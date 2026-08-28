@@ -1,4 +1,4 @@
-# clickclack-pi v1 scope
+# pi-clickclack v1 scope
 
 ## Goal
 
@@ -6,12 +6,12 @@ Let one trusted owner talk to persistent, fully tooled Pi coding-agent sessions 
 
 ## Architecture
 
-`clickclack-pi` is a standalone Node.js and TypeScript daemon.
+`pi-clickclack` is a standalone Node.js and TypeScript daemon.
 
 ```text
 ClickClack
   ⇅ durable events, ephemeral progress, messages, uploads
-clickclack-pi
+pi-clickclack
   ⇅ AgentSession API and event subscription
 Pi
 ```

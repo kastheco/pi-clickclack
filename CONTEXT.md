@@ -5,7 +5,7 @@ This context describes how ClickClack conversations are connected to persistent 
 ## Language
 
 **Bridge**:
-The standalone `clickclack-pi` service that translates between ClickClack conversation events and Pi session operations.
+The standalone `pi-clickclack` service that translates between ClickClack conversation events and Pi session operations.
 _Avoid_: Plugin, Pi extension, ClickClack fork feature
 
 **Conversation**:

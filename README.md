@@ -1,13 +1,13 @@
-# clickclack-pi
+# pi-clickclack
 
-`clickclack-pi` is a private local bridge between ClickClack conversations and persistent Pi coding-agent sessions.
+`pi-clickclack` is a private local bridge between ClickClack conversations and persistent Pi coding-agent sessions.
 
 It runs as a standalone service. It does not require changes to ClickClack, a Pi fork, or a Pi extension.
 
 ```text
 ClickClack
   ⇅ HTTP, realtime WebSocket, agent progress
-clickclack-pi
+pi-clickclack
   ⇅ AgentSession SDK
 Pi
 ```

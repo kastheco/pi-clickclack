@@ -7,7 +7,7 @@ import test from "node:test";
 import { ConfigurationError, loadConfig } from "./config.js";
 
 function fixture(): { root: string; environment: Record<string, string> } {
-  const root = mkdtempSync(join(tmpdir(), "clickclack-pi-config-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-clickclack-config-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
   mkdirSync(project);

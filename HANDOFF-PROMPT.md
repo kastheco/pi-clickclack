@@ -1,6 +1,6 @@
-# Start KAS-732 in clickclack-pi
+# Start KAS-732 in pi-clickclack
 
-Work in `/home/kas/dev/clickclack-pi` and implement **KAS-732: Bootstrap the bridge service and state store**.
+Work in `/home/kas/dev/pi-clickclack` and implement **KAS-732: Bootstrap the bridge service and state store**.
 
 Linear issue: https://linear.app/kashub/issue/KAS-732/bootstrap-the-bridge-service-and-state-store
 

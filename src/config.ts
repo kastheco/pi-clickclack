@@ -103,7 +103,7 @@ export function loadConfig(environment: Environment = process.env): BridgeConfig
 
   const statePath = absolutePath(
     "CLICKCLACK_PI_STATE_PATH",
-    environment.CLICKCLACK_PI_STATE_PATH?.trim() || resolve(homedir(), ".local/state/clickclack-pi/state.sqlite"),
+    environment.CLICKCLACK_PI_STATE_PATH?.trim() || resolve(homedir(), ".local/state/pi-clickclack/state.sqlite"),
     issues,
     false,
   );
