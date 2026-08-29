@@ -2,7 +2,10 @@ import { ClickClackClient } from "@clickclack/sdk-ts";
 
 import type { BridgeConfig } from "./config.js";
 
-export type ClickClackBoundary = Pick<ClickClackClient, "me" | "workspaces">;
+export type ClickClackBoundary = Pick<
+  ClickClackClient,
+  "me" | "workspaces" | "messages" | "channels" | "dms" | "events"
+>;
 
 export function createClickClackClient(config: BridgeConfig): ClickClackClient {
   return new ClickClackClient({

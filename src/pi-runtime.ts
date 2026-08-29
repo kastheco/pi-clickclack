@@ -25,6 +25,11 @@ export type EmbeddedPiRuntimeBoundary = {
   createSessionRuntime(request: PiRuntimeRequest): Promise<AgentSessionRuntime>;
 };
 
+export const bridgeAppendSystemPrompt = [
+  "Shell tools already execute in the pinned project's current working directory.",
+  "Do not prepend `cd <project cwd> &&` to shell commands unless the command genuinely needs a different directory.",
+].join(" ");
+
 /**
  * Constructs the embedded SDK boundary only. No ModelRuntime, resource loader,
  * SessionManager, or AgentSession is created until createSessionRuntime is called
@@ -81,6 +86,9 @@ export function createEmbeddedPiRuntime(config: BridgeConfig): EmbeddedPiRuntime
           cwd,
           agentDir: config.pi.agentDir,
           modelRuntime: models,
+          resourceLoaderOptions: {
+            appendSystemPrompt: [bridgeAppendSystemPrompt],
+          },
         });
         return {
           ...(await createAgentSessionFromServices({
