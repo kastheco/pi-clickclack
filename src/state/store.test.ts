@@ -63,6 +63,21 @@ test("bindings upsert and keep one active Pi session", () => {
       .prepare("SELECT archived_at FROM pi_session_references WHERE session_id = 'session-1'")
       .get() as { archived_at: string | null };
     assert.equal(typeof archived.archived_at, "string");
+    assert.equal(store.archiveActivePiSession(binding.id), true);
+    assert.equal(store.getActivePiSession(binding.id), undefined);
+    assert.deepEqual(
+      store.listArchivedPiSessions(binding.id).map((reference) => reference.sessionId),
+      ["session-2", "session-1"],
+    );
+    const restored = store.restorePiSession(binding.id, second.id);
+    assert.equal(restored.sessionId, "session-2");
+    assert.equal(store.getActivePiSession(binding.id)?.sessionId, "session-2");
+    assert.deepEqual(
+      store.listArchivedPiSessions(binding.id).map((reference) => reference.sessionId),
+      ["session-1"],
+    );
+    assert.equal(store.archiveActivePiSession(binding.id), true);
+    assert.equal(store.archiveActivePiSession(binding.id), false);
   } finally {
     store.close();
   }
@@ -84,6 +99,20 @@ test("active turns use compare-and-set transitions", () => {
     assert.equal(store.transitionActiveTurn(turnId, "running", "stopping"), true);
     assert.equal(store.finishActiveTurn(turnId, "stopping"), true);
     assert.equal(store.getActiveTurn(turnId), undefined);
+
+    const interruptedMessageId = toMessageId("msg_interrupted_source");
+    store.claimSourceMessage({ messageId: interruptedMessageId });
+    store.setActivePiSession({
+      bindingId: binding.id,
+      sessionId: "interrupted-session",
+      sessionFile: "/sessions/interrupted.jsonl",
+    });
+    const interruptedTurnId = toTurnId("turn_interrupted");
+    store.startActiveTurn({ turnId: interruptedTurnId, bindingId: binding.id, sourceMessageId: interruptedMessageId });
+    assert.equal(store.recoverInterruptedTurns(), 1);
+    assert.equal(store.getActiveTurn(interruptedTurnId), undefined);
+    assert.equal(store.getActivePiSession(binding.id), undefined);
+    assert.equal(store.recoverInterruptedTurns(), 0);
   } finally {
     store.close();
   }

@@ -240,6 +240,60 @@ export class StateStore {
     return row ? piSessionReference(row) : undefined;
   }
 
+  listArchivedPiSessions(bindingId: number): PiSessionReference[] {
+    const rows = this.database
+      .prepare(`
+        SELECT id, binding_id, session_id, session_file, created_at, archived_at
+        FROM pi_session_references
+        WHERE binding_id = ? AND archived_at IS NOT NULL
+        ORDER BY created_at DESC, id DESC
+      `)
+      .all(bindingId) as Row[];
+    return rows.map(piSessionReference);
+  }
+
+  restorePiSession(bindingId: number, referenceId: number): PiSessionReference {
+    return this.transaction(() => {
+      const row = this.database
+        .prepare(`
+          SELECT id, binding_id, session_id, session_file, created_at, archived_at
+          FROM pi_session_references WHERE id = ? AND binding_id = ?
+        `)
+        .get(referenceId, bindingId) as Row | undefined;
+      if (!row) throw new Error("Pi session reference not found for binding");
+      const now = timestamp();
+      this.database
+        .prepare("UPDATE pi_session_references SET archived_at = ? WHERE binding_id = ? AND archived_at IS NULL")
+        .run(now, bindingId);
+      this.database
+        .prepare("UPDATE pi_session_references SET archived_at = NULL WHERE id = ?")
+        .run(referenceId);
+      return piSessionReference({ ...row, archived_at: null });
+    });
+  }
+
+  archiveActivePiSession(bindingId: number): boolean {
+    return this.database
+      .prepare("UPDATE pi_session_references SET archived_at = ? WHERE binding_id = ? AND archived_at IS NULL")
+      .run(timestamp(), bindingId).changes === 1;
+  }
+
+  recoverInterruptedTurns(): number {
+    return this.transaction(() => {
+      const bindings = this.database.prepare("SELECT DISTINCT binding_id FROM active_turns").all() as Row[];
+      if (bindings.length === 0) return 0;
+      const now = timestamp();
+      for (const row of bindings) {
+        this.database
+          .prepare("UPDATE pi_session_references SET archived_at = ? WHERE binding_id = ? AND archived_at IS NULL")
+          .run(now, integer(row.binding_id));
+      }
+      const count = integer((this.database.prepare("SELECT COUNT(*) AS count FROM active_turns").get() as Row).count);
+      this.database.prepare("DELETE FROM active_turns").run();
+      return count;
+    });
+  }
+
   startActiveTurn(input: {
     turnId: TurnId;
     bindingId: number;
