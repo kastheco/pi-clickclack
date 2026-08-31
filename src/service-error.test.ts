@@ -40,6 +40,7 @@ test("does not reuse an earlier assistant message when the current Pi turn fails
   const clickClack = {
     me: async () => ({ id: "usr_bot", kind: "bot", display_name: "Bridge", handle: "bridge", avatar_url: "", created_at: "" }),
     workspaces: { get: async () => ({ id: "wsp_test", route_id: "W1", name: "Test", slug: "test", icon_url: "", created_at: "" }) },
+    bots: { setCommands: async () => [] },
     messages: { get: async () => source },
     channels: { sendMessage: async () => ({}) },
     dms: { sendMessage: async (_id: string, input: { body: string }) => { sent.push(input.body); return {}; } },

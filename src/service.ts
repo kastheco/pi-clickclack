@@ -1,10 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
-import type { Message, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
-import type { AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
+import type { BotCommandInput, Message, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
+import { resolveCliModel, type AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
 
 import { TurnActivity, type ActivityTransport } from "./activity.js";
+import {
+  botCommandMenu,
+  isPiResourceCommand,
+  parseSlashInvocation,
+  runtimeBotCommandMenu,
+  type SlashInvocation,
+} from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig } from "./config.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
@@ -47,6 +54,7 @@ export class BridgeService {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
+  private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
 
   constructor(
     readonly config: BridgeConfig,
@@ -75,6 +83,7 @@ export class BridgeService {
 
     this.identity = identity;
     this.workspace = workspace;
+    await this.publishCommandMenu();
     const interruptedTurns = this.state.recoverInterruptedTurns();
     if (interruptedTurns > 0) {
       this.logger.warn("recovered interrupted Pi turns from previous bridge process", { interruptedTurns });
@@ -87,6 +96,7 @@ export class BridgeService {
       workspaceId: workspace.id,
       projectAliases: [...this.config.projects.keys()],
       piRuntime: this.piRuntime.kind,
+      publishedCommands: botCommandMenu.length,
       sessionsStarted: this.runtimes.size,
     });
   }
@@ -240,6 +250,12 @@ export class BridgeService {
       return;
     }
 
+    const slashInvocation = parseSlashInvocation(cleanBody);
+    if (slashInvocation) {
+      await this.handleSlashCommand(binding, message, slashInvocation);
+      return;
+    }
+
     const prompt = cleanBody || "say hello and briefly identify the project connected to this conversation.";
     await this.runTurn(binding, message, prompt);
   }
@@ -291,7 +307,163 @@ export class BridgeService {
     );
   }
 
-  private async runTurn(binding: ConversationBinding, source: Message, prompt: string): Promise<void> {
+  private async handleSlashCommand(
+    binding: ConversationBinding,
+    source: Message,
+    invocation: SlashInvocation,
+  ): Promise<void> {
+    const command = invocation.name.toLowerCase();
+    try {
+      const runtime = await this.runtimeFor(binding);
+      switch (command) {
+        case "compact":
+          await runtime.session.compact(invocation.args || undefined);
+          await this.sendReply(source, "Pi session compacted.", `pi-command-${source.id}`);
+          return;
+        case "new": {
+          if (invocation.args) {
+            await this.sendReply(source, "usage: `/new`", `pi-command-${source.id}`);
+            return;
+          }
+          const result = await runtime.newSession();
+          if (result.cancelled) {
+            await this.sendReply(source, "Pi session replacement was cancelled.", `pi-command-${source.id}`);
+            return;
+          }
+          this.recordReplacementSession(binding, runtime);
+          await this.sendReply(source, "New Pi session started.", `pi-command-${source.id}`);
+          return;
+        }
+        case "name": {
+          if (!invocation.args) {
+            await this.sendReply(
+              source,
+              runtime.session.sessionName ? `Pi session name: ${runtime.session.sessionName}` : "usage: `/name <name>`",
+              `pi-command-${source.id}`,
+            );
+            return;
+          }
+          runtime.session.setSessionName(invocation.args);
+          await this.sendReply(source, `Pi session name set: ${runtime.session.sessionName ?? invocation.args}`, `pi-command-${source.id}`);
+          return;
+        }
+        case "session":
+          if (invocation.args) {
+            await this.sendReply(source, "usage: `/session`", `pi-command-${source.id}`);
+            return;
+          }
+          await this.sendReply(source, formatSessionStats(runtime), `pi-command-${source.id}`);
+          return;
+        case "model":
+          await this.handleModelCommand(runtime, source, invocation.args);
+          return;
+        case "thinking":
+          await this.handleThinkingCommand(runtime, source, invocation.args);
+          return;
+        case "reload":
+          if (invocation.args) {
+            await this.sendReply(source, "usage: `/reload`", `pi-command-${source.id}`);
+            return;
+          }
+          await runtime.session.reload();
+          try {
+            await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
+          } catch (error) {
+            this.logger.warn("could not refresh reloaded Pi commands in ClickClack", {
+              projectAlias: binding.projectAlias,
+              error,
+            });
+          }
+          await this.sendReply(source, "Pi extensions, skills, prompts, and context reloaded.", `pi-command-${source.id}`);
+          return;
+        case "copy": {
+          if (invocation.args) {
+            await this.sendReply(source, "usage: `/copy`", `pi-command-${source.id}`);
+            return;
+          }
+          const text = runtime.session.getLastAssistantText();
+          await this.sendReply(source, text ?? "This Pi session has no assistant answer to copy.", `pi-command-${source.id}`);
+          return;
+        }
+        default:
+          if (!isPiResourceCommand(runtime, invocation)) {
+            await this.sendReply(source, `unknown Pi command \`/${invocation.name}\`.`, `pi-command-${source.id}`);
+            return;
+          }
+          await this.runTurn(binding, source, invocation.raw, {
+            allowNoAssistant: true,
+            noAssistantReply: `Pi command \`/${invocation.name}\` completed.`,
+          });
+      }
+    } catch (error) {
+      this.logger.error("Pi command failed", {
+        command: invocation.name,
+        sourceMessageId: source.id,
+        projectAlias: binding.projectAlias,
+        error,
+      });
+      await this.sendReply(source, `Pi command \`/${invocation.name}\` failed. check the bridge log for the error.`, `pi-command-error-${source.id}`);
+    }
+  }
+
+  private async handleModelCommand(runtime: AgentSessionRuntime, source: Message, modelRef: string): Promise<void> {
+    if (!modelRef) {
+      const current = runtime.session.model;
+      const label = current ? `${current.provider}/${current.id}` : "none";
+      await this.sendReply(source, `Pi model: ${label}`, `pi-command-${source.id}`);
+      return;
+    }
+    const resolved = resolveCliModel({
+      cliModel: modelRef,
+      modelRuntime: runtime.session.modelRuntime,
+    });
+    if (resolved.error || !resolved.model) {
+      await this.sendReply(source, `couldn't resolve Pi model \`${modelRef}\`: ${resolved.error ?? "model not found"}`, `pi-command-${source.id}`);
+      return;
+    }
+    await runtime.session.setModel(resolved.model);
+    if (resolved.thinkingLevel) runtime.session.setThinkingLevel(resolved.thinkingLevel);
+    await this.sendReply(
+      source,
+      `Pi model set: ${resolved.model.provider}/${resolved.model.id} (${runtime.session.thinkingLevel})`,
+      `pi-command-${source.id}`,
+    );
+  }
+
+  private async handleThinkingCommand(runtime: AgentSessionRuntime, source: Message, level: string): Promise<void> {
+    const available = runtime.session.getAvailableThinkingLevels();
+    if (!level) {
+      await this.sendReply(
+        source,
+        `Pi thinking: ${runtime.session.thinkingLevel}. available: ${available.join(", ") || "off"}`,
+        `pi-command-${source.id}`,
+      );
+      return;
+    }
+    if (!available.includes(level as (typeof available)[number])) {
+      await this.sendReply(source, `invalid thinking level \`${level}\`. available: ${available.join(", ") || "off"}`, `pi-command-${source.id}`);
+      return;
+    }
+    runtime.session.setThinkingLevel(level as (typeof available)[number]);
+    await this.sendReply(source, `Pi thinking set: ${runtime.session.thinkingLevel}`, `pi-command-${source.id}`);
+  }
+
+  private recordReplacementSession(binding: ConversationBinding, runtime: AgentSessionRuntime): void {
+    const sessionFile = runtime.session.sessionFile;
+    if (!sessionFile) throw new Error("Pi did not create a persistent replacement session file");
+    this.state.setActivePiSession({
+      bindingId: binding.id,
+      sessionId: runtime.session.sessionId,
+      sessionFile,
+    });
+  }
+
+  private async runTurn(
+    binding: ConversationBinding,
+    source: Message,
+    prompt: string,
+    options: { allowNoAssistant?: boolean; noAssistantReply?: string } = {},
+  ): Promise<void> {
     const turnId = toTurnId(`turn_${randomUUID()}`);
     let status: "starting" | "running" = "starting";
     let activity: TurnActivity | undefined;
@@ -320,9 +492,9 @@ export class BridgeService {
         unsubscribe();
         unsubscribe = undefined;
       }
-      const answer = finalAssistantText(runtime.session.messages.slice(messageStart));
+      const answer = finalAssistantText(runtime.session.messages.slice(messageStart), options.allowNoAssistant);
       await activity.finalize();
-      await this.sendReply(source, answer, `pi-${source.id}`);
+      await this.sendReply(source, answer ?? options.noAssistantReply ?? "Pi command completed.", `pi-${source.id}`);
       this.state.finishActiveTurn(turnId, "running");
       this.logger.info("Pi turn completed", {
         turnId,
@@ -365,7 +537,31 @@ export class BridgeService {
       });
     }
     this.runtimes.set(binding.id, runtime);
+    try {
+      await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
+    } catch (error) {
+      this.logger.warn("could not refresh Pi resource commands in ClickClack", {
+        projectAlias: binding.projectAlias,
+        error,
+      });
+    }
     return runtime;
+  }
+
+  private async refreshProjectCommandMenu(projectAlias: string, runtime: AgentSessionRuntime): Promise<void> {
+    this.projectCommandMenus.set(projectAlias, runtimeBotCommandMenu(runtime));
+    await this.publishCommandMenu();
+  }
+
+  private async publishCommandMenu(): Promise<void> {
+    const byName = new Map<string, BotCommandInput>();
+    for (const command of botCommandMenu) byName.set(command.command, command);
+    for (const commands of this.projectCommandMenus.values()) {
+      for (const command of commands) {
+        if (!byName.has(command.command)) byName.set(command.command, command);
+      }
+    }
+    await this.clickClack.bots.setCommands([...byName.values()].slice(0, 100));
   }
 
   private isDirected(
@@ -488,7 +684,27 @@ function isRecoverableSessionFile(path: string): boolean {
   return pendingToolCalls.size === 0;
 }
 
-function finalAssistantText(messages: readonly unknown[]): string {
+function formatSessionStats(runtime: AgentSessionRuntime): string {
+  const stats = runtime.session.getSessionStats();
+  const context = stats.contextUsage && stats.contextUsage.tokens !== null && stats.contextUsage.percent !== null
+    ? `${stats.contextUsage.tokens.toLocaleString()} / ${stats.contextUsage.contextWindow.toLocaleString()} tokens (${stats.contextUsage.percent.toFixed(1)}%)`
+    : "unavailable";
+  return [
+    "**Pi session**",
+    "",
+    `- name: ${runtime.session.sessionName ?? "unnamed"}`,
+    `- id: \`${stats.sessionId}\``,
+    `- model: ${runtime.session.model ? `${runtime.session.model.provider}/${runtime.session.model.id}` : "none"}`,
+    `- thinking: ${runtime.session.thinkingLevel}`,
+    `- messages: ${stats.totalMessages} (${stats.userMessages} user, ${stats.assistantMessages} assistant)`,
+    `- tools: ${stats.toolCalls} calls, ${stats.toolResults} results`,
+    `- tokens: ${stats.tokens.total.toLocaleString()}`,
+    `- context: ${context}`,
+    `- cost: $${stats.cost.toFixed(3)}`,
+  ].join("\n");
+}
+
+function finalAssistantText(messages: readonly unknown[], allowMissing = false): string | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (!message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") continue;
@@ -511,5 +727,6 @@ function finalAssistantText(messages: readonly unknown[]): string {
     if (text) return text;
     break;
   }
+  if (allowMissing) return undefined;
   throw new Error("Pi completed without an assistant text response");
 }

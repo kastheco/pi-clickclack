@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import type { Message, MessageInput, RealtimeEvent } from "@clickclack/sdk-ts";
+import type { BotCommandInput, Message, MessageInput, RealtimeEvent } from "@clickclack/sdk-ts";
 
 import type { ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig, ProjectConfig } from "./config.js";
@@ -22,6 +22,7 @@ type Fixture = {
   messages: Map<string, Message>;
   sent: Array<{ target: "channel" | "direct"; id: string; body: string }>;
   activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }>;
+  commandMenu: BotCommandInput[];
   emit(event: RealtimeEvent): void;
   subscriptionCount(): number;
 };
@@ -50,6 +51,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
   const messages = new Map<string, Message>();
   const sent: Array<{ target: "channel" | "direct"; id: string; body: string }> = [];
   const activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }> = [];
+  const commandMenu: BotCommandInput[] = [];
   let onEvent: EventHandler | undefined;
   let subscriptions = 0;
   const clickClack = {
@@ -70,6 +72,12 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
         icon_url: "",
         created_at: "2026-01-01T00:00:00Z",
       }),
+    },
+    bots: {
+      setCommands: async (commands: BotCommandInput[]) => {
+        commandMenu.splice(0, commandMenu.length, ...commands);
+        return [];
+      },
     },
     messages: {
       get: async (messageId: string) => {
@@ -120,6 +128,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     messages,
     sent,
     activity,
+    commandMenu,
     emit(event) {
       if (!onEvent) throw new Error("fake realtime subscription has not started");
       onEvent(event);
@@ -190,6 +199,10 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   await service.start();
   assert.equal(sessionsCreated, 0);
   assert.equal(setup.subscriptionCount(), 1);
+  assert.deepEqual(
+    setup.commandMenu.map((command) => command.command),
+    ["project", "continue", "compact", "new", "name", "session", "model", "thinking", "reload", "copy"],
+  );
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
   service.stop();
   assert.throws(() => stateStore.database.prepare("SELECT 1"), /not open|closed/u);
@@ -368,5 +381,115 @@ test("project command switches projects, archives the old session, and unmention
   assert.equal(service.state.getActivePiSession(previous.id), undefined);
   assert.equal(setup.sent.length, 1);
   assert.match(setup.sent[0]?.body ?? "", /bound to `other`/u);
+  service.stop();
+});
+
+test("Pi host commands compact, name, and replace the bound session without reaching the model", async () => {
+  const setup = fixture();
+  const compactInstructions: string[] = [];
+  const createSession = (id: string) => ({
+    sessionId: id,
+    sessionFile: `/tmp/${id}.jsonl`,
+    sessionName: undefined as string | undefined,
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    async compact(instructions?: string) { compactInstructions.push(instructions ?? ""); return {}; },
+    setSessionName(name: string) { this.sessionName = name.trim(); },
+  });
+  const runtime = {
+    session: createSession("session-1"),
+    async newSession() {
+      this.session = createSession("session-2");
+      return { cancelled: false };
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dcn_1" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const commands = [
+    message({ id: "msg_name", body: "/name command bridge", directConversationId: "dcn_1" }),
+    message({ id: "msg_compact", body: "/compact keep command decisions", directConversationId: "dcn_1" }),
+    message({ id: "msg_new", body: "/new", directConversationId: "dcn_1" }),
+  ];
+  for (const command of commands) setup.messages.set(command.id, command);
+
+  await service.start();
+  commands.forEach((command, index) => setup.emit(createdEvent({ messageId: command.id, cursor: `cur_${200 + index}` })));
+  await service.waitForIdle();
+
+  assert.deepEqual(compactInstructions, ["keep command decisions"]);
+  assert.deepEqual(setup.sent.map((row) => row.body), [
+    "Pi session name set: command bridge",
+    "Pi session compacted.",
+    "New Pi session started.",
+  ]);
+  assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
+  assert.equal(service.state.listArchivedPiSessions(1)[0]?.sessionId, "session-1");
+  service.stop();
+});
+
+test("extension slash commands pass through AgentSession.prompt and unknown commands do not", async () => {
+  const setup = fixture();
+  const receivedPrompts: string[] = [];
+  const session = {
+    sessionId: "session-1",
+    sessionFile: "/tmp/session-1.jsonl",
+    messages: [] as unknown[],
+    promptTemplates: [] as Array<{ name: string }>,
+    resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
+    extensionRunner: {
+      getCommand: (name: string) => name === "review" ? {} : undefined,
+      getRegisteredCommands: () => [{ invocationName: "review", description: "Review project changes" }],
+    },
+    subscribe() { return () => {}; },
+    async prompt(text: string) { receivedPrompts.push(text); },
+  };
+  const runtime = { session, async dispose() {} };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dcn_1" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const review = message({ id: "msg_review", body: "/review src/service.ts", directConversationId: "dcn_1" });
+  const unknown = message({ id: "msg_unknown", body: "/not-a-command", directConversationId: "dcn_1" });
+  setup.messages.set(review.id, review);
+  setup.messages.set(unknown.id, unknown);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: review.id, cursor: "cur_200" }));
+  setup.emit(createdEvent({ messageId: unknown.id, cursor: "cur_300" }));
+  await service.waitForIdle();
+
+  assert.deepEqual(receivedPrompts, ["/review src/service.ts"]);
+  assert.ok(setup.commandMenu.some((command) => command.command === "review"));
+  assert.deepEqual(setup.sent.map((row) => row.body), [
+    "Pi command `/review` completed.",
+    "unknown Pi command `/not-a-command`.",
+  ]);
   service.stop();
 });

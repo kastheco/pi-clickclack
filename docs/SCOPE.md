@@ -65,15 +65,20 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 
 ## Commands
 
-The first release exposes:
+The bridge publishes its complete supported command menu through ClickClack's bot-command API:
 
-- `/project <alias>`: bind the conversation to an approved project.
-- `/new`: archive the current binding's Pi session and start a new one.
-- `/stop`: abort the active turn and clear live progress.
-- `/status`: show the project, session, model, context usage, and active-turn state.
-- `/queue`: queue the message as a follow-up instead of steering the active turn.
+- `/project <alias>` binds the conversation to an approved project.
+- `/continue` resumes the latest recoverable Pi session.
+- `/compact [instructions]` compacts the current Pi session.
+- `/new` archives the current session and starts a persistent replacement.
+- `/name [name]` shows or sets the Pi session name.
+- `/session` shows session, usage, and context statistics.
+- `/model [provider/model]` shows or selects the session model.
+- `/thinking [level]` shows or selects the thinking level.
+- `/reload` reloads Pi extensions, skills, prompts, and context files.
+- `/copy` sends the latest assistant answer as a new ClickClack message.
 
-Model selection and thinking level remain service configuration in v1.
+Extension commands, prompt templates, and `/skill:<name>` commands are passed unchanged to `AgentSession.prompt()` when they exist in the bound project's loaded Pi resources. Compatible extension and prompt-template names are added to ClickClack's bot-command menu after the project runtime loads. Skill command names contain a colon, which ClickClack's command-menu schema does not accept, so skills remain available by typing them directly. Unknown slash commands are rejected instead of becoming model prompts. Pi commands that depend on terminal-only selectors, clipboard access, local credential dialogs, or process shutdown are not advertised in ClickClack.
 
 ## State and recovery
 
@@ -97,7 +102,7 @@ The bridge claims a source message before invoking Pi. Replayed ClickClack event
 - Only configured owner IDs may invoke Pi or answer interactive requests.
 - Chat input cannot introduce an arbitrary filesystem path.
 - Every Pi session runs from a configured project alias and approved working directory.
-- The bot token receives only the ClickClack scopes required for realtime read, conversations, uploads, and agent activity.
+- The bot token receives only the ClickClack scopes required for realtime read, conversations, uploads, agent activity, and command-menu publication.
 - Logs must not contain bot tokens, provider credentials, or complete secret-bearing tool output.
 
 ## Out of scope
