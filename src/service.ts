@@ -54,6 +54,7 @@ export class BridgeService {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
+  private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
 
   constructor(
@@ -325,7 +326,13 @@ export class BridgeService {
             await this.sendReply(source, "usage: `/new`", `pi-command-${source.id}`);
             return;
           }
-          const result = await runtime.newSession();
+          let result: { cancelled: boolean };
+          try {
+            result = await runtime.newSession();
+          } catch (error) {
+            this.runtimes.delete(binding.id);
+            throw error;
+          }
           if (result.cancelled) {
             await this.sendReply(source, "Pi session replacement was cancelled.", `pi-command-${source.id}`);
             return;
@@ -485,11 +492,16 @@ export class BridgeService {
       unsubscribe = runtime.session.subscribe((event) => activity?.handle(event));
       this.state.transitionActiveTurn(turnId, "starting", "running");
       status = "running";
-      const messageStart = runtime.session.messages.length;
+      const session = runtime.session;
+      const messageStart = session.messages.length;
+      const extensionErrors: Error[] = [];
+      this.activeExtensionErrors.set(binding.id, extensionErrors);
       try {
-        await runtime.session.prompt(prompt, { source: "interactive" });
+        await this.promptAndWaitForNestedPrompts(session, prompt);
+        if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
-        unsubscribe();
+        this.activeExtensionErrors.delete(binding.id);
+        unsubscribe?.();
         unsubscribe = undefined;
       }
       const answer = finalAssistantText(runtime.session.messages.slice(messageStart), options.allowNoAssistant);
@@ -538,6 +550,13 @@ export class BridgeService {
     }
     this.runtimes.set(binding.id, runtime);
     try {
+      await this.bindRuntimeExtensions(binding, runtime);
+    } catch (error) {
+      this.runtimes.delete(binding.id);
+      await runtime.dispose();
+      throw error;
+    }
+    try {
       await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
     } catch (error) {
       this.logger.warn("could not refresh Pi resource commands in ClickClack", {
@@ -546,6 +565,100 @@ export class BridgeService {
       });
     }
     return runtime;
+  }
+
+  private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
+    const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
+      if (typeof session.bindExtensions !== "function") return;
+      await session.bindExtensions({
+        mode: "rpc",
+        commandContextActions: {
+          waitForIdle: () => session.waitForIdle(),
+          newSession: (options) => this.replaceRuntimeSession(binding, runtime, () => runtime.newSession(options)),
+          fork: (entryId, options) => this.replaceRuntimeSession(binding, runtime, async () => {
+            const result = await runtime.fork(entryId, options);
+            return { cancelled: result.cancelled };
+          }),
+          navigateTree: async (targetId, options) => {
+            const result = await session.navigateTree(targetId, options);
+            return { cancelled: result.cancelled };
+          },
+          switchSession: (sessionPath, options) => this.replaceRuntimeSession(
+            binding,
+            runtime,
+            () => runtime.switchSession(sessionPath, options),
+          ),
+          reload: async () => {
+            await session.reload();
+            await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
+          },
+        },
+        onError: (extensionError) => {
+          const error = new Error(
+            `Pi extension error (${extensionError.extensionPath}, ${extensionError.event}): ${extensionError.error}`,
+          );
+          this.logger.error("Pi extension failed", {
+            projectAlias: binding.projectAlias,
+            bindingId: binding.id,
+            extensionPath: extensionError.extensionPath,
+            event: extensionError.event,
+            error: extensionError.error,
+            stack: extensionError.stack,
+          });
+          this.activeExtensionErrors.get(binding.id)?.push(error);
+        },
+      });
+    };
+
+    if (typeof runtime.setRebindSession === "function") {
+      runtime.setRebindSession(bindSession);
+    }
+    await bindSession(runtime.session);
+  }
+
+  private async replaceRuntimeSession(
+    binding: ConversationBinding,
+    runtime: AgentSessionRuntime,
+    replace: () => Promise<{ cancelled: boolean }>,
+  ): Promise<{ cancelled: boolean }> {
+    try {
+      const result = await replace();
+      if (!result.cancelled) this.recordReplacementSession(binding, runtime);
+      return result;
+    } catch (error) {
+      this.runtimes.delete(binding.id);
+      throw error;
+    }
+  }
+
+  private async promptAndWaitForNestedPrompts(
+    session: AgentSessionRuntime["session"],
+    prompt: string,
+  ): Promise<void> {
+    const originalPrompt = session.prompt;
+    const pending = new Set<Promise<void>>();
+    let invocationCount = 0;
+    let nestedFailure: unknown;
+
+    session.prompt = (text, promptOptions) => {
+      invocationCount += 1;
+      const isNested = invocationCount > 1;
+      const operation = originalPrompt.call(session, text, promptOptions);
+      pending.add(operation);
+      void operation.catch((error: unknown) => {
+        if (isNested && nestedFailure === undefined) nestedFailure = error;
+      }).finally(() => pending.delete(operation));
+      return operation;
+    };
+
+    try {
+      await session.prompt(prompt, { source: "interactive" });
+      while (pending.size > 0) await Promise.allSettled([...pending]);
+      if (nestedFailure !== undefined) throw nestedFailure;
+      if (typeof session.waitForIdle === "function") await session.waitForIdle();
+    } finally {
+      session.prompt = originalPrompt;
+    }
   }
 
   private async refreshProjectCommandMenu(projectAlias: string, runtime: AgentSessionRuntime): Promise<void> {
