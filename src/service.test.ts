@@ -493,3 +493,87 @@ test("extension slash commands pass through AgentSession.prompt and unknown comm
   ]);
   service.stop();
 });
+
+test("extension session replacement delivers the replacement session answer", async () => {
+  const setup = fixture();
+  type ReplacementOptions = {
+    withSession?: (context: { sendUserMessage(text: string): Promise<void> }) => Promise<void>;
+  };
+  type ExtensionBinding = {
+    commandContextActions: {
+      newSession(options?: ReplacementOptions): Promise<{ cancelled: boolean }>;
+    };
+  };
+
+  const bindings = new Map<string, ExtensionBinding>();
+  let runReplacement: (() => Promise<void>) | undefined;
+  const createSession = (id: string, messages: unknown[]) => ({
+    sessionId: id,
+    sessionFile: `/tmp/${id}.jsonl`,
+    messages,
+    promptTemplates: [] as Array<{ name: string }>,
+    resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
+    extensionRunner: {
+      getCommand: (name: string) => name === "review" ? {} : undefined,
+      getRegisteredCommands: () => [{ invocationName: "review", description: "Review project changes" }],
+    },
+    async bindExtensions(binding: ExtensionBinding) { bindings.set(id, binding); },
+    subscribe() { return () => {}; },
+    async waitForIdle() {},
+    async prompt() { await runReplacement?.(); },
+  });
+  type TestSession = ReturnType<typeof createSession>;
+  let rebindSession: ((session: TestSession) => Promise<void>) | undefined;
+  const runtime = {
+    session: createSession("session-1", Array.from({ length: 4 }, () => ({
+      role: "assistant",
+      content: [{ type: "text", text: "old answer" }],
+    }))),
+    setRebindSession(callback: (session: TestSession) => Promise<void>) { rebindSession = callback; },
+    async newSession(options?: ReplacementOptions) {
+      this.session = createSession("session-2", []);
+      await rebindSession?.(this.session);
+      await options?.withSession?.({
+        sendUserMessage: async () => {
+          this.session.messages.push({
+            role: "assistant",
+            content: [{ type: "text", text: "replacement answer" }],
+          });
+        },
+      });
+      return { cancelled: false };
+    },
+    async dispose() {},
+  };
+  runReplacement = async () => {
+    await bindings.get("session-1")?.commandContextActions.newSession({
+      withSession: async (context) => context.sendUserMessage("continue in replacement"),
+    });
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dcn_1" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const review = message({ id: "msg_review_replace", body: "/review", directConversationId: "dcn_1" });
+  setup.messages.set(review.id, review);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: review.id, cursor: "cur_200" }));
+  await service.waitForIdle();
+
+  assert.deepEqual(setup.sent.map((row) => row.body), ["replacement answer"]);
+  assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
+  service.stop();
+});

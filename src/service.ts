@@ -40,6 +40,13 @@ type ConversationTarget = {
 
 const reconnectDelayMs = 1_000;
 
+type ActiveSessionTurn = {
+  activity: TurnActivity;
+  session: AgentSessionRuntime["session"];
+  messageStart: number;
+  unsubscribe: (() => void) | undefined;
+};
+
 export class BridgeService {
   readonly state: StateStore;
   readonly clickClack: ClickClackBoundary;
@@ -54,6 +61,7 @@ export class BridgeService {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
+  private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
 
@@ -474,7 +482,7 @@ export class BridgeService {
     const turnId = toTurnId(`turn_${randomUUID()}`);
     let status: "starting" | "running" = "starting";
     let activity: TurnActivity | undefined;
-    let unsubscribe: (() => void) | undefined;
+    let activeSessionTurn: ActiveSessionTurn | undefined;
     try {
       this.state.startActiveTurn({
         turnId,
@@ -489,22 +497,31 @@ export class BridgeService {
         transport: this.activityTransport(source),
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
       });
-      unsubscribe = runtime.session.subscribe((event) => activity?.handle(event));
+      activeSessionTurn = {
+        activity,
+        session: runtime.session,
+        messageStart: runtime.session.messages.length,
+        unsubscribe: undefined,
+      };
+      this.activeSessionTurns.set(binding.id, activeSessionTurn);
+      this.bindActiveTurnSession(binding.id, runtime.session);
       this.state.transitionActiveTurn(turnId, "starting", "running");
       status = "running";
-      const session = runtime.session;
-      const messageStart = session.messages.length;
       const extensionErrors: Error[] = [];
       this.activeExtensionErrors.set(binding.id, extensionErrors);
       try {
-        await this.promptAndWaitForNestedPrompts(session, prompt);
+        await this.promptAndWaitForNestedPrompts(runtime.session, prompt);
         if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
         this.activeExtensionErrors.delete(binding.id);
-        unsubscribe?.();
-        unsubscribe = undefined;
+        this.activeSessionTurns.delete(binding.id);
+        activeSessionTurn.unsubscribe?.();
+        activeSessionTurn.unsubscribe = undefined;
       }
-      const answer = finalAssistantText(runtime.session.messages.slice(messageStart), options.allowNoAssistant);
+      const answer = finalAssistantText(
+        activeSessionTurn.session.messages.slice(activeSessionTurn.messageStart),
+        options.allowNoAssistant,
+      );
       await activity.finalize();
       await this.sendReply(source, answer ?? options.noAssistantReply ?? "Pi command completed.", `pi-${source.id}`);
       this.state.finishActiveTurn(turnId, "running");
@@ -514,7 +531,8 @@ export class BridgeService {
         projectAlias: binding.projectAlias,
       });
     } catch (error) {
-      unsubscribe?.();
+      this.activeSessionTurns.delete(binding.id);
+      activeSessionTurn?.unsubscribe?.();
       await activity?.finalize();
       const current = this.state.getActiveTurn(turnId);
       if (current?.status === "starting") this.state.transitionActiveTurn(turnId, "starting", "stopping");
@@ -608,12 +626,22 @@ export class BridgeService {
           this.activeExtensionErrors.get(binding.id)?.push(error);
         },
       });
+      this.bindActiveTurnSession(binding.id, session);
     };
 
     if (typeof runtime.setRebindSession === "function") {
       runtime.setRebindSession(bindSession);
     }
     await bindSession(runtime.session);
+  }
+
+  private bindActiveTurnSession(bindingId: number, session: AgentSessionRuntime["session"]): void {
+    const activeTurn = this.activeSessionTurns.get(bindingId);
+    if (!activeTurn) return;
+    activeTurn.unsubscribe?.();
+    activeTurn.session = session;
+    activeTurn.messageStart = session.messages.length;
+    activeTurn.unsubscribe = session.subscribe((event) => activeTurn.activity.handle(event));
   }
 
   private async replaceRuntimeSession(
