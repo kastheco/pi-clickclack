@@ -143,6 +143,7 @@ function message(input: {
   authorId?: string;
   channelId?: string;
   directConversationId?: string;
+  attachments?: Message["attachments"];
 }): Message {
   return {
     id: input.id,
@@ -155,6 +156,7 @@ function message(input: {
     body_format: "markdown",
     created_at: "2026-01-01T00:00:00Z",
     kind: "message",
+    ...(input.attachments ? { attachments: input.attachments } : {}),
   };
 }
 
@@ -272,6 +274,208 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   assert.equal(setup.activity[0]?.turnId, setup.activity[1]?.turnId);
   assert.equal(service.state.getBinding("channel", "chn_1" as never)?.projectAlias, "main");
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-1");
+  service.stop();
+});
+
+test("an attachment is hydrated, downloaded, and passed to Pi as an image", async () => {
+  const setup = fixture();
+  const upload = {
+    id: "upl_1",
+    workspace_id: "wsp_test",
+    owner_id: "usr_owner",
+    filename: "diagram.png",
+    content_type: "image/png",
+    byte_size: 7,
+    created_at: "2026-01-01T00:00:00Z",
+  };
+  const source = message({
+    id: "msg_image",
+    body: "look at this",
+    directConversationId: "dm_1",
+  });
+  const hydrated = message({
+    id: source.id,
+    body: source.body,
+    directConversationId: "dm_1",
+    attachments: [upload],
+  });
+  let messageReads = 0;
+  setup.messages.set(source.id, source);
+  setup.clickClack.messages.get = async () => {
+    messageReads += 1;
+    if (messageReads === 2) throw new Error("temporary read failure");
+    return messageReads === 1 ? source : hydrated;
+  };
+  const downloaded: string[] = [];
+  Object.assign(setup.clickClack, {
+    uploads: {
+      download: async (uploadId: string) => {
+        downloaded.push(uploadId);
+        return new Blob(["PNGDATA"], { type: "image/png" });
+      },
+    },
+  });
+  let receivedPrompt = "";
+  let receivedImages: unknown[] | undefined;
+  const runtime = {
+    session: {
+      sessionId: "session-image",
+      sessionFile: "/tmp/session-image.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt(text: string, options?: { images?: unknown[] }) {
+        receivedPrompt = text;
+        receivedImages = options?.images;
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "seen" }], stopReason: "stop" });
+      },
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+    sleep: async () => {},
+  } as ConstructorParameters<typeof BridgeService>[1]);
+
+  await service.start();
+  setup.emit({
+    ...createdEvent({ messageId: source.id, cursor: "cur_200" }),
+    payload: {
+      message_id: source.id,
+      author_id: "usr_owner",
+      direct_conversation_id: "dm_1",
+      expected_attachment_count: "1",
+    },
+  });
+  await service.waitForIdle();
+
+  assert.equal(messageReads, 3);
+  assert.deepEqual(downloaded, [upload.id]);
+  assert.equal(receivedPrompt, "look at this");
+  assert.deepEqual(receivedImages, [{
+    type: "image",
+    data: Buffer.from("PNGDATA").toString("base64"),
+    mimeType: "image/png",
+  }]);
+  assert.deepEqual(setup.sent, [{ target: "direct", id: "dm_1", body: "seen" }]);
+  service.stop();
+});
+
+test("an incomplete attachment set fails visibly without prompting Pi", async () => {
+  const setup = fixture();
+  const source = message({
+    id: "msg_incomplete_image",
+    body: "look at this",
+    directConversationId: "dm_1",
+  });
+  let messageReads = 0;
+  setup.messages.set(source.id, source);
+  setup.clickClack.messages.get = async () => {
+    messageReads += 1;
+    return source;
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => {
+      throw new Error("Pi must not start for incomplete attachments");
+    },
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+    sleep: async () => {},
+  });
+
+  await service.start();
+  setup.emit({
+    ...createdEvent({ messageId: source.id, cursor: "cur_200" }),
+    payload: {
+      message_id: source.id,
+      author_id: "usr_owner",
+      direct_conversation_id: "dm_1",
+      expected_attachment_count: "1",
+    },
+  });
+  await service.waitForIdle();
+
+  assert.equal(messageReads, 26);
+  assert.deepEqual(setup.sent, [{
+    target: "direct",
+    id: "dm_1",
+    body: "i couldn't load every attachment. please resend the message and try again.",
+  }]);
+  service.stop();
+});
+
+test("oversized images are rejected before the bridge downloads them", async () => {
+  const setup = fixture();
+  const source = message({
+    id: "msg_oversized_image",
+    body: "look at this",
+    directConversationId: "dm_1",
+    attachments: Array.from({ length: 5 }, (_, index) => ({
+      id: `upl_large_${index}`,
+      workspace_id: "wsp_test",
+      owner_id: "usr_owner",
+      filename: `large-${index}.png`,
+      content_type: "image/png",
+      byte_size: 5 * 1024 * 1024,
+      created_at: "2026-01-01T00:00:00Z",
+    })),
+  });
+  setup.messages.set(source.id, source);
+  let downloads = 0;
+  Object.assign(setup.clickClack, {
+    uploads: {
+      download: async () => {
+        downloads += 1;
+        return new Blob();
+      },
+    },
+  });
+  let prompts = 0;
+  const runtime = {
+    session: {
+      sessionId: "session-large-image",
+      sessionFile: "/tmp/session-large-image.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() { prompts += 1; },
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const logLines: string[] = [];
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink: (line) => logLines.push(line) }),
+  });
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await service.waitForIdle();
+
+  assert.equal(downloads, 0);
+  assert.equal(prompts, 0);
+  assert.match(logLines.join("\n"), /image attachments total/u);
+  assert.deepEqual(setup.sent, [{
+    target: "direct",
+    id: "dm_1",
+    body: "pi couldn't complete that turn. check the bridge log for the error.",
+  }]);
   service.stop();
 });
 

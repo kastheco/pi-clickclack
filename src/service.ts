@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 import type { BotCommandInput, Message, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
-import { resolveCliModel, type AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
+import { resolveCliModel, type AgentSessionRuntime, type PromptOptions } from "@earendil-works/pi-coding-agent";
 
 import { TurnActivity, type ActivityTransport } from "./activity.js";
 import {
@@ -31,6 +31,7 @@ export type BridgeServiceDependencies = {
   stateStore?: StateStore;
   clickClack?: ClickClackBoundary;
   piRuntime?: EmbeddedPiRuntimeBoundary;
+  sleep?: (milliseconds: number) => Promise<void>;
 };
 
 type ConversationTarget = {
@@ -39,6 +40,11 @@ type ConversationTarget = {
 };
 
 const reconnectDelayMs = 1_000;
+const attachmentHydrationDelayMs = 80;
+const attachmentHydrationAttempts = 25;
+const maxPiImageBytes = 5 * 1024 * 1024;
+const maxPiImageTotalBytes = 20 * 1024 * 1024;
+const piImageContentTypes = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
 
 type ActiveSessionTurn = {
   activity: TurnActivity;
@@ -53,6 +59,7 @@ export class BridgeService {
   readonly piRuntime: EmbeddedPiRuntimeBoundary;
   readonly logger: Logger;
 
+  private readonly sleep: (milliseconds: number) => Promise<void>;
   private started = false;
   private stopped = false;
   private identity?: User;
@@ -75,6 +82,7 @@ export class BridgeService {
     this.state = dependencies.stateStore ?? new StateStore(config.statePath);
     this.clickClack = dependencies.clickClack ?? createClickClackClient(config);
     this.piRuntime = dependencies.piRuntime ?? createEmbeddedPiRuntime(config);
+    this.sleep = dependencies.sleep ?? delay;
   }
 
   async start(): Promise<void> {
@@ -196,16 +204,15 @@ export class BridgeService {
   }
 
   private async processEvent(event: RealtimeEvent): Promise<void> {
-    try {
-      if (event.workspace_id !== this.config.clickClack.workspaceId) return;
-      if (event.type !== "message.created") return;
+    if (event.workspace_id !== this.config.clickClack.workspaceId) return;
+    if (event.type === "message.created") {
       const messageId = textField(event.payload.message_id);
-      if (!messageId) return;
-      const message = await this.clickClack.messages.get(messageId);
-      await this.processMessage(event, message);
-    } finally {
-      if (event.cursor) this.state.advanceRealtimeCursor(event.cursor);
+      if (messageId) {
+        const message = await this.clickClack.messages.get(messageId);
+        await this.processMessage(event, message);
+      }
     }
+    if (event.cursor) this.state.advanceRealtimeCursor(event.cursor);
   }
 
   private async processMessage(event: RealtimeEvent, message: Message): Promise<void> {
@@ -247,6 +254,23 @@ export class BridgeService {
       return;
     }
 
+    const hydrated = await this.hydrateExpectedAttachments(event, message);
+    if (!hydrated) {
+      const claim = this.state.claimSourceMessage({
+        messageId: toMessageId(message.id),
+        eventId: event.id,
+        eventCursor: event.cursor,
+      });
+      if (claim.claimed) {
+        await this.sendReply(
+          message,
+          "i couldn't load every attachment. please resend the message and try again.",
+          `pi-attachment-error-${message.id}`,
+        );
+      }
+      return;
+    }
+    message = hydrated;
     const claim = this.state.claimSourceMessage({
       messageId: toMessageId(message.id),
       eventId: event.id,
@@ -265,7 +289,12 @@ export class BridgeService {
       return;
     }
 
-    const prompt = cleanBody || "say hello and briefly identify the project connected to this conversation.";
+    const hasImage = message.attachments?.some((attachment) =>
+      piImageContentTypes.has(normalizeContentType(attachment.content_type))
+    );
+    const prompt = cleanBody || (hasImage
+      ? "Review the attached image."
+      : "say hello and briefly identify the project connected to this conversation.");
     await this.runTurn(binding, message, prompt);
   }
 
@@ -473,6 +502,71 @@ export class BridgeService {
     });
   }
 
+  private async hydrateExpectedAttachments(
+    event: RealtimeEvent,
+    message: Message,
+  ): Promise<Message | undefined> {
+    const expected = positiveIntegerField(event.payload.expected_attachment_count);
+    if (expected === 0 || (message.attachments?.length ?? 0) >= expected) return message;
+
+    let hydrated = message;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attachmentHydrationAttempts; attempt += 1) {
+      await this.sleep(attachmentHydrationDelayMs);
+      try {
+        hydrated = await this.clickClack.messages.get(message.id);
+        if ((hydrated.attachments?.length ?? 0) >= expected) return hydrated;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    this.logger.warn("message attachments did not finish hydrating", {
+      messageId: message.id,
+      expectedAttachments: expected,
+      hydratedAttachments: hydrated.attachments?.length ?? 0,
+      ...(lastError ? { error: lastError } : {}),
+    });
+    return undefined;
+  }
+
+  private async loadPromptImages(
+    message: Message,
+  ): Promise<Array<{ type: "image"; data: string; mimeType: string }>> {
+    const attachments = message.attachments ?? [];
+    const images = attachments.filter((attachment) =>
+      piImageContentTypes.has(normalizeContentType(attachment.content_type))
+    );
+    const oversized = images.find((attachment) => attachment.byte_size > maxPiImageBytes);
+    if (oversized) {
+      throw new Error(
+        `ClickClack image attachment ${oversized.id} is larger than Pi's ${maxPiImageBytes} byte limit`,
+      );
+    }
+    const totalBytes = images.reduce((total, attachment) => total + attachment.byte_size, 0);
+    if (totalBytes > maxPiImageTotalBytes) {
+      throw new Error(
+        `ClickClack image attachments total ${totalBytes} bytes; Pi's limit is ${maxPiImageTotalBytes}`,
+      );
+    }
+
+    const promptImages: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    for (const attachment of images) {
+      const blob = await this.clickClack.uploads.download(attachment.id);
+      const bytes = Buffer.from(await blob.arrayBuffer());
+      if (bytes.byteLength !== attachment.byte_size) {
+        throw new Error(
+          `ClickClack attachment ${attachment.id} downloaded ${bytes.byteLength} bytes; expected ${attachment.byte_size}`,
+        );
+      }
+      promptImages.push({
+        type: "image",
+        data: bytes.toString("base64"),
+        mimeType: normalizeContentType(attachment.content_type),
+      });
+    }
+    return promptImages;
+  }
+
   private async runTurn(
     binding: ConversationBinding,
     source: Message,
@@ -510,7 +604,12 @@ export class BridgeService {
       const extensionErrors: Error[] = [];
       this.activeExtensionErrors.set(binding.id, extensionErrors);
       try {
-        await this.promptAndWaitForNestedPrompts(runtime.session, prompt);
+        const images = await this.loadPromptImages(source);
+        await this.promptAndWaitForNestedPrompts(
+          runtime.session,
+          prompt,
+          images.length > 0 ? { images } : {},
+        );
         if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
         this.activeExtensionErrors.delete(binding.id);
@@ -662,6 +761,7 @@ export class BridgeService {
   private async promptAndWaitForNestedPrompts(
     session: AgentSessionRuntime["session"],
     prompt: string,
+    promptOptions: Pick<PromptOptions, "images"> = {},
   ): Promise<void> {
     const originalPrompt = session.prompt;
     const pending = new Set<Promise<void>>();
@@ -680,7 +780,7 @@ export class BridgeService {
     };
 
     try {
-      await session.prompt(prompt, { source: "interactive" });
+      await session.prompt(prompt, { ...promptOptions, source: "interactive" });
       while (pending.size > 0) await Promise.allSettled([...pending]);
       if (nestedFailure !== undefined) throw nestedFailure;
       if (typeof session.waitForIdle === "function") await session.waitForIdle();
@@ -794,6 +894,19 @@ function stripBotMention(body: string, handle: string): string {
 
 function textField(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function positiveIntegerField(value: unknown): number {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : 0;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function normalizeContentType(value: string): string {
+  return value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isContinueCommand(body: string): boolean {
