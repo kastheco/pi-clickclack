@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  decisionBlock,
+  decisionBlockLanguage,
   decisionTurnId,
   isDecisionTurnId,
   readDecisionReply,
@@ -100,6 +102,42 @@ test("an ordinary activity turn is not a decision", () => {
   for (const turnId of ["turn_abc", "", undefined]) {
     assert.equal(isDecisionTurnId(turnId), false, String(turnId));
   }
+});
+
+test("the prompt carries a parseable choice block", () => {
+  const prompt = renderDecisionPrompt(decision());
+  const fence = new RegExp("```" + decisionBlockLanguage + "\\n(.*?)\\n```", "su").exec(prompt);
+  assert.notEqual(fence, null);
+  assert.deepEqual(JSON.parse(fence?.[1] ?? ""), {
+    v: 1,
+    choices: [
+      { n: 1, key: "continue", label: "Yes, continue", input: false },
+      { n: 2, key: "stop", label: "No, stop", input: false },
+      { n: 3, key: "replan", label: "Replan", input: true },
+    ],
+    dismiss: "cancel",
+  });
+});
+
+// The block exists so a client can answer without retyping. Every reply it
+// advertises has to be one readDecisionReply already accepts, or a button would
+// send something the bridge drops on the floor.
+test("every reply the block advertises is one the bridge accepts", () => {
+  const block = decisionBlock(decision());
+  for (const choice of block.choices) {
+    const body = choice.input ? `${choice.n} some instructions` : String(choice.n);
+    assert.deepEqual(
+      readDecisionReply(decision(), body),
+      {
+        kind: "answer",
+        answer: choice.input
+          ? { choice: choice.key, input: { instructions: "some instructions" } }
+          : { choice: choice.key },
+      },
+      body,
+    );
+  }
+  assert.deepEqual(readDecisionReply(decision(), block.dismiss), { kind: "dismissed" });
 });
 
 // Pins the bridge's marker against the copy ClickClack's web client matches on.

@@ -13,6 +13,36 @@ import type { ClaimedWorkflowDecision, DecisionAnswer } from "./workflow-decisio
 /** Reply text that means "leave this decision alone". */
 const dismissals = new Set(["cancel", "dismiss", "ignore", "later", "skip"]);
 
+/** The dismissal a client should send. One of `dismissals`, and the one the prose prints. */
+const offeredDismissal = "cancel";
+
+/**
+ * Fence language marking the machine-readable half of a decision prompt.
+ *
+ * ClickClack messages carry no metadata field: CreateMessageRequest accepts
+ * body, kind, turn_id, nonce, topic_id, bot_command_id, and
+ * expected_attachment_count, and turn_id already carries the decision marker.
+ * So the structure travels in the body, as a fenced block this module authors
+ * next to the prose it authors. A client reads the block; one that does not
+ * know it still renders the numbered prose, which stays authoritative for
+ * anyone answering by hand.
+ */
+export const decisionBlockLanguage = "clickclack-decision";
+
+/** Machine-readable choices published alongside the rendered prompt. */
+export type DecisionBlock = {
+  v: 1;
+  choices: readonly {
+    /** The number the operator would type. Carried explicitly, never derived from position. */
+    n: number;
+    key: string;
+    label: string;
+    /** True when the choice needs text after the number, so a bare click cannot answer it. */
+    input: boolean;
+  }[];
+  dismiss: string;
+};
+
 /**
  * Namespace marking a turn as a workflow decision prompt.
  *
@@ -50,7 +80,22 @@ export function renderDecisionPrompt(decision: ClaimedWorkflowDecision): string 
     lines.push(`${index + 1}. ${choice.label}${suffix}`);
   });
   lines.push("", "_Reply with a number to answer. Reply `cancel` to leave it pending._");
+  lines.push("", `\`\`\`${decisionBlockLanguage}`, JSON.stringify(decisionBlock(decision)), "```");
   return lines.join("\n");
+}
+
+/** Builds the machine-readable half of one decision prompt. */
+export function decisionBlock(decision: ClaimedWorkflowDecision): DecisionBlock {
+  return {
+    v: 1,
+    choices: decision.choices.map((choice, index) => ({
+      n: index + 1,
+      key: choice.key,
+      label: choice.label,
+      input: choice.expectsInput,
+    })),
+    dismiss: offeredDismissal,
+  };
 }
 
 export type DecisionReply =
