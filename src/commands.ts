@@ -9,6 +9,7 @@ export type SlashInvocation = {
 
 export const botCommandMenu: readonly BotCommandInput[] = [
   { command: "project", description: "Bind this conversation to a configured project", args_hint: "<alias>" },
+  { command: "invoke", description: "Show or set how this conversation invokes Pi", args_hint: "[mention|always]" },
   { command: "continue", description: "Continue the latest recoverable Pi session" },
   { command: "compact", description: "Compact the current Pi session", args_hint: "[instructions]" },
   { command: "new", description: "Start a new Pi session" },

@@ -424,7 +424,10 @@ export class BridgeService {
       conversationType: target.type,
       conversationId,
       projectAlias: alias,
-      invocationMode: this.invocationMode(target),
+      // An existing binding keeps the mode it was last set to. Recomputing from
+      // static config here would silently revert an operator's /invoke choice
+      // the next time they rebound the project.
+      invocationMode: previous?.invocationMode ?? this.invocationMode(target),
     });
     const modeText = binding.invocationMode === "mention" ? "mention @pi to invoke it" : "messages will invoke pi automatically";
     await this.sendReply(source, `bound to \`${aliasValue}\`; ${modeText}.`);
@@ -459,6 +462,12 @@ export class BridgeService {
     invocation: SlashInvocation,
   ): Promise<void> {
     const command = invocation.name.toLowerCase();
+    // Answered before the runtime is resolved: changing how a conversation
+    // invokes Pi should not require a working Pi session.
+    if (command === "invoke") {
+      await this.handleInvokeCommand(binding, source, invocation.args);
+      return;
+    }
     try {
       const runtime = await this.runtimeFor(binding);
       switch (command) {
@@ -752,8 +761,61 @@ export class BridgeService {
         status,
         error,
       });
+      if (error instanceof MissingAssistantTextError) {
+        const reset = await this.quarantineUnresponsiveSession(binding);
+        if (reset) {
+          await this.sendReply(
+            source,
+            "pi's session stopped responding, so it was reset. send that again.",
+            `pi-error-${source.id}`,
+          );
+          return;
+        }
+      }
       await this.sendReply(source, "pi couldn't complete that turn. check the bridge log for the error.", `pi-error-${source.id}`);
     }
+  }
+
+  private async quarantineUnresponsiveSession(binding: ConversationBinding): Promise<boolean> {
+    const runtime = this.runtimes.get(binding.id);
+    this.runtimes.delete(binding.id);
+
+    const presented = this.presentedDecisions.get(binding.id);
+    presented?.resolve(undefined);
+    this.presentedDecisions.delete(binding.id);
+
+    const watcher = this.decisionWatchers.get(binding.id);
+    this.decisionWatchers.delete(binding.id);
+    if (watcher) {
+      try {
+        await watcher.stop();
+      } catch (error) {
+        this.logger.warn("could not stop workflow decision watcher for unresponsive Pi session", {
+          bindingId: binding.id,
+          error,
+        });
+      }
+    }
+
+    if (runtime) {
+      try {
+        await runtime.dispose();
+      } catch (error) {
+        this.logger.warn("could not dispose unresponsive Pi session", {
+          bindingId: binding.id,
+          error,
+        });
+      }
+    }
+    const archived = this.state.archiveActivePiSession(binding.id);
+    if (runtime || archived) {
+      this.logger.warn("quarantined unresponsive Pi session", {
+        bindingId: binding.id,
+        projectAlias: binding.projectAlias,
+      });
+      return true;
+    }
+    return false;
   }
 
   private async runtimeFor(binding: ConversationBinding): Promise<AgentSessionRuntime> {
@@ -985,6 +1047,45 @@ export class BridgeService {
     return Boolean(this.identity && event.mentioned_user_ids?.includes(this.identity.id));
   }
 
+  /**
+   * Shows or sets how this conversation invokes Pi.
+   *
+   * Direct conversations always invoke automatically, so the mode is fixed
+   * there. A channel dedicated to Pi can opt out of mention-only without an
+   * environment change and a restart.
+   */
+  private async handleInvokeCommand(
+    binding: ConversationBinding,
+    source: Message,
+    args: string,
+  ): Promise<void> {
+    const nonce = `pi-command-${source.id}`;
+    const requested = args.trim().toLowerCase();
+    const describe = (mode: InvocationMode) =>
+      mode === "mention" ? "mention @pi to invoke it" : "every message invokes pi";
+
+    if (!requested) {
+      await this.sendReply(source, `invocation: \`${binding.invocationMode}\`; ${describe(binding.invocationMode)}.`, nonce);
+      return;
+    }
+    if (requested !== "mention" && requested !== "always") {
+      await this.sendReply(source, "usage: `/invoke [mention|always]`", nonce);
+      return;
+    }
+    if (binding.conversationType === "direct") {
+      await this.sendReply(source, "direct conversations always invoke pi automatically.", nonce);
+      return;
+    }
+
+    const updated = this.state.upsertBinding({
+      conversationType: binding.conversationType,
+      conversationId: binding.conversationId,
+      projectAlias: binding.projectAlias,
+      invocationMode: requested,
+    });
+    await this.sendReply(source, `invocation set to \`${updated.invocationMode}\`; ${describe(updated.invocationMode)}.`, nonce);
+  }
+
   private invocationMode(target: ConversationTarget): InvocationMode {
     if (target.type === "direct") return "auto";
     return this.config.invocationBindings.find(
@@ -1152,5 +1253,12 @@ function finalAssistantText(messages: readonly unknown[], allowMissing = false):
     break;
   }
   if (allowMissing) return undefined;
-  throw new Error("Pi completed without an assistant text response");
+  throw new MissingAssistantTextError();
+}
+
+class MissingAssistantTextError extends Error {
+  constructor() {
+    super("Pi completed without an assistant text response");
+    this.name = "MissingAssistantTextError";
+  }
 }

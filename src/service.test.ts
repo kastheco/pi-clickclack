@@ -203,7 +203,7 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   assert.equal(setup.subscriptionCount(), 1);
   assert.deepEqual(
     setup.commandMenu.map((command) => command.command),
-    ["project", "continue", "compact", "new", "name", "session", "model", "thinking", "reload", "copy"],
+    ["project", "invoke", "continue", "compact", "new", "name", "session", "model", "thinking", "reload", "copy"],
   );
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
   service.stop();
@@ -906,5 +906,80 @@ test("two messages in one conversation run in order, not concurrently", async ()
   await service.waitForIdle();
 
   assert.deepEqual(events, ["start:first", "end:first", "start:second", "end:second"]);
+  service.stop();
+});
+
+test("the invoke command switches a channel to always-on and survives a rebind", async () => {
+  const setup = fixture(["main", "other"]);
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => { throw new Error("should not create a session"); },
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  const enable = message({ id: "msg_invoke", body: "/invoke always", channelId: "chn_2" });
+  const unmentioned = message({ id: "msg_plain", body: "no mention here", channelId: "chn_2" });
+  const rebind = message({ id: "msg_rebind", body: "/project other", channelId: "chn_2" });
+  for (const item of [enable, unmentioned, rebind]) setup.messages.set(item.id, item);
+
+  await service.start();
+  service.state.upsertBinding({
+    conversationType: "channel",
+    conversationId: "chn_2" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "mention",
+  });
+
+  setup.emit(createdEvent({ messageId: enable.id, cursor: "cur_200", channelId: "chn_2", mentionedUserIds: ["usr_bot"] }));
+  await service.waitForIdle();
+  assert.equal(service.state.getBinding("channel", "chn_2" as never)?.invocationMode, "always");
+  assert.match(setup.sent[0]?.body ?? "", /invocation set to `always`/u);
+
+  // An unmentioned message now reaches Pi, which is the whole point.
+  setup.emit(createdEvent({ messageId: unmentioned.id, cursor: "cur_300", channelId: "chn_2" }));
+  await service.waitForIdle();
+
+  // Rebinding the project must not silently revert the operator's choice.
+  setup.emit(createdEvent({ messageId: rebind.id, cursor: "cur_400", channelId: "chn_2" }));
+  await service.waitForIdle();
+  assert.equal(service.state.getBinding("channel", "chn_2" as never)?.invocationMode, "always");
+  service.stop();
+});
+
+test("invoke reports the current mode and refuses an unknown one", async () => {
+  const setup = fixture(["main"]);
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => { throw new Error("should not create a session"); },
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  const show = message({ id: "msg_show", body: "/invoke", channelId: "chn_2" });
+  const bogus = message({ id: "msg_bogus", body: "/invoke sometimes", channelId: "chn_2" });
+  for (const item of [show, bogus]) setup.messages.set(item.id, item);
+
+  await service.start();
+  service.state.upsertBinding({
+    conversationType: "channel",
+    conversationId: "chn_2" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "mention",
+  });
+
+  setup.emit(createdEvent({ messageId: show.id, cursor: "cur_200", channelId: "chn_2", mentionedUserIds: ["usr_bot"] }));
+  setup.emit(createdEvent({ messageId: bogus.id, cursor: "cur_300", channelId: "chn_2", mentionedUserIds: ["usr_bot"] }));
+  await service.waitForIdle();
+
+  assert.match(setup.sent[0]?.body ?? "", /invocation: `mention`/u);
+  assert.match(setup.sent[1]?.body ?? "", /usage: `\/invoke \[mention\|always\]`/u);
+  assert.equal(service.state.getBinding("channel", "chn_2" as never)?.invocationMode, "mention");
   service.stop();
 });
