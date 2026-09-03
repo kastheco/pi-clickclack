@@ -85,6 +85,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Stable identity for one answer to one decision revision.
+ *
+ * Includes the collected input, so correcting a replan instruction is a new
+ * attempt rather than a repeat of the previous one under the same key.
+ */
+function answerKey(
+  interaction: WorkflowInteractiveRequest,
+  answer: DecisionAnswer,
+): string {
+  const input = answer.input === undefined ? "" : JSON.stringify(answer.input);
+  return `${interaction.requestId}:${interaction.revision}:${answer.choice}:${input}`;
+}
+
 /** True when another presenter holds an unexpired claim on this decision. */
 export function claimIsLive(
   interaction: WorkflowInteractiveRequest,
@@ -229,11 +243,21 @@ export class WorkflowDecisionWatcher {
     return true;
   }
 
+  /**
+   * Answers one claimed decision.
+   *
+   * The host derives its acceptance attempt id from the idempotency key and
+   * treats a repeat of the same key as the same answer, so the key is derived
+   * from the request, its revision, and the chosen answer. A retry of the same
+   * answer is then idempotent, while a different answer to the same decision is
+   * a distinct attempt the host can accept or reject on its own terms rather
+   * than silently adopting the first one.
+   */
   private async answer(
     interaction: WorkflowInteractiveRequest,
     answer: DecisionAnswer,
   ): Promise<void> {
-    const submissionId = `${interaction.requestId}-${interaction.revision}-${answer.choice}`;
+    const submissionId = answerKey(interaction, answer);
     const settled = await this.options.client.requestDurable({
       operation: "decision.answer",
       idempotencyKey: submissionId,

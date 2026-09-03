@@ -247,3 +247,37 @@ test("only one decision is presented at a time", async () => {
 
   assert.equal(presented, 1);
 });
+
+test("the same answer retries under one key while a corrected answer does not", async () => {
+  const keys: string[] = [];
+  const transport = client({
+    requestDurable: async (options) => {
+      keys.push(options.idempotencyKey);
+      return { outcome: "accepted" };
+    },
+  });
+  const answers: DecisionAnswer[] = [
+    { choice: "replan", input: { instructions: "first" } },
+    { choice: "replan", input: { instructions: "first" } },
+    { choice: "replan", input: { instructions: "corrected" } },
+    { choice: "continue" },
+  ];
+
+  for (const answer of answers) {
+    const watcher = new WorkflowDecisionWatcher({
+      client: transport,
+      sessionId: "session-1",
+      present: async () => answer,
+    });
+    await watcher.start();
+    transport.emit(sessionEvent([decisionRequest()]));
+    await settle();
+    await watcher.stop();
+  }
+
+  // A repeated answer reuses its key so the host adopts the first acceptance.
+  assert.equal(keys[0], keys[1]);
+  // A corrected instruction and a different choice are separate attempts.
+  assert.notEqual(keys[1], keys[2]);
+  assert.notEqual(keys[2], keys[3]);
+});
