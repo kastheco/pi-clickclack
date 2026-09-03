@@ -14,6 +14,13 @@ import {
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig } from "./config.js";
+import { readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
+import {
+  WorkflowDecisionWatcher,
+  type ClaimedWorkflowDecision,
+  type DecisionAnswer,
+  type WorkflowDecisionClient,
+} from "./workflow-decisions.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { StateStore, type ConversationBinding } from "./state/store.js";
@@ -32,6 +39,13 @@ export type BridgeServiceDependencies = {
   clickClack?: ClickClackBoundary;
   piRuntime?: EmbeddedPiRuntimeBoundary;
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * Supplies the Pi Workflows client used to deliver human decisions.
+   *
+   * Defaults to no client, so decision delivery stays opt-in and the bridge
+   * never starts a workflow host as a side effect of ordinary chat.
+   */
+  workflowClient?: () => WorkflowDecisionClient | undefined;
 };
 
 type ConversationTarget = {
@@ -53,6 +67,18 @@ type ActiveSessionTurn = {
   unsubscribe: (() => void) | undefined;
 };
 
+/**
+ * One workflow decision presented in a conversation and awaiting a reply.
+ *
+ * The bridge holds the claim while this is open, so an unanswered decision is
+ * released rather than left claimed when the conversation moves on.
+ */
+type PresentedDecision = {
+  decision: ClaimedWorkflowDecision;
+  source: Message;
+  resolve: (answer: DecisionAnswer | undefined) => void;
+};
+
 export class BridgeService {
   readonly state: StateStore;
   readonly clickClack: ClickClackBoundary;
@@ -60,6 +86,7 @@ export class BridgeService {
   readonly logger: Logger;
 
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
   private started = false;
   private stopped = false;
   private identity?: User;
@@ -69,6 +96,10 @@ export class BridgeService {
   private eventQueue: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
+  private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
+  private readonly presentedDecisions = new Map<number, PresentedDecision>();
+  /** Last owner message per binding, used as the conversation to post decisions into. */
+  private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
 
@@ -83,6 +114,7 @@ export class BridgeService {
     this.clickClack = dependencies.clickClack ?? createClickClackClient(config);
     this.piRuntime = dependencies.piRuntime ?? createEmbeddedPiRuntime(config);
     this.sleep = dependencies.sleep ?? delay;
+    this.workflowClient = dependencies.workflowClient;
   }
 
   async start(): Promise<void> {
@@ -124,6 +156,13 @@ export class BridgeService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.socket?.close();
     this.socket = undefined;
+    // Release every claimed decision before closing. An unanswered decision
+    // stays pending in the workflow host, so another presenter can take it.
+    for (const presented of this.presentedDecisions.values()) presented.resolve(undefined);
+    this.presentedDecisions.clear();
+    for (const watcher of this.decisionWatchers.values()) void watcher.stop();
+    this.decisionWatchers.clear();
+    this.conversationSources.clear();
     for (const runtime of this.runtimes.values()) void runtime.dispose();
     this.runtimes.clear();
     this.state.close();
@@ -252,6 +291,35 @@ export class BridgeService {
     if (!binding) {
       await this.sendReply(message, `bind this conversation first with \`/project <alias>\`. available: ${[...this.config.projects.keys()].join(", ")}`);
       return;
+    }
+
+    this.conversationSources.set(binding.id, message);
+
+    // A presented workflow decision consumes the next matching reply before it
+    // can start a Pi turn. The reply is matched before the source message is
+    // claimed, so an unmatched reply still falls through to ordinary handling
+    // and the conversation is not trapped by a pending decision.
+    const presented = this.presentedDecisions.get(binding.id);
+    if (presented !== undefined) {
+      const reply = readDecisionReply(presented.decision, cleanBody);
+      if (reply.kind !== "unmatched") {
+        const claim = this.state.claimSourceMessage({
+          messageId: toMessageId(message.id),
+          eventId: event.id,
+          eventCursor: event.cursor,
+        });
+        if (!claim.claimed) return;
+        this.presentedDecisions.delete(binding.id);
+        presented.resolve(reply.kind === "answer" ? reply.answer : undefined);
+        await this.sendReply(
+          message,
+          reply.kind === "answer"
+            ? "answer recorded, resuming the workflow."
+            : "left the decision pending.",
+          `pi-decision-ack-${message.id}`,
+        );
+        return;
+      }
     }
 
     const hydrated = await this.hydrateExpectedAttachments(event, message);
@@ -681,7 +749,64 @@ export class BridgeService {
         error,
       });
     }
+    await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
     return runtime;
+  }
+
+  /**
+   * Surfaces this binding's workflow human decisions in its conversation.
+   *
+   * Watching is best effort: a workflow host that is unavailable must not stop
+   * ordinary chat turns, so a failure is logged and the binding runs without
+   * decision delivery until its next runtime.
+   */
+  private async watchWorkflowDecisions(
+    binding: ConversationBinding,
+    sessionId: string,
+  ): Promise<void> {
+    if (this.decisionWatchers.has(binding.id)) return;
+    const client = this.workflowClient?.();
+    if (client === undefined) return;
+
+    const watcher = new WorkflowDecisionWatcher({
+      client,
+      sessionId,
+      present: async (decision) => await this.presentDecision(binding, decision),
+      onError: (error) =>
+        this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
+    });
+    this.decisionWatchers.set(binding.id, watcher);
+    try {
+      await watcher.start();
+    } catch (error) {
+      this.decisionWatchers.delete(binding.id);
+      this.logger.warn("could not watch workflow decisions", { bindingId: binding.id, error });
+    }
+  }
+
+  /**
+   * Posts one decision into its conversation and waits for the operator.
+   *
+   * Resolution comes from processMessage when a reply matches. A decision left
+   * open when the conversation moves on stays pending for another presenter
+   * rather than being answered on the operator's behalf.
+   */
+  private async presentDecision(
+    binding: ConversationBinding,
+    decision: ClaimedWorkflowDecision,
+  ): Promise<DecisionAnswer | undefined> {
+    const source = this.conversationSources.get(binding.id);
+    if (source === undefined) return undefined;
+
+    await this.sendReply(
+      source,
+      renderDecisionPrompt(decision),
+      `pi-decision-${decision.requestId}-${decision.revision}`,
+    );
+
+    return await new Promise<DecisionAnswer | undefined>((resolve) => {
+      this.presentedDecisions.set(binding.id, { decision, source, resolve });
+    });
   }
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
