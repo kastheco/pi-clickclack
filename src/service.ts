@@ -833,7 +833,16 @@ export class BridgeService {
   private async runtimeFor(binding: ConversationBinding): Promise<AgentSessionRuntime> {
     const cached = this.runtimes.get(binding.id);
     if (cached) return cached;
-    const reference = this.state.getActivePiSession(binding.id);
+    let reference = this.state.getActivePiSession(binding.id);
+    if (reference && !existsSync(reference.sessionFile)) {
+      this.state.archiveActivePiSession(binding.id);
+      this.logger.warn("archived missing active Pi session file", {
+        bindingId: binding.id,
+        projectAlias: binding.projectAlias,
+        sessionId: reference.sessionId,
+      });
+      reference = undefined;
+    }
     const runtime = await this.piRuntime.createSessionRuntime({
       projectAlias: binding.projectAlias,
       ...(reference ? { sessionFile: reference.sessionFile } : {}),

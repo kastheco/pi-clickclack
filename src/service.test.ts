@@ -565,6 +565,74 @@ test("continue restores the latest recoverable session and resumes its interrupt
   }
 });
 
+test("a missing active session file is archived and replaced automatically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-clickclack-missing-session-"));
+  try {
+    const setup = fixture();
+    const missingSessionFile = join(root, "missing.jsonl");
+    const replacementSessionFile = join(root, "replacement.jsonl");
+    const createRequests: Array<{ projectAlias: string; sessionFile?: string }> = [];
+    const runtime = {
+      session: {
+        sessionId: "session-replacement",
+        sessionFile: replacementSessionFile,
+        sessionName: undefined as string | undefined,
+        messages: [] as unknown[],
+        subscribe() { return () => {}; },
+        setSessionName(name: string) { this.sessionName = name; },
+      },
+      async dispose() {},
+    };
+    const piRuntime = {
+      kind: "embedded-pi-sdk" as const,
+      project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async (request: { projectAlias: string; sessionFile?: string }) => {
+        createRequests.push(request);
+        if (request.sessionFile) throw new Error(`attempted to restore missing session ${request.sessionFile}`);
+        return runtime;
+      },
+    } as unknown as EmbeddedPiRuntimeBoundary;
+    const service = new BridgeService(setup.config, {
+      clickClack: setup.clickClack,
+      piRuntime,
+      logger: createLogger({ sink() {} }),
+    });
+    const binding = service.state.upsertBinding({
+      conversationType: "direct",
+      conversationId: "dm_missing_session" as never,
+      projectAlias: toProjectAlias("main"),
+      invocationMode: "auto",
+    });
+    const stale = service.state.setActivePiSession({
+      bindingId: binding.id,
+      sessionId: "session-missing",
+      sessionFile: missingSessionFile,
+    });
+    const source = message({
+      id: "msg_missing_session",
+      body: "/name recovered",
+      directConversationId: "dm_missing_session",
+    });
+    setup.messages.set(source.id, source);
+
+    await service.start();
+    setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+    await service.waitForIdle();
+
+    assert.deepEqual(createRequests, [{ projectAlias: "main" }]);
+    assert.equal(service.state.getActivePiSession(binding.id)?.sessionId, "session-replacement");
+    assert.equal(service.state.listArchivedPiSessions(binding.id).some((candidate) => candidate.id === stale.id), true);
+    assert.deepEqual(setup.sent, [{
+      target: "direct",
+      id: "dm_missing_session",
+      body: "Pi session name set: recovered",
+    }]);
+    service.stop();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("project command switches projects, archives the old session, and unmentioned channel text stays ignored", async () => {
   const setup = fixture(["main", "other"]);
   const piRuntime = {
