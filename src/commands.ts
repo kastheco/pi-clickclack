@@ -59,8 +59,14 @@ export function isPiResourceCommand(runtime: AgentSessionRuntime, invocation: Sl
   return runtime.session.resourceLoader.getSkills().skills.some((skill) => skill.name === skillName);
 }
 
+/**
+ * Matches ClickClack's bot command shape, including one optional namespace
+ * segment, so a command family such as /kas:cook reaches the command menu.
+ * A name outside this shape is dropped rather than rejected, because Pi
+ * extensions may register names ClickClack cannot represent.
+ */
 function isPublishableCommandName(name: string): boolean {
-  return /^[a-z0-9_-]{1,32}$/u.test(name);
+  return /^[a-z0-9_-]{1,32}(?::[a-z0-9_-]{1,32})?$/u.test(name);
 }
 
 function boundedMetadata(value: string): string {
