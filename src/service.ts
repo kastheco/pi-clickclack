@@ -14,7 +14,7 @@ import {
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig } from "./config.js";
-import { readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
+import { decisionTurnId, readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
 import {
   WorkflowDecisionWatcher,
   type ClaimedWorkflowDecision,
@@ -798,10 +798,15 @@ export class BridgeService {
     const source = this.conversationSources.get(binding.id);
     if (source === undefined) return undefined;
 
-    await this.sendReply(
-      source,
+    // Posted as agent_commentary carrying a decision turn_id rather than as an
+    // ordinary reply. ClickClack has no decision message kind, and its
+    // message.created event omits kind entirely for ordinary messages, so an
+    // ordinary reply would reach the client with nothing marking it as a
+    // decision.
+    await this.activityTransport(source).create(
+      "agent_commentary",
       renderDecisionPrompt(decision),
-      `pi-decision-${decision.requestId}-${decision.revision}`,
+      decisionTurnId(decision.requestId, decision.revision),
     );
 
     return await new Promise<DecisionAnswer | undefined>((resolve) => {

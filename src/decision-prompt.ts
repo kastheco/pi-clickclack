@@ -13,6 +13,31 @@ import type { ClaimedWorkflowDecision, DecisionAnswer } from "./workflow-decisio
 /** Reply text that means "leave this decision alone". */
 const dismissals = new Set(["cancel", "dismiss", "ignore", "later", "skip"]);
 
+/**
+ * Namespace marking a turn as a workflow decision prompt.
+ *
+ * ClickClack's message kinds are message, agent_commentary, and agent_tool; a
+ * decision is not one of them and adding a kind would diverge this fork from
+ * upstream on its own message contract. turn_id is an opaque bot-authored
+ * correlation string that ClickClack passes through unvalidated and publishes
+ * on the message.created event, so it carries the marker instead.
+ *
+ * A decision prompt therefore posts as agent_commentary, which already requires
+ * a bot token holding agent_activity:write, so a human session cannot forge
+ * one.
+ */
+const decisionTurnPrefix = "decision:";
+
+/** Builds the turn_id that marks one decision prompt. */
+export function decisionTurnId(requestId: string, revision: number): string {
+  return `${decisionTurnPrefix}${requestId}:${revision}`;
+}
+
+/** True when a turn_id marks a workflow decision prompt. */
+export function isDecisionTurnId(turnId: string | undefined): boolean {
+  return turnId !== undefined && turnId.startsWith(decisionTurnPrefix);
+}
+
 export function renderDecisionPrompt(decision: ClaimedWorkflowDecision): string {
   const lines = [
     `**${decision.title}**`,

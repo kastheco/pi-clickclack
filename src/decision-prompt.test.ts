@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
+import {
+  decisionTurnId,
+  isDecisionTurnId,
+  readDecisionReply,
+  renderDecisionPrompt,
+} from "./decision-prompt.js";
 import type { ClaimedWorkflowDecision } from "./workflow-decisions.js";
 
 function decision(): ClaimedWorkflowDecision {
@@ -83,4 +88,23 @@ test("multiline instructions keep their body", () => {
     kind: "answer",
     answer: { choice: "replan", input: { instructions: "rework the plan\nkeep the island" } },
   });
+});
+
+test("a decision turn is marked so the client can recognize it", () => {
+  const turnId = decisionTurnId("request-1", 3);
+  assert.equal(turnId, "decision:request-1:3");
+  assert.equal(isDecisionTurnId(turnId), true);
+});
+
+test("an ordinary activity turn is not a decision", () => {
+  for (const turnId of ["turn_abc", "", undefined]) {
+    assert.equal(isDecisionTurnId(turnId), false, String(turnId));
+  }
+});
+
+// Pins the bridge's marker against the copy ClickClack's web client matches on.
+// The two sides live in separate repositories, so a silent rename here would
+// leave the alert permanently quiet with both test suites still green.
+test("the marker matches the prefix ClickClack detects", () => {
+  assert.match(decisionTurnId("request-1", 3), /^decision:/u);
 });
