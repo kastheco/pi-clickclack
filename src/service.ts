@@ -14,6 +14,13 @@ import {
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig } from "./config.js";
+import { decisionTurnId, readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
+import {
+  WorkflowDecisionWatcher,
+  type ClaimedWorkflowDecision,
+  type DecisionAnswer,
+  type WorkflowDecisionClient,
+} from "./workflow-decisions.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { StateStore, type ConversationBinding } from "./state/store.js";
@@ -32,6 +39,13 @@ export type BridgeServiceDependencies = {
   clickClack?: ClickClackBoundary;
   piRuntime?: EmbeddedPiRuntimeBoundary;
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * Supplies the Pi Workflows client used to deliver human decisions.
+   *
+   * Defaults to no client, so decision delivery stays opt-in and the bridge
+   * never starts a workflow host as a side effect of ordinary chat.
+   */
+  workflowClient?: () => WorkflowDecisionClient | undefined;
 };
 
 type ConversationTarget = {
@@ -53,6 +67,18 @@ type ActiveSessionTurn = {
   unsubscribe: (() => void) | undefined;
 };
 
+/**
+ * One workflow decision presented in a conversation and awaiting a reply.
+ *
+ * The bridge holds the claim while this is open, so an unanswered decision is
+ * released rather than left claimed when the conversation moves on.
+ */
+type PresentedDecision = {
+  decision: ClaimedWorkflowDecision;
+  source: Message;
+  resolve: (answer: DecisionAnswer | undefined) => void;
+};
+
 export class BridgeService {
   readonly state: StateStore;
   readonly clickClack: ClickClackBoundary;
@@ -60,6 +86,7 @@ export class BridgeService {
   readonly logger: Logger;
 
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
   private started = false;
   private stopped = false;
   private identity?: User;
@@ -67,8 +94,19 @@ export class BridgeService {
   private socket: WebSocket | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
+  /**
+   * One work chain per conversation binding. Ingest stays globally ordered so
+   * the realtime cursor and source-message claims advance in event order, but
+   * agent turns run on these chains so a turn in one conversation cannot block
+   * a message in another.
+   */
+  private readonly conversationQueues = new Map<number, Promise<void>>();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
+  private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
+  private readonly presentedDecisions = new Map<number, PresentedDecision>();
+  /** Last owner message per binding, used as the conversation to post decisions into. */
+  private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
 
@@ -83,6 +121,7 @@ export class BridgeService {
     this.clickClack = dependencies.clickClack ?? createClickClackClient(config);
     this.piRuntime = dependencies.piRuntime ?? createEmbeddedPiRuntime(config);
     this.sleep = dependencies.sleep ?? delay;
+    this.workflowClient = dependencies.workflowClient;
   }
 
   async start(): Promise<void> {
@@ -124,6 +163,13 @@ export class BridgeService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.socket?.close();
     this.socket = undefined;
+    // Release every claimed decision before closing. An unanswered decision
+    // stays pending in the workflow host, so another presenter can take it.
+    for (const presented of this.presentedDecisions.values()) presented.resolve(undefined);
+    this.presentedDecisions.clear();
+    for (const watcher of this.decisionWatchers.values()) void watcher.stop();
+    this.decisionWatchers.clear();
+    this.conversationSources.clear();
     for (const runtime of this.runtimes.values()) void runtime.dispose();
     this.runtimes.clear();
     this.state.close();
@@ -135,7 +181,30 @@ export class BridgeService {
   }
 
   async waitForIdle(): Promise<void> {
-    await this.eventQueue;
+    for (;;) {
+      await this.eventQueue;
+      const pending = [...this.conversationQueues.values()];
+      if (pending.length === 0) return;
+      await Promise.all(pending);
+    }
+  }
+
+  /**
+   * Append conversation-scoped work to that conversation's chain and return
+   * immediately. Failures are logged rather than rethrown so one failed turn
+   * does not poison the chain for later messages.
+   */
+  private enqueueConversationWork(bindingId: number, work: () => Promise<void>): void {
+    const previous = this.conversationQueues.get(bindingId) ?? Promise.resolve();
+    const next: Promise<void> = previous
+      .then(work)
+      .catch((error: unknown) => {
+        this.logger.error("conversation work failed", { bindingId, error });
+      })
+      .then(() => {
+        if (this.conversationQueues.get(bindingId) === next) this.conversationQueues.delete(bindingId);
+      });
+    this.conversationQueues.set(bindingId, next);
   }
 
   private async connectRealtime(): Promise<void> {
@@ -232,7 +301,14 @@ export class BridgeService {
         eventCursor: event.cursor,
       });
       if (!claim.claimed) return;
-      await this.bindProject(target, projectCommand, message);
+      // Rebinding disposes the conversation's runtime, so it has to wait behind
+      // any turn already running on that conversation.
+      const existing = this.state.getBinding(target.type, toConversationId(target.id));
+      if (existing) {
+        this.enqueueConversationWork(existing.id, () => this.bindProject(target, projectCommand, message));
+      } else {
+        await this.bindProject(target, projectCommand, message);
+      }
       return;
     }
 
@@ -252,6 +328,35 @@ export class BridgeService {
     if (!binding) {
       await this.sendReply(message, `bind this conversation first with \`/project <alias>\`. available: ${[...this.config.projects.keys()].join(", ")}`);
       return;
+    }
+
+    this.conversationSources.set(binding.id, message);
+
+    // A presented workflow decision consumes the next matching reply before it
+    // can start a Pi turn. The reply is matched before the source message is
+    // claimed, so an unmatched reply still falls through to ordinary handling
+    // and the conversation is not trapped by a pending decision.
+    const presented = this.presentedDecisions.get(binding.id);
+    if (presented !== undefined) {
+      const reply = readDecisionReply(presented.decision, cleanBody);
+      if (reply.kind !== "unmatched") {
+        const claim = this.state.claimSourceMessage({
+          messageId: toMessageId(message.id),
+          eventId: event.id,
+          eventCursor: event.cursor,
+        });
+        if (!claim.claimed) return;
+        this.presentedDecisions.delete(binding.id);
+        presented.resolve(reply.kind === "answer" ? reply.answer : undefined);
+        await this.sendReply(
+          message,
+          reply.kind === "answer"
+            ? "answer recorded, resuming the workflow."
+            : "left the decision pending.",
+          `pi-decision-ack-${message.id}`,
+        );
+        return;
+      }
     }
 
     const hydrated = await this.hydrateExpectedAttachments(event, message);
@@ -278,14 +383,17 @@ export class BridgeService {
     });
     if (!claim.claimed) return;
 
+    const bound = binding;
+    const claimed = message;
+
     if (isContinueCommand(cleanBody)) {
-      await this.continueSession(binding, message);
+      this.enqueueConversationWork(bound.id, () => this.continueSession(bound, claimed));
       return;
     }
 
     const slashInvocation = parseSlashInvocation(cleanBody);
     if (slashInvocation) {
-      await this.handleSlashCommand(binding, message, slashInvocation);
+      this.enqueueConversationWork(bound.id, () => this.handleSlashCommand(bound, claimed, slashInvocation));
       return;
     }
 
@@ -295,7 +403,7 @@ export class BridgeService {
     const prompt = cleanBody || (hasImage
       ? "Review the attached image."
       : "say hello and briefly identify the project connected to this conversation.");
-    await this.runTurn(binding, message, prompt);
+    this.enqueueConversationWork(bound.id, () => this.runTurn(bound, claimed, prompt));
   }
 
   private async bindProject(target: ConversationTarget, aliasValue: string, source: Message): Promise<void> {
@@ -316,7 +424,10 @@ export class BridgeService {
       conversationType: target.type,
       conversationId,
       projectAlias: alias,
-      invocationMode: this.invocationMode(target),
+      // An existing binding keeps the mode it was last set to. Recomputing from
+      // static config here would silently revert an operator's /invoke choice
+      // the next time they rebound the project.
+      invocationMode: previous?.invocationMode ?? this.invocationMode(target),
     });
     const modeText = binding.invocationMode === "mention" ? "mention @pi to invoke it" : "messages will invoke pi automatically";
     await this.sendReply(source, `bound to \`${aliasValue}\`; ${modeText}.`);
@@ -351,6 +462,12 @@ export class BridgeService {
     invocation: SlashInvocation,
   ): Promise<void> {
     const command = invocation.name.toLowerCase();
+    // Answered before the runtime is resolved: changing how a conversation
+    // invokes Pi should not require a working Pi session.
+    if (command === "invoke") {
+      await this.handleInvokeCommand(binding, source, invocation.args);
+      return;
+    }
     try {
       const runtime = await this.runtimeFor(binding);
       switch (command) {
@@ -644,8 +761,61 @@ export class BridgeService {
         status,
         error,
       });
+      if (error instanceof MissingAssistantTextError) {
+        const reset = await this.quarantineUnresponsiveSession(binding);
+        if (reset) {
+          await this.sendReply(
+            source,
+            "pi's session stopped responding, so it was reset. send that again.",
+            `pi-error-${source.id}`,
+          );
+          return;
+        }
+      }
       await this.sendReply(source, "pi couldn't complete that turn. check the bridge log for the error.", `pi-error-${source.id}`);
     }
+  }
+
+  private async quarantineUnresponsiveSession(binding: ConversationBinding): Promise<boolean> {
+    const runtime = this.runtimes.get(binding.id);
+    this.runtimes.delete(binding.id);
+
+    const presented = this.presentedDecisions.get(binding.id);
+    presented?.resolve(undefined);
+    this.presentedDecisions.delete(binding.id);
+
+    const watcher = this.decisionWatchers.get(binding.id);
+    this.decisionWatchers.delete(binding.id);
+    if (watcher) {
+      try {
+        await watcher.stop();
+      } catch (error) {
+        this.logger.warn("could not stop workflow decision watcher for unresponsive Pi session", {
+          bindingId: binding.id,
+          error,
+        });
+      }
+    }
+
+    if (runtime) {
+      try {
+        await runtime.dispose();
+      } catch (error) {
+        this.logger.warn("could not dispose unresponsive Pi session", {
+          bindingId: binding.id,
+          error,
+        });
+      }
+    }
+    const archived = this.state.archiveActivePiSession(binding.id);
+    if (runtime || archived) {
+      this.logger.warn("quarantined unresponsive Pi session", {
+        bindingId: binding.id,
+        projectAlias: binding.projectAlias,
+      });
+      return true;
+    }
+    return false;
   }
 
   private async runtimeFor(binding: ConversationBinding): Promise<AgentSessionRuntime> {
@@ -681,7 +851,69 @@ export class BridgeService {
         error,
       });
     }
+    await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
     return runtime;
+  }
+
+  /**
+   * Surfaces this binding's workflow human decisions in its conversation.
+   *
+   * Watching is best effort: a workflow host that is unavailable must not stop
+   * ordinary chat turns, so a failure is logged and the binding runs without
+   * decision delivery until its next runtime.
+   */
+  private async watchWorkflowDecisions(
+    binding: ConversationBinding,
+    sessionId: string,
+  ): Promise<void> {
+    if (this.decisionWatchers.has(binding.id)) return;
+    const client = this.workflowClient?.();
+    if (client === undefined) return;
+
+    const watcher = new WorkflowDecisionWatcher({
+      client,
+      sessionId,
+      present: async (decision) => await this.presentDecision(binding, decision),
+      onError: (error) =>
+        this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
+    });
+    this.decisionWatchers.set(binding.id, watcher);
+    try {
+      await watcher.start();
+    } catch (error) {
+      this.decisionWatchers.delete(binding.id);
+      this.logger.warn("could not watch workflow decisions", { bindingId: binding.id, error });
+    }
+  }
+
+  /**
+   * Posts one decision into its conversation and waits for the operator.
+   *
+   * Resolution comes from processMessage when a reply matches. A decision left
+   * open when the conversation moves on stays pending for another presenter
+   * rather than being answered on the operator's behalf.
+   */
+  private async presentDecision(
+    binding: ConversationBinding,
+    decision: ClaimedWorkflowDecision,
+  ): Promise<DecisionAnswer | undefined> {
+    const source = this.conversationSources.get(binding.id);
+    if (source === undefined) return undefined;
+
+    // Posted as agent_commentary carrying a decision turn_id rather than as an
+    // ordinary reply. ClickClack has no decision message kind, and its
+    // message.created event omits kind entirely for ordinary messages, so an
+    // ordinary reply would reach the client with nothing marking it as a
+    // decision.
+    await this.activityTransport(source).create(
+      "agent_commentary",
+      renderDecisionPrompt(decision),
+      decisionTurnId(decision.requestId, decision.revision),
+    );
+
+    return await new Promise<DecisionAnswer | undefined>((resolve) => {
+      this.presentedDecisions.set(binding.id, { decision, source, resolve });
+    });
   }
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
@@ -813,6 +1045,45 @@ export class BridgeService {
     if (target.type === "direct") return true;
     if (binding?.invocationMode === "always") return true;
     return Boolean(this.identity && event.mentioned_user_ids?.includes(this.identity.id));
+  }
+
+  /**
+   * Shows or sets how this conversation invokes Pi.
+   *
+   * Direct conversations always invoke automatically, so the mode is fixed
+   * there. A channel dedicated to Pi can opt out of mention-only without an
+   * environment change and a restart.
+   */
+  private async handleInvokeCommand(
+    binding: ConversationBinding,
+    source: Message,
+    args: string,
+  ): Promise<void> {
+    const nonce = `pi-command-${source.id}`;
+    const requested = args.trim().toLowerCase();
+    const describe = (mode: InvocationMode) =>
+      mode === "mention" ? "mention @pi to invoke it" : "every message invokes pi";
+
+    if (!requested) {
+      await this.sendReply(source, `invocation: \`${binding.invocationMode}\`; ${describe(binding.invocationMode)}.`, nonce);
+      return;
+    }
+    if (requested !== "mention" && requested !== "always") {
+      await this.sendReply(source, "usage: `/invoke [mention|always]`", nonce);
+      return;
+    }
+    if (binding.conversationType === "direct") {
+      await this.sendReply(source, "direct conversations always invoke pi automatically.", nonce);
+      return;
+    }
+
+    const updated = this.state.upsertBinding({
+      conversationType: binding.conversationType,
+      conversationId: binding.conversationId,
+      projectAlias: binding.projectAlias,
+      invocationMode: requested,
+    });
+    await this.sendReply(source, `invocation set to \`${updated.invocationMode}\`; ${describe(updated.invocationMode)}.`, nonce);
   }
 
   private invocationMode(target: ConversationTarget): InvocationMode {
@@ -982,5 +1253,12 @@ function finalAssistantText(messages: readonly unknown[], allowMissing = false):
     break;
   }
   if (allowMissing) return undefined;
-  throw new Error("Pi completed without an assistant text response");
+  throw new MissingAssistantTextError();
+}
+
+class MissingAssistantTextError extends Error {
+  constructor() {
+    super("Pi completed without an assistant text response");
+    this.name = "MissingAssistantTextError";
+  }
 }
