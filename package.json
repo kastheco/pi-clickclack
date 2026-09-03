@@ -12,6 +12,7 @@
   "dependencies": {
     "@clickclack/sdk-ts": "file:../clickclack/packages/sdk-ts",
     "@earendil-works/pi-coding-agent": "0.84.3",
+    "@osolmaz/pi-workflows": "0.16.0",
     "valibot": "^1.4.2"
   },
   "devDependencies": {
