@@ -781,3 +781,130 @@ test("extension session replacement delivers the replacement session answer", as
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
   service.stop();
 });
+
+test("a slow turn in one conversation does not block a turn in another", async () => {
+  const setup = fixture();
+  const started: string[] = [];
+  const finished: string[] = [];
+  let releaseSlow: (() => void) | undefined;
+  const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  const runtimeFor = (label: string) => ({
+    session: {
+      sessionId: `session-${label}`,
+      sessionFile: `/tmp/session-${label}.jsonl`,
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() {
+        started.push(label);
+        if (label === "slow") await slowGate;
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: `${label} answer` }], stopReason: "stop" });
+        finished.push(label);
+      },
+    },
+    async dispose() {},
+  });
+  // Runtimes are created in the order the two conversations are dispatched:
+  // the slow channel message first, then the fast direct message.
+  const pending = [runtimeFor("slow"), runtimeFor("fast")];
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => pending.shift()!,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({
+    conversationType: "channel",
+    conversationId: "chn_slow" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "always",
+  });
+  service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dm_fast" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const slow = message({ id: "msg_slow", body: "long job", channelId: "chn_slow" });
+  const fast = message({ id: "msg_fast", body: "quick question", directConversationId: "dm_fast" });
+  setup.messages.set(slow.id, slow);
+  setup.messages.set(fast.id, fast);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: slow.id, cursor: "cur_200", channelId: "chn_slow" }));
+  setup.emit(createdEvent({ messageId: fast.id, cursor: "cur_201" }));
+
+  // The fast conversation must complete while the slow one is still blocked.
+  for (let attempt = 0; attempt < 200 && !finished.includes("fast"); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(finished, ["fast"]);
+  assert.deepEqual(started.toSorted(), ["fast", "slow"]);
+
+  releaseSlow?.();
+  await service.waitForIdle();
+  assert.deepEqual(finished.toSorted(), ["fast", "slow"]);
+  assert.deepEqual(
+    setup.sent.toSorted((left, right) => left.id.localeCompare(right.id)),
+    [
+      { target: "channel", id: "chn_slow", body: "slow answer" },
+      { target: "direct", id: "dm_fast", body: "fast answer" },
+    ],
+  );
+  service.stop();
+});
+
+test("two messages in one conversation run in order, not concurrently", async () => {
+  const setup = fixture();
+  const events: string[] = [];
+  let active = 0;
+  const runtime = {
+    session: {
+      sessionId: "session-serial",
+      sessionFile: "/tmp/session-serial.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt(text: string) {
+        active += 1;
+        assert.equal(active, 1, "two turns overlapped in one conversation");
+        events.push(`start:${text}`);
+        await new Promise((resolve) => setImmediate(resolve));
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: `answered ${text}` }], stopReason: "stop" });
+        events.push(`end:${text}`);
+        active -= 1;
+      },
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dm_serial" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const first = message({ id: "msg_first", body: "first", directConversationId: "dm_serial" });
+  const second = message({ id: "msg_second", body: "second", directConversationId: "dm_serial" });
+  setup.messages.set(first.id, first);
+  setup.messages.set(second.id, second);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: first.id, cursor: "cur_200" }));
+  setup.emit(createdEvent({ messageId: second.id, cursor: "cur_201" }));
+  await service.waitForIdle();
+
+  assert.deepEqual(events, ["start:first", "end:first", "start:second", "end:second"]);
+  service.stop();
+});

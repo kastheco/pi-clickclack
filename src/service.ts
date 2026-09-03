@@ -94,6 +94,13 @@ export class BridgeService {
   private socket: WebSocket | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
+  /**
+   * One work chain per conversation binding. Ingest stays globally ordered so
+   * the realtime cursor and source-message claims advance in event order, but
+   * agent turns run on these chains so a turn in one conversation cannot block
+   * a message in another.
+   */
+  private readonly conversationQueues = new Map<number, Promise<void>>();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
@@ -174,7 +181,30 @@ export class BridgeService {
   }
 
   async waitForIdle(): Promise<void> {
-    await this.eventQueue;
+    for (;;) {
+      await this.eventQueue;
+      const pending = [...this.conversationQueues.values()];
+      if (pending.length === 0) return;
+      await Promise.all(pending);
+    }
+  }
+
+  /**
+   * Append conversation-scoped work to that conversation's chain and return
+   * immediately. Failures are logged rather than rethrown so one failed turn
+   * does not poison the chain for later messages.
+   */
+  private enqueueConversationWork(bindingId: number, work: () => Promise<void>): void {
+    const previous = this.conversationQueues.get(bindingId) ?? Promise.resolve();
+    const next: Promise<void> = previous
+      .then(work)
+      .catch((error: unknown) => {
+        this.logger.error("conversation work failed", { bindingId, error });
+      })
+      .then(() => {
+        if (this.conversationQueues.get(bindingId) === next) this.conversationQueues.delete(bindingId);
+      });
+    this.conversationQueues.set(bindingId, next);
   }
 
   private async connectRealtime(): Promise<void> {
@@ -271,7 +301,14 @@ export class BridgeService {
         eventCursor: event.cursor,
       });
       if (!claim.claimed) return;
-      await this.bindProject(target, projectCommand, message);
+      // Rebinding disposes the conversation's runtime, so it has to wait behind
+      // any turn already running on that conversation.
+      const existing = this.state.getBinding(target.type, toConversationId(target.id));
+      if (existing) {
+        this.enqueueConversationWork(existing.id, () => this.bindProject(target, projectCommand, message));
+      } else {
+        await this.bindProject(target, projectCommand, message);
+      }
       return;
     }
 
@@ -346,14 +383,17 @@ export class BridgeService {
     });
     if (!claim.claimed) return;
 
+    const bound = binding;
+    const claimed = message;
+
     if (isContinueCommand(cleanBody)) {
-      await this.continueSession(binding, message);
+      this.enqueueConversationWork(bound.id, () => this.continueSession(bound, claimed));
       return;
     }
 
     const slashInvocation = parseSlashInvocation(cleanBody);
     if (slashInvocation) {
-      await this.handleSlashCommand(binding, message, slashInvocation);
+      this.enqueueConversationWork(bound.id, () => this.handleSlashCommand(bound, claimed, slashInvocation));
       return;
     }
 
@@ -363,7 +403,7 @@ export class BridgeService {
     const prompt = cleanBody || (hasImage
       ? "Review the attached image."
       : "say hello and briefly identify the project connected to this conversation.");
-    await this.runTurn(binding, message, prompt);
+    this.enqueueConversationWork(bound.id, () => this.runTurn(bound, claimed, prompt));
   }
 
   private async bindProject(target: ConversationTarget, aliasValue: string, source: Message): Promise<void> {
