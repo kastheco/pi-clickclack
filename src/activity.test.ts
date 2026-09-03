@@ -166,3 +166,80 @@ test("reports activity transport failures without failing the Pi turn", async ()
 
   assert.equal(errors.length, 1);
 });
+
+test("gives git its own heading so a commit is legible while collapsed", async () => {
+  const { activity, created } = fixture();
+
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_1",
+    toolName: "bash",
+    args: { command: "git commit -m 'fix: keep the queue draining'" },
+  });
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_2",
+    toolName: "bash",
+    args: { command: "rg 'git' src/" },
+  });
+  await activity.finalize();
+
+  assert.deepEqual(created.map((row) => row.body), [
+    "**git commit**\n\n-m fix: keep the queue draining",
+    "**bash**\n\nrg 'git' src/",
+  ]);
+});
+
+test("names the repository when a git command targets one explicitly", async () => {
+  const { activity, created } = fixture();
+
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_1",
+    toolName: "bash",
+    args: { command: "git -C /home/kas/dev/vault push origin staging" },
+  });
+  await activity.finalize();
+
+  assert.equal(created[0]?.body, "**git push** · /home/kas/dev/vault\n\norigin staging");
+});
+
+test("classifies git after the pinned cd prefix is stripped", async () => {
+  const created: Array<{ body: string }> = [];
+  const activity = new TurnActivity({
+    turnId: "turn_1",
+    source: { channel_id: "chn_1" },
+    projectCwd: "/home/kas/dev/clickclack",
+    transport: {
+      async create(_kind, body) { created.push({ body }); return { id: "msg_1" }; },
+      async update() {},
+    },
+  });
+
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_1",
+    toolName: "bash",
+    args: { command: "cd /home/kas/dev/clickclack && git status --short" },
+  });
+  await activity.finalize();
+
+  assert.deepEqual(created, [{ body: "**git status**\n\n--short" }]);
+});
+
+test("a failed git command still reports its failure", async () => {
+  const { activity, created, updated } = fixture();
+
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_1",
+    toolName: "bash",
+    args: { command: "git push origin main" },
+  });
+  await activity.finalize();
+  activity.handle({ type: "tool_execution_end", toolCallId: "tool_1", isError: true });
+  await activity.finalize();
+
+  assert.equal(created.length, 1);
+  assert.deepEqual(updated, [{ messageId: "msg_1", body: "**git push**\n\norigin main\n\nfailed" }]);
+});

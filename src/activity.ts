@@ -1,5 +1,7 @@
 import type { Message } from "@clickclack/sdk-ts";
 
+import { classifyGitCommand, formatGitActivity } from "./git-activity.js";
+
 export type ActivitySource = Pick<Message, "channel_id" | "direct_conversation_id">;
 
 export type ActivityMessage = { id: string };
@@ -196,8 +198,26 @@ export class TurnActivity {
 }
 
 function toolBody(name: string, args: unknown, projectCwd?: string): string {
+  const git = gitBody(name, args, projectCwd);
+  if (git) return git;
   const detail = toolDetail(args, projectCwd);
   return detail ? `**${name}**\n\n${detail}` : `**${name}**`;
+}
+
+/**
+ * Renders a `bash` call that runs git under its own heading. Git is the one
+ * kind of shell command whose result outlives the turn, so it is worth
+ * distinguishing from the reads and greps it is buried among.
+ */
+function gitBody(name: string, args: unknown, projectCwd?: string): string {
+  if (name !== "bash" || !isRecord(args)) return "";
+  const command = args.command;
+  if (typeof command !== "string" || !command.trim()) return "";
+  const normalized = projectCwd
+    ? stripPinnedCwdPrefix(command.trim(), projectCwd)
+    : command.trim();
+  const activity = classifyGitCommand(normalized);
+  return activity ? formatGitActivity(activity) : "";
 }
 
 function toolDetail(value: unknown, projectCwd?: string): string {
