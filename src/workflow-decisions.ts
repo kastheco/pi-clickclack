@@ -73,6 +73,18 @@ export type WorkflowDecisionWatcherOptions = {
   sessionId: string;
   /** Presents one claimed decision. Resolves to the chosen key, or undefined to release it. */
   present: (decision: ClaimedWorkflowDecision) => Promise<DecisionAnswer | undefined>;
+  /**
+   * Reports the session's run state on every view event.
+   *
+   * The session view carries the run alongside its pending interactions, so
+   * observing it here costs nothing beyond a callback: a second subscription
+   * for the same events would double the host's work and could disagree with
+   * this one about ordering. `undefined` means the session has no run.
+   *
+   * Reporting must not throw. A failure to publish run state is cosmetic, while
+   * an exception here would abandon the decision pass that shares this event.
+   */
+  onRun?: (event: unknown) => void;
   onError?: (error: unknown) => void;
 };
 
@@ -182,6 +194,13 @@ export class WorkflowDecisionWatcher {
     await this.options.client.ensureAvailable();
     const unwatch = await this.options.client.watchSession(this.options.sessionId, (event) => {
       if (generation !== this.generation) return;
+      // Run state first, and defensively: a throwing observer must not cost the
+      // operator a decision that arrived on the same event.
+      try {
+        this.options.onRun?.(event);
+      } catch (error) {
+        this.options.onError?.(error);
+      }
       const interactions = sessionInteractions(event);
       if (interactions !== undefined) void this.consume(interactions);
     });

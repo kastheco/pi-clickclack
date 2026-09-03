@@ -281,3 +281,68 @@ test("the same answer retries under one key while a corrected answer does not", 
   assert.notEqual(keys[1], keys[2]);
   assert.notEqual(keys[2], keys[3]);
 });
+
+test("the session view's run is reported alongside its decisions", async () => {
+  const transport = client();
+  const seen: unknown[] = [];
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "session-1",
+    present: async () => undefined,
+    onRun: (event) => seen.push(event),
+  });
+  await watcher.start();
+
+  const event = { view: { pendingInteractions: [], run: { runId: "run-1" } } };
+  transport.emit(event);
+  await settle();
+
+  assert.deepEqual(seen, [event]);
+  await watcher.stop();
+});
+
+// The run observer is cosmetic; a decision is not. An observer that throws must
+// not cost the operator the decision that arrived on the same event.
+test("a throwing run observer does not stop the decision on that event", async () => {
+  const transport = client();
+  const errors: unknown[] = [];
+  const presented: string[] = [];
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "session-1",
+    present: async (decision) => {
+      presented.push(decision.requestId);
+      return { choice: "continue" };
+    },
+    onRun: () => {
+      throw new Error("observer blew up");
+    },
+    onError: (error) => errors.push(error),
+  });
+  await watcher.start();
+
+  transport.emit(sessionEvent([decisionRequest()]));
+  await settle();
+
+  assert.deepEqual(presented, ["request-1"]);
+  assert.equal(errors.length, 1);
+  await watcher.stop();
+});
+
+test("a watcher with no run observer works unchanged", async () => {
+  const transport = client();
+  const presented: string[] = [];
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "session-1",
+    present: async (decision) => {
+      presented.push(decision.requestId);
+      return { choice: "continue" };
+    },
+  });
+  await watcher.start();
+  transport.emit(sessionEvent([decisionRequest()]));
+  await settle();
+  assert.deepEqual(presented, ["request-1"]);
+  await watcher.stop();
+});

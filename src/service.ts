@@ -21,6 +21,8 @@ import {
   type DecisionAnswer,
   type WorkflowDecisionClient,
 } from "./workflow-decisions.js";
+import { sessionRun, type RunView } from "./workflow-run-view.js";
+import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { StateStore, type ConversationBinding } from "./state/store.js";
@@ -104,6 +106,8 @@ export class BridgeService {
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
+  /** Publishes each bound conversation's workflow run state. */
+  private readonly runReporters = new Map<number, WorkflowRunReporter>();
   private readonly presentedDecisions = new Map<number, PresentedDecision>();
   /** Last owner message per binding, used as the conversation to post decisions into. */
   private readonly conversationSources = new Map<number, Message>();
@@ -169,6 +173,10 @@ export class BridgeService {
     this.presentedDecisions.clear();
     for (const watcher of this.decisionWatchers.values()) void watcher.stop();
     this.decisionWatchers.clear();
+    // Clears each conversation's run frame. A frame left behind would sit on
+    // screen as live state nothing ever contradicts.
+    for (const reporter of this.runReporters.values()) reporter.stop();
+    this.runReporters.clear();
     this.conversationSources.clear();
     for (const runtime of this.runtimes.values()) void runtime.dispose();
     this.runtimes.clear();
@@ -784,6 +792,10 @@ export class BridgeService {
     presented?.resolve(undefined);
     this.presentedDecisions.delete(binding.id);
 
+    const reporter = this.runReporters.get(binding.id);
+    this.runReporters.delete(binding.id);
+    reporter?.stop();
+
     const watcher = this.decisionWatchers.get(binding.id);
     this.decisionWatchers.delete(binding.id);
     if (watcher) {
@@ -870,20 +882,57 @@ export class BridgeService {
     const client = this.workflowClient?.();
     if (client === undefined) return;
 
+    // The session view carries the run alongside its pending interactions, so
+    // the run reporter rides this one subscription rather than opening a second.
+    const reporter = new WorkflowRunReporter({
+      publish: (run) => this.publishRunFrame(binding, run),
+      onError: (error) =>
+        this.logger.warn("workflow run publication failed", { bindingId: binding.id, error }),
+    });
+
     const watcher = new WorkflowDecisionWatcher({
       client,
       sessionId,
       present: async (decision) => await this.presentDecision(binding, decision),
+      onRun: (event) => reporter.report(sessionRun(event)),
       onError: (error) =>
         this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
     });
     this.decisionWatchers.set(binding.id, watcher);
+    this.runReporters.set(binding.id, reporter);
     try {
       await watcher.start();
     } catch (error) {
       this.decisionWatchers.delete(binding.id);
+      this.runReporters.delete(binding.id);
+      reporter.stop();
       this.logger.warn("could not watch workflow decisions", { bindingId: binding.id, error });
     }
+  }
+
+  /**
+   * Publishes one conversation's run state as an ephemeral frame.
+   *
+   * Ephemeral rather than durable: this is the live state of a run, not a record
+   * of it, and a timeline full of status frames would bury the conversation.
+   * ClickClack requires such a frame to name exactly one channel or DM, which
+   * the binding already does.
+   */
+  private async publishRunFrame(
+    binding: ConversationBinding,
+    run: RunView | null,
+  ): Promise<void> {
+    const workspaceId = this.workspace?.id;
+    if (workspaceId === undefined) return;
+    const target = binding.conversationType === "channel"
+      ? { channelId: binding.conversationId }
+      : { directConversationId: binding.conversationId };
+    await this.clickClack.events.publishEphemeral({
+      workspaceId,
+      ...target,
+      type: "workflow.run",
+      payload: { run },
+    });
   }
 
   /**

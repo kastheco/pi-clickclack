@@ -23,6 +23,7 @@ type Fixture = {
   sent: Array<{ target: "channel" | "direct"; id: string; body: string }>;
   activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }>;
   commandMenu: BotCommandInput[];
+  ephemeral: Array<{ type: string; channelId?: string; directConversationId?: string; payload: unknown }>;
   emit(event: RealtimeEvent): void;
   subscriptionCount(): number;
 };
@@ -52,6 +53,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
   const sent: Array<{ target: "channel" | "direct"; id: string; body: string }> = [];
   const activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }> = [];
   const commandMenu: BotCommandInput[] = [];
+  const ephemeral: Fixture["ephemeral"] = [];
   let onEvent: EventHandler | undefined;
   let subscriptions = 0;
   const clickClack = {
@@ -115,6 +117,20 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     },
     events: {
       list: async () => ({ events: [], tailCursor: "cur_100" }),
+      publishEphemeral: async (input: {
+        type: string;
+        channelId?: string;
+        directConversationId?: string;
+        payload: unknown;
+      }) => {
+        ephemeral.push({
+          type: input.type,
+          ...(input.channelId ? { channelId: input.channelId } : {}),
+          ...(input.directConversationId ? { directConversationId: input.directConversationId } : {}),
+          payload: input.payload,
+        });
+        return { id: `eph_${ephemeral.length}` };
+      },
       subscribe: (options: { onEvent: EventHandler }) => {
         subscriptions += 1;
         onEvent = options.onEvent;
@@ -129,6 +145,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     sent,
     activity,
     commandMenu,
+    ephemeral,
     emit(event) {
       if (!onEvent) throw new Error("fake realtime subscription has not started");
       onEvent(event);
