@@ -79,8 +79,12 @@ test("execution detail never reaches the operator view", () => {
   }
 });
 
-test("a run is read off a session-view event", () => {
-  const run = sessionRun({ view: { schema: "pi-workflows.session-view.v1", run: runView() } });
+test("a run is read off a real session snapshot event", () => {
+  const run = sessionRun({
+    type: "event",
+    event: "session_snapshot",
+    payload: { schema: "pi-workflows.session-view.v1", run: runView() },
+  });
   assert.equal(run?.runId, "run-1");
   assert.equal(run?.status, "waiting");
 });

@@ -6,12 +6,14 @@ import test from "node:test";
 
 import type { BotCommandInput, Message, MessageInput, RealtimeEvent } from "@clickclack/sdk-ts";
 
+import { createBridgeApplication } from "./application.js";
 import type { ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig, ProjectConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import type { EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { BridgeService } from "./service.js";
-import { StateStore } from "./state/store.js";
+import { StateStore, type ConversationBinding } from "./state/store.js";
+import type { ClaimedWorkflowDecision, DecisionAnswer } from "./workflow-decisions.js";
 import { toProjectAlias } from "./types.js";
 
 type EventHandler = (event: RealtimeEvent) => void;
@@ -195,6 +197,31 @@ function createdEvent(input: {
   };
 }
 
+function workflowClientRecorder(options: { hangWhenStopping?: string } = {}) {
+  const watched: string[] = [];
+  const stopped: string[] = [];
+  let closed = 0;
+  return {
+    watched,
+    stopped,
+    closed: () => closed,
+    factory: () => ({
+      clientId: "pi-clickclack-test",
+      ensureAvailable: async () => ({}) as never,
+      watchSession: async (sessionId: string) => {
+        watched.push(sessionId);
+        return async () => {
+          stopped.push(sessionId);
+          if (options.hangWhenStopping === sessionId) await new Promise<void>(() => {});
+        };
+      },
+      request: async () => ({ outcome: "accepted" }),
+      requestDurable: async () => ({ outcome: "accepted" }),
+      close: async () => { closed += 1; },
+    }),
+  };
+}
+
 test("service authenticates, subscribes to realtime, and closes state cleanly", async () => {
   const setup = fixture();
   let sessionsCreated = 0;
@@ -223,7 +250,144 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
     ["project", "invoke", "continue", "compact", "new", "name", "session", "model", "thinking", "reload", "copy"],
   );
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
-  service.stop();
+  await service.waitForStop();
+  assert.throws(() => stateStore.database.prepare("SELECT 1"), /not open|closed/u);
+});
+
+test("shutdown cancels a decision while its message is still publishing", async () => {
+  const setup = fixture();
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    logger: createLogger({ sink() {} }),
+  });
+  const binding = service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dm_decision_publish" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const source = message({
+    id: "msg_decision_source",
+    body: "start",
+    directConversationId: "dm_decision_publish",
+  });
+  const internals = service as unknown as {
+    conversationSources: Map<number, Message>;
+    presentedDecisions: Map<number, unknown>;
+    presentDecision(
+      binding: ConversationBinding,
+      decision: ClaimedWorkflowDecision,
+    ): Promise<DecisionAnswer | undefined>;
+  };
+  internals.conversationSources.set(binding.id, source);
+  let releasePublish!: () => void;
+  let markPublishStarted!: () => void;
+  const publishGate = new Promise<void>((resolve) => { releasePublish = resolve; });
+  const publishStarted = new Promise<void>((resolve) => { markPublishStarted = resolve; });
+  const sendMessage = setup.clickClack.dms.sendMessage.bind(setup.clickClack.dms);
+  setup.clickClack.dms.sendMessage = async (...args) => {
+    markPublishStarted();
+    await publishGate;
+    return sendMessage(...args);
+  };
+
+  await service.start();
+  const presenting = internals.presentDecision(binding, {
+    requestId: "request-1",
+    runId: "run-1",
+    revision: 3,
+    title: "Continue?",
+    summary: "Choose whether to continue.",
+    choices: [{ key: "continue", label: "Continue", expectsInput: false }],
+  });
+  await publishStarted;
+  const stopping = service.waitForStop();
+  releasePublish();
+
+  assert.equal(await presenting, undefined);
+  await stopping;
+  assert.equal(internals.presentedDecisions.size, 0);
+});
+
+test("workflow cleanup invalidates the watcher before awaiting the reporter clear", async () => {
+  const setup = fixture();
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    logger: createLogger({ sink() {} }),
+  });
+  const order: string[] = [];
+  let releaseReporter!: () => void;
+  const reporterGate = new Promise<void>((resolve) => { releaseReporter = resolve; });
+  const internals = service as unknown as {
+    presentedDecisions: Map<number, { resolve(answer: undefined): void }>;
+    runReporters: Map<number, { stop(): Promise<void> }>;
+    decisionWatchers: Map<number, { stop(): Promise<void> }>;
+    workflowSessionIds: Map<number, string>;
+    stopWorkflowObservation(bindingId: number): Promise<void>;
+  };
+  internals.presentedDecisions.set(1, {
+    resolve: () => { order.push("release-presentation"); },
+  });
+  internals.runReporters.set(1, {
+    stop: async () => {
+      order.push("reporter-start");
+      await reporterGate;
+      order.push("reporter-finish");
+    },
+  });
+  internals.decisionWatchers.set(1, {
+    stop: async () => { order.push("watcher-stop"); },
+  });
+  internals.workflowSessionIds.set(1, "session-1");
+
+  const stopping = internals.stopWorkflowObservation(1);
+  await Promise.resolve();
+  assert.deepEqual(order, ["release-presentation", "watcher-stop", "reporter-start"]);
+  releaseReporter();
+  await stopping;
+});
+
+test("shutdown drains an in-flight realtime catch-up before closing state", async () => {
+  const setup = fixture();
+  const stateStore = new StateStore(":memory:");
+  stateStore.advanceRealtimeCursor("cur_100");
+  let releaseList!: () => void;
+  let markListStarted!: () => void;
+  const listGate = new Promise<void>((resolve) => { releaseList = resolve; });
+  const listStarted = new Promise<void>((resolve) => { markListStarted = resolve; });
+  let messageReads = 0;
+  setup.clickClack.messages.get = async (messageId) => {
+    messageReads += 1;
+    return setup.messages.get(messageId)!;
+  };
+  setup.clickClack.events.list = async () => {
+    markListStarted();
+    await listGate;
+    return {
+      events: [createdEvent({ messageId: "msg_during_stop", cursor: "cur_101" })],
+      tailCursor: "cur_101",
+    };
+  };
+  const piRuntime: EmbeddedPiRuntimeBoundary = {
+    kind: "embedded-pi-sdk",
+    project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => { throw new Error("runtime must not start during shutdown"); },
+  };
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    stateStore,
+    logger: createLogger({ sink() {} }),
+  });
+
+  const starting = service.start();
+  await listStarted;
+  const stopping = service.waitForStop();
+  releaseList();
+  await starting;
+  await stopping;
+
+  assert.equal(messageReads, 0);
   assert.throws(() => stateStore.database.prepare("SELECT 1"), /not open|closed/u);
 });
 
@@ -264,11 +428,30 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
-  const service = new BridgeService(setup.config, {
+  let workflowClientCreated = 0;
+  let workflowClientClosed = 0;
+  let workflowWatcherStopped = 0;
+  const watchedSessions: string[] = [];
+  const application = createBridgeApplication(setup.config, {
     clickClack: setup.clickClack,
     piRuntime,
     logger: createLogger({ sink() {} }),
+    workflowClientFactory: () => {
+      workflowClientCreated += 1;
+      return {
+        clientId: "pi-clickclack-test",
+        ensureAvailable: async () => ({}) as never,
+        watchSession: async (sessionId) => {
+          watchedSessions.push(sessionId);
+          return async () => { workflowWatcherStopped += 1; };
+        },
+        request: async () => ({ outcome: "accepted" }),
+        requestDurable: async () => ({ outcome: "accepted" }),
+        close: async () => { workflowClientClosed += 1; },
+      };
+    },
   });
+  const service = application.service;
   const source = message({ id: "msg_1", body: "@bridge hello", channelId: "chn_1" });
   setup.messages.set(source.id, source);
 
@@ -291,7 +474,159 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   assert.equal(setup.activity[0]?.turnId, setup.activity[1]?.turnId);
   assert.equal(service.state.getBinding("channel", "chn_1" as never)?.projectAlias, "main");
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-1");
-  service.stop();
+  assert.equal(workflowClientCreated, 1);
+  assert.deepEqual(watchedSessions, ["session-1"]);
+  await application.stop();
+  assert.equal(workflowWatcherStopped, 1);
+  assert.equal(workflowClientClosed, 1);
+});
+
+test("application shutdown reports a stuck runtime and keeps the process safety deadline actionable", async () => {
+  const setup = fixture();
+  const runtime = {
+    session: {
+      sessionId: "session-hung-runtime",
+      sessionFile: "/tmp/session-hung-runtime.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() {
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
+      },
+    },
+    async dispose() { await new Promise<void>(() => {}); },
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  let workflowClientClosed = 0;
+  const logLines: string[] = [];
+  const application = createBridgeApplication(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink: (line) => logLines.push(line) }),
+    shutdownTimeoutMs: 5,
+    forcedCleanupTimeoutMs: 5,
+    workflowClientFactory: () => ({
+      clientId: "pi-clickclack-test",
+      ensureAvailable: async () => ({}) as never,
+      watchSession: async () => async () => undefined,
+      request: async () => ({ outcome: "accepted" }),
+      requestDurable: async () => ({ outcome: "accepted" }),
+      close: async () => { workflowClientClosed += 1; },
+    }),
+  });
+  const source = message({ id: "msg_hung_unwatch", body: "run", directConversationId: "dm_hung_unwatch" });
+  setup.messages.set(source.id, source);
+
+  await application.service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await application.service.waitForIdle();
+  const stopResult = await application.stop();
+
+  assert.equal(stopResult, "timed_out");
+  assert.equal(workflowClientClosed, 1);
+  assert.match(logLines.join("\n"), /shutdown deadline/u);
+  assert.match(logLines.join("\n"), /remained stuck/u);
+});
+
+test("application shutdown drains runtime creation before disposal and state close", async () => {
+  const setup = fixture();
+  let releaseCreation!: () => void;
+  let markCreationStarted!: () => void;
+  const creationGate = new Promise<void>((resolve) => { releaseCreation = resolve; });
+  const creationStarted = new Promise<void>((resolve) => { markCreationStarted = resolve; });
+  let disposed = 0;
+  const runtime = {
+    session: {
+      sessionId: "session-late-runtime",
+      sessionFile: "/tmp/session-late-runtime.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() {
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
+      },
+    },
+    async dispose() { disposed += 1; },
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => {
+      markCreationStarted();
+      await creationGate;
+      return runtime;
+    },
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const application = createBridgeApplication(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+    workflowClientFactory: () => ({
+      clientId: "pi-clickclack-test",
+      ensureAvailable: async () => ({}) as never,
+      watchSession: async () => async () => undefined,
+      request: async () => ({ outcome: "accepted" }),
+      requestDurable: async () => ({ outcome: "accepted" }),
+      close: async () => undefined,
+    }),
+  });
+  const source = message({ id: "msg_late_runtime", body: "run", directConversationId: "dm_late_runtime" });
+  setup.messages.set(source.id, source);
+
+  await application.service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await creationStarted;
+  const stopping = application.stop();
+  releaseCreation();
+
+  assert.equal(await stopping, "completed");
+  assert.equal(disposed, 1);
+});
+
+test("application shutdown reports rejected runtime disposal", async () => {
+  const setup = fixture();
+  let workflowClientClosed = 0;
+  const runtime = {
+    session: {
+      sessionId: "session-rejected-disposal",
+      sessionFile: "/tmp/session-rejected-disposal.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() {
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
+      },
+    },
+    async dispose() { throw new Error("dispose failed"); },
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const application = createBridgeApplication(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+    workflowClientFactory: () => ({
+      clientId: "pi-clickclack-test",
+      ensureAvailable: async () => ({}) as never,
+      watchSession: async () => async () => undefined,
+      request: async () => ({ outcome: "accepted" }),
+      requestDurable: async () => ({ outcome: "accepted" }),
+      close: async () => { workflowClientClosed += 1; },
+    }),
+  });
+  const source = message({ id: "msg_rejected_disposal", body: "run", directConversationId: "dm_rejected_disposal" });
+  setup.messages.set(source.id, source);
+
+  await application.service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await application.service.waitForIdle();
+
+  assert.equal(await application.stop(), "failed");
+  assert.equal(workflowClientClosed, 1);
 });
 
 test("an attachment is hydrated, downloaded, and passed to Pi as an image", async () => {
@@ -324,10 +659,14 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
     return messageReads === 1 ? source : hydrated;
   };
   const downloaded: string[] = [];
+  const lifecycle: string[] = [];
+  let sessionIdle = true;
   Object.assign(setup.clickClack, {
     uploads: {
       download: async (uploadId: string) => {
         downloaded.push(uploadId);
+        lifecycle.push("download");
+        sessionIdle = false;
         return new Blob(["PNGDATA"], { type: "image/png" });
       },
     },
@@ -339,8 +678,15 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
       sessionId: "session-image",
       sessionFile: "/tmp/session-image.jsonl",
       messages: [] as unknown[],
+      get isIdle() { return sessionIdle; },
       subscribe() { return () => {}; },
+      async waitForIdle() {
+        lifecycle.push("wait");
+        sessionIdle = true;
+      },
       async prompt(text: string, options?: { images?: unknown[] }) {
+        lifecycle.push("prompt");
+        assert.equal(sessionIdle, true);
         receivedPrompt = text;
         receivedImages = options?.images;
         this.messages.push({ role: "assistant", content: [{ type: "text", text: "seen" }], stopReason: "stop" });
@@ -375,6 +721,7 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
   assert.equal(messageReads, 3);
   assert.deepEqual(downloaded, [upload.id]);
   assert.equal(receivedPrompt, "look at this");
+  assert.deepEqual(lifecycle, ["download", "wait", "prompt", "wait"]);
   assert.deepEqual(receivedImages, [{
     type: "image",
     data: Buffer.from("PNGDATA").toString("base64"),
@@ -565,6 +912,67 @@ test("continue restores the latest recoverable session and resumes its interrupt
   }
 });
 
+test("continue replaces the workflow watcher even when the restored session keeps its id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-clickclack-rewatch-continue-"));
+  try {
+    const setup = fixture();
+    const sessionFile = join(root, "session.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "session-live", cwd: "/tmp/main" }));
+    const runtime = (answer: string) => ({
+      session: {
+        sessionId: "session-live",
+        sessionFile,
+        sessionName: undefined as string | undefined,
+        messages: [] as unknown[],
+        subscribe() { return () => {}; },
+        setSessionName(name: string) { this.sessionName = name; },
+        async prompt() {
+          this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
+        },
+      },
+      async dispose() {},
+    });
+    const runtimes = [runtime("unused"), runtime("continued")];
+    const piRuntime = {
+      kind: "embedded-pi-sdk" as const,
+      project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtimes.shift()!,
+    } as unknown as EmbeddedPiRuntimeBoundary;
+    const workflow = workflowClientRecorder();
+    const application = createBridgeApplication(setup.config, {
+      clickClack: setup.clickClack,
+      piRuntime,
+      logger: createLogger({ sink() {} }),
+      workflowClientFactory: workflow.factory,
+    });
+    const service = application.service;
+    const binding = service.state.upsertBinding({
+      conversationType: "direct",
+      conversationId: "dm_continue_rewatch" as never,
+      projectAlias: toProjectAlias("main"),
+      invocationMode: "auto",
+    });
+    service.state.setActivePiSession({ bindingId: binding.id, sessionId: "session-live", sessionFile });
+    const establish = message({ id: "msg_establish", body: "/name active", directConversationId: "dm_continue_rewatch" });
+    const resume = message({ id: "msg_rewatch_continue", body: "/continue", directConversationId: "dm_continue_rewatch" });
+    setup.messages.set(establish.id, establish);
+    setup.messages.set(resume.id, resume);
+
+    await service.start();
+    setup.emit(createdEvent({ messageId: establish.id, cursor: "cur_200" }));
+    await service.waitForIdle();
+    setup.emit(createdEvent({ messageId: resume.id, cursor: "cur_201" }));
+    await service.waitForIdle();
+
+    assert.deepEqual(workflow.watched, ["session-live", "session-live"]);
+    assert.deepEqual(workflow.stopped, ["session-live"]);
+    await application.stop();
+    assert.deepEqual(workflow.stopped, ["session-live", "session-live"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a missing active session file is archived and replaced automatically", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-clickclack-missing-session-"));
   try {
@@ -673,6 +1081,59 @@ test("project command switches projects, archives the old session, and unmention
   service.stop();
 });
 
+test("project changes stop the old workflow watcher and bind the next project session", async () => {
+  const setup = fixture(["main", "other"]);
+  const runtime = (sessionId: string, answer: string) => ({
+    session: {
+      sessionId,
+      sessionFile: `/tmp/${sessionId}.jsonl`,
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt() {
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
+      },
+    },
+    async dispose() {},
+  });
+  const runtimes = [runtime("session-main", "main answer"), runtime("session-other", "other answer")];
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtimes.shift()!,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const workflow = workflowClientRecorder();
+  const application = createBridgeApplication(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+    workflowClientFactory: workflow.factory,
+  });
+  const service = application.service;
+  service.state.upsertBinding({
+    conversationType: "channel",
+    conversationId: "chn_project_rewatch" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "mention",
+  });
+  const first = message({ id: "msg_main_turn", body: "@bridge first", channelId: "chn_project_rewatch" });
+  const change = message({ id: "msg_change_project", body: "/project other", channelId: "chn_project_rewatch" });
+  const second = message({ id: "msg_other_turn", body: "@bridge second", channelId: "chn_project_rewatch" });
+  for (const source of [first, change, second]) setup.messages.set(source.id, source);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: first.id, cursor: "cur_200", channelId: "chn_project_rewatch", mentionedUserIds: ["usr_bot"] }));
+  await service.waitForIdle();
+  setup.emit(createdEvent({ messageId: change.id, cursor: "cur_201", channelId: "chn_project_rewatch" }));
+  await service.waitForIdle();
+  setup.emit(createdEvent({ messageId: second.id, cursor: "cur_202", channelId: "chn_project_rewatch", mentionedUserIds: ["usr_bot"] }));
+  await service.waitForIdle();
+
+  assert.deepEqual(workflow.watched, ["session-main", "session-other"]);
+  assert.deepEqual(workflow.stopped, ["session-main"]);
+  await application.stop();
+  assert.deepEqual(workflow.stopped, ["session-main", "session-other"]);
+});
+
 test("Pi host commands compact, name, and replace the bound session without reaching the model", async () => {
   const setup = fixture();
   const compactInstructions: string[] = [];
@@ -698,11 +1159,17 @@ test("Pi host commands compact, name, and replace the bound session without reac
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
-  const service = new BridgeService(setup.config, {
+  const workflow = workflowClientRecorder({ hangWhenStopping: "session-1" });
+  const application = createBridgeApplication(setup.config, {
     clickClack: setup.clickClack,
     piRuntime,
     logger: createLogger({ sink() {} }),
+    workflowClientFactory: workflow.factory,
+    workflowObservationStopTimeoutMs: 5,
+    shutdownTimeoutMs: 5,
+    forcedCleanupTimeoutMs: 5,
   });
+  const service = application.service;
   service.state.upsertBinding({
     conversationType: "direct",
     conversationId: "dcn_1" as never,
@@ -728,24 +1195,55 @@ test("Pi host commands compact, name, and replace the bound session without reac
   ]);
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
   assert.equal(service.state.listArchivedPiSessions(1)[0]?.sessionId, "session-1");
-  service.stop();
+  assert.deepEqual(workflow.watched, ["session-1", "session-2"]);
+  assert.deepEqual(workflow.stopped, ["session-1"]);
+  assert.equal(await application.stop(), "timed_out");
+  assert.deepEqual(workflow.stopped, ["session-1", "session-2"]);
 });
 
-test("extension slash commands pass through AgentSession.prompt and unknown commands do not", async () => {
+test("extension slash commands wait for autonomous session work before opening their turn", async () => {
   const setup = fixture();
   const receivedPrompts: string[] = [];
+  const lifecycle: string[] = [];
+  let idle = false;
+  let listener: ((event: unknown) => void) | undefined;
   const session = {
     sessionId: "session-1",
     sessionFile: "/tmp/session-1.jsonl",
     messages: [] as unknown[],
+    get isIdle() { return idle; },
     promptTemplates: [] as Array<{ name: string }>,
     resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
     extensionRunner: {
       getCommand: (name: string) => name === "review" ? {} : undefined,
       getRegisteredCommands: () => [{ invocationName: "review", description: "Review project changes" }],
     },
-    subscribe() { return () => {}; },
-    async prompt(text: string) { receivedPrompts.push(text); },
+    subscribe(next: (event: unknown) => void) {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    async waitForIdle() {
+      lifecycle.push("wait");
+      if (!idle) {
+        listener?.({
+          type: "tool_execution_start",
+          toolCallId: "prior-tool",
+          toolName: "read",
+          args: { path: "/tmp/prior" },
+        });
+        this.messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "prior autonomous answer" }],
+          stopReason: "stop",
+        });
+        idle = true;
+      }
+    },
+    async prompt(text: string) {
+      assert.equal(idle, true);
+      lifecycle.push("prompt");
+      receivedPrompts.push(text);
+    },
   };
   const runtime = { session, async dispose() {} };
   const piRuntime = {
@@ -775,6 +1273,8 @@ test("extension slash commands pass through AgentSession.prompt and unknown comm
   await service.waitForIdle();
 
   assert.deepEqual(receivedPrompts, ["/review src/service.ts"]);
+  assert.deepEqual(lifecycle, ["wait", "prompt", "wait"]);
+  assert.deepEqual(setup.activity, []);
   assert.ok(setup.commandMenu.some((command) => command.command === "review"));
   assert.deepEqual(setup.sent.map((row) => row.body), [
     "Pi command `/review` completed.",
@@ -844,11 +1344,14 @@ test("extension session replacement delivers the replacement session answer", as
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
-  const service = new BridgeService(setup.config, {
+  const workflow = workflowClientRecorder();
+  const application = createBridgeApplication(setup.config, {
     clickClack: setup.clickClack,
     piRuntime,
     logger: createLogger({ sink() {} }),
+    workflowClientFactory: workflow.factory,
   });
+  const service = application.service;
   service.state.upsertBinding({
     conversationType: "direct",
     conversationId: "dcn_1" as never,
@@ -864,7 +1367,10 @@ test("extension session replacement delivers the replacement session answer", as
 
   assert.deepEqual(setup.sent.map((row) => row.body), ["replacement answer"]);
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
-  service.stop();
+  assert.deepEqual(workflow.watched, ["session-1", "session-2"]);
+  assert.deepEqual(workflow.stopped, ["session-1"]);
+  await application.stop();
+  assert.deepEqual(workflow.stopped, ["session-1", "session-2"]);
 });
 
 test("a slow turn in one conversation does not block a turn in another", async () => {

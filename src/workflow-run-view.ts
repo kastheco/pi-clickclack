@@ -15,7 +15,7 @@
  * execution detail.
  */
 
-import { isRecord } from "./workflow-decisions.js";
+import { isRecord, workflowSessionView } from "./workflow-decisions.js";
 
 /** Operator-facing status of a run, as the host itself describes it. */
 export type RunStatus =
@@ -95,10 +95,8 @@ export type RunView = {
  * worse than showing none.
  */
 export function sessionRun(event: unknown): RunView | undefined {
-  if (!isRecord(event)) return undefined;
-  const view = event.view;
-  if (!isRecord(view)) return undefined;
-  return readRunView(view.run);
+  const view = workflowSessionView(event);
+  return view === undefined ? undefined : readRunView(view.run);
 }
 
 /** Reads one run view, as delivered by the host. */

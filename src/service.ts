@@ -41,11 +41,12 @@ export type BridgeServiceDependencies = {
   clickClack?: ClickClackBoundary;
   piRuntime?: EmbeddedPiRuntimeBoundary;
   sleep?: (milliseconds: number) => Promise<void>;
+  workflowObservationStopTimeoutMs?: number;
   /**
    * Supplies the Pi Workflows client used to deliver human decisions.
    *
-   * Defaults to no client, so decision delivery stays opt-in and the bridge
-   * never starts a workflow host as a side effect of ordinary chat.
+   * The production application supplies a lazy process-owned client. Direct
+   * service construction defaults to none, which keeps isolated tests opt-in.
    */
   workflowClient?: () => WorkflowDecisionClient | undefined;
 };
@@ -88,6 +89,7 @@ export class BridgeService {
   readonly logger: Logger;
 
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly workflowObservationStopTimeoutMs: number;
   private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
   private started = false;
   private stopped = false;
@@ -96,6 +98,8 @@ export class BridgeService {
   private socket: WebSocket | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private eventQueue: Promise<void> = Promise.resolve();
+  private startupTask: Promise<void> | undefined;
+  private readonly realtimeTasks = new Set<Promise<void>>();
   /**
    * One work chain per conversation binding. Ingest stays globally ordered so
    * the realtime cursor and source-message claims advance in event order, but
@@ -106,6 +110,9 @@ export class BridgeService {
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
+  private readonly workflowSessionIds = new Map<number, string>();
+  /** Timed-out watcher detaches that shutdown must still account for. */
+  private readonly pendingWorkflowCleanup = new Set<Promise<void>>();
   /** Publishes each bound conversation's workflow run state. */
   private readonly runReporters = new Map<number, WorkflowRunReporter>();
   private readonly presentedDecisions = new Map<number, PresentedDecision>();
@@ -113,6 +120,7 @@ export class BridgeService {
   private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
+  private stopTask: Promise<void> = Promise.resolve();
 
   constructor(
     readonly config: BridgeConfig,
@@ -125,13 +133,18 @@ export class BridgeService {
     this.clickClack = dependencies.clickClack ?? createClickClackClient(config);
     this.piRuntime = dependencies.piRuntime ?? createEmbeddedPiRuntime(config);
     this.sleep = dependencies.sleep ?? delay;
+    this.workflowObservationStopTimeoutMs = dependencies.workflowObservationStopTimeoutMs ?? 1_000;
     this.workflowClient = dependencies.workflowClient;
   }
 
-  async start(): Promise<void> {
-    if (this.stopped) throw new Error("cannot start a stopped bridge service");
-    if (this.started) return;
+  start(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("cannot start a stopped bridge service"));
+    if (this.startupTask !== undefined) return this.startupTask;
+    this.startupTask = this.startOnce();
+    return this.startupTask;
+  }
 
+  private async startOnce(): Promise<void> {
     const [identity, workspace] = await Promise.all([
       this.clickClack.me(),
       this.clickClack.workspaces.get(this.config.clickClack.workspaceId),
@@ -140,16 +153,18 @@ export class BridgeService {
     if (workspace.id !== this.config.clickClack.workspaceId) {
       throw new Error("ClickClack returned the wrong configured workspace");
     }
+    if (this.stopped) return;
 
     this.identity = identity;
     this.workspace = workspace;
     await this.publishCommandMenu();
+    if (this.stopped) return;
     const interruptedTurns = this.state.recoverInterruptedTurns();
     if (interruptedTurns > 0) {
       this.logger.warn("recovered interrupted Pi turns from previous bridge process", { interruptedTurns });
     }
     this.started = true;
-    await this.connectRealtime();
+    await this.trackRealtime(this.connectRealtime());
     this.logger.info("bridge service started", {
       botUserId: identity.id,
       botHandle: identity.handle,
@@ -167,20 +182,58 @@ export class BridgeService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.socket?.close();
     this.socket = undefined;
-    // Release every claimed decision before closing. An unanswered decision
-    // stays pending in the workflow host, so another presenter can take it.
-    for (const presented of this.presentedDecisions.values()) presented.resolve(undefined);
-    this.presentedDecisions.clear();
-    for (const watcher of this.decisionWatchers.values()) void watcher.stop();
-    this.decisionWatchers.clear();
-    // Clears each conversation's run frame. A frame left behind would sit on
-    // screen as live state nothing ever contradicts.
-    for (const reporter of this.runReporters.values()) reporter.stop();
-    this.runReporters.clear();
+    this.stopTask = this.finishCleanup();
+  }
+
+  async waitForStop(): Promise<void> {
+    this.stop();
+    await this.stopTask;
+  }
+
+  private async finishCleanup(): Promise<void> {
+    // Startup and reconnect catch-up run outside the normal event queue. Drain
+    // them first, then drain every event and conversation they admitted before
+    // taking the runtime snapshot or closing state.
+    if (this.startupTask !== undefined) await Promise.allSettled([this.startupTask]);
+    while (this.realtimeTasks.size > 0) {
+      await Promise.allSettled([...this.realtimeTasks]);
+    }
+    await this.eventQueue;
+    while (this.conversationQueues.size > 0) {
+      await Promise.all([...this.conversationQueues.values()]);
+    }
+
+    const workflowBindings = new Set([
+      ...this.decisionWatchers.keys(),
+      ...this.runReporters.keys(),
+      ...this.presentedDecisions.keys(),
+    ]);
+    const cleanup = [
+      ...[...workflowBindings].map(async (bindingId) => await this.stopWorkflowObservation(bindingId)),
+      ...[...this.runtimes.values()].map(async (runtime) => await runtime.dispose()),
+    ];
+    this.workflowSessionIds.clear();
     this.conversationSources.clear();
-    for (const runtime of this.runtimes.values()) void runtime.dispose();
     this.runtimes.clear();
-    this.state.close();
+
+    const cleanupResults = await Promise.allSettled(cleanup);
+    while (this.pendingWorkflowCleanup.size > 0) {
+      const pending = [...this.pendingWorkflowCleanup];
+      pending.forEach((task) => this.pendingWorkflowCleanup.delete(task));
+      cleanupResults.push(...await Promise.allSettled(pending));
+    }
+    const cleanupFailures = cleanupResults
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((failure) => failure.reason);
+    try {
+      this.state.close();
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+    if (cleanupFailures.length > 0) {
+      this.logger.warn("bridge cleanup failed", { failures: cleanupFailures });
+      throw new AggregateError(cleanupFailures, "bridge cleanup failed");
+    }
     this.logger.info("bridge service stopped", {
       started: this.started,
       botUserId: this.identity?.id,
@@ -215,6 +268,12 @@ export class BridgeService {
     this.conversationQueues.set(bindingId, next);
   }
 
+  private trackRealtime(task: Promise<void>): Promise<void> {
+    this.realtimeTasks.add(task);
+    void task.finally(() => this.realtimeTasks.delete(task)).catch(() => undefined);
+    return task;
+  }
+
   private async connectRealtime(): Promise<void> {
     if (this.stopped) return;
     let cursor = this.state.getRealtimeCursor();
@@ -225,6 +284,7 @@ export class BridgeService {
         limit: 1,
         includeTail: true,
       });
+      if (this.stopped) return;
       if (initial.tailCursor) {
         this.state.advanceRealtimeCursor(initial.tailCursor);
         cursor = initial.tailCursor;
@@ -254,6 +314,7 @@ export class BridgeService {
         limit: 100,
         includeTail: true,
       });
+      if (this.stopped) return cursor;
       for (const event of page.events) {
         await this.processEvent(event);
         cursor = event.cursor;
@@ -269,6 +330,7 @@ export class BridgeService {
   }
 
   private enqueueEvent(event: RealtimeEvent): void {
+    if (this.stopped) return;
     this.eventQueue = this.eventQueue
       .then(() => this.processEvent(event))
       .catch((error: unknown) => {
@@ -423,6 +485,7 @@ export class BridgeService {
     const conversationId = toConversationId(target.id);
     const previous = this.state.getBinding(target.type, conversationId);
     if (previous && previous.projectAlias !== alias) {
+      await this.stopWorkflowObservation(previous.id);
       const runtime = this.runtimes.get(previous.id);
       if (runtime) await runtime.dispose();
       this.runtimes.delete(previous.id);
@@ -452,6 +515,7 @@ export class BridgeService {
       return;
     }
 
+    await this.stopWorkflowObservation(binding.id);
     const cached = this.runtimes.get(binding.id);
     if (cached) await cached.dispose();
     this.runtimes.delete(binding.id);
@@ -500,6 +564,7 @@ export class BridgeService {
             return;
           }
           this.recordReplacementSession(binding, runtime);
+          await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
           await this.sendReply(source, "New Pi session started.", `pi-command-${source.id}`);
           return;
         }
@@ -703,12 +768,17 @@ export class BridgeService {
     let activity: TurnActivity | undefined;
     let activeSessionTurn: ActiveSessionTurn | undefined;
     try {
+      const runtime = await this.runtimeFor(binding);
+      // Attachment hydration can cross the network. Do it before the final
+      // idle barrier so autonomous extension work that starts meanwhile stays
+      // outside this ClickClack turn's activity and error boundary.
+      const images = await this.loadPromptImages(source);
+      if (runtime.session.isIdle === false) await runtime.session.waitForIdle();
       this.state.startActiveTurn({
         turnId,
         bindingId: binding.id,
         sourceMessageId: toMessageId(source.id),
       });
-      const runtime = await this.runtimeFor(binding);
       activity = new TurnActivity({
         turnId,
         source,
@@ -729,7 +799,6 @@ export class BridgeService {
       const extensionErrors: Error[] = [];
       this.activeExtensionErrors.set(binding.id, extensionErrors);
       try {
-        const images = await this.loadPromptImages(source);
         await this.promptAndWaitForNestedPrompts(
           runtime.session,
           prompt,
@@ -788,25 +857,13 @@ export class BridgeService {
     const runtime = this.runtimes.get(binding.id);
     this.runtimes.delete(binding.id);
 
-    const presented = this.presentedDecisions.get(binding.id);
-    presented?.resolve(undefined);
-    this.presentedDecisions.delete(binding.id);
-
-    const reporter = this.runReporters.get(binding.id);
-    this.runReporters.delete(binding.id);
-    reporter?.stop();
-
-    const watcher = this.decisionWatchers.get(binding.id);
-    this.decisionWatchers.delete(binding.id);
-    if (watcher) {
-      try {
-        await watcher.stop();
-      } catch (error) {
-        this.logger.warn("could not stop workflow decision watcher for unresponsive Pi session", {
-          bindingId: binding.id,
-          error,
-        });
-      }
+    try {
+      await this.stopWorkflowObservation(binding.id);
+    } catch (error) {
+      this.logger.warn("could not stop workflow observation for unresponsive Pi session", {
+        bindingId: binding.id,
+        error,
+      });
     }
 
     if (runtime) {
@@ -832,7 +889,10 @@ export class BridgeService {
 
   private async runtimeFor(binding: ConversationBinding): Promise<AgentSessionRuntime> {
     const cached = this.runtimes.get(binding.id);
-    if (cached) return cached;
+    if (cached) {
+      await this.watchWorkflowDecisions(binding, cached.session.sessionId);
+      return cached;
+    }
     let reference = this.state.getActivePiSession(binding.id);
     if (reference && !existsSync(reference.sessionFile)) {
       this.state.archiveActivePiSession(binding.id);
@@ -887,7 +947,12 @@ export class BridgeService {
     binding: ConversationBinding,
     sessionId: string,
   ): Promise<void> {
-    if (this.decisionWatchers.has(binding.id)) return;
+    if (
+      this.workflowSessionIds.get(binding.id) === sessionId
+      && this.decisionWatchers.has(binding.id)
+    ) return;
+    await this.stopWorkflowObservation(binding.id);
+
     const client = this.workflowClient?.();
     if (client === undefined) return;
 
@@ -907,16 +972,73 @@ export class BridgeService {
       onError: (error) =>
         this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
     });
+    this.workflowSessionIds.set(binding.id, sessionId);
     this.decisionWatchers.set(binding.id, watcher);
     this.runReporters.set(binding.id, reporter);
     try {
       await watcher.start();
     } catch (error) {
-      this.decisionWatchers.delete(binding.id);
-      this.runReporters.delete(binding.id);
-      reporter.stop();
+      if (this.decisionWatchers.get(binding.id) === watcher) {
+        this.workflowSessionIds.delete(binding.id);
+        this.decisionWatchers.delete(binding.id);
+        this.runReporters.delete(binding.id);
+      }
+      await reporter.stop();
       this.logger.warn("could not watch workflow decisions", { bindingId: binding.id, error });
     }
+  }
+
+  private async stopWorkflowObservation(bindingId: number): Promise<void> {
+    const presented = this.presentedDecisions.get(bindingId);
+    this.presentedDecisions.delete(bindingId);
+    presented?.resolve(undefined);
+
+    const reporter = this.runReporters.get(bindingId);
+    this.runReporters.delete(bindingId);
+
+    const watcher = this.decisionWatchers.get(bindingId);
+    this.decisionWatchers.delete(bindingId);
+    this.workflowSessionIds.delete(bindingId);
+
+    // Stop the watcher synchronously before awaiting the reporter's final
+    // clear. Its generation bump and queue/timer reset prevent a released
+    // presentation from being reclaimed during that await.
+    const stopping = watcher?.stop();
+    if (stopping) void stopping.catch(() => undefined);
+
+    let reporterError: unknown;
+    try {
+      // A replacement reporter must not publish until the old reporter's clear
+      // has landed, or a delayed old clear can erase the new run frame.
+      if (reporter) await reporter.stop();
+    } catch (error) {
+      reporterError = error;
+    }
+
+    let watcherError: unknown;
+    if (stopping) {
+      try {
+        const stopped = await settlesWithin(
+          stopping,
+          this.workflowObservationStopTimeoutMs,
+        );
+        if (!stopped) {
+          // Keep the task, even after it settles, so shutdown can account for a
+          // late rejection instead of falsely reporting completed cleanup.
+          this.pendingWorkflowCleanup.add(stopping);
+          this.logger.warn("workflow observation cleanup exceeded its deadline", {
+            bindingId,
+            workflowObservationStopTimeoutMs: this.workflowObservationStopTimeoutMs,
+          });
+        }
+      } catch (error) {
+        watcherError = error;
+        this.logger.warn("could not stop workflow observation", { bindingId, error });
+      }
+    }
+
+    const errors = [reporterError, watcherError].filter((error) => error !== undefined);
+    if (errors.length > 0) throw new AggregateError(errors, "workflow observation cleanup failed");
   }
 
   /**
@@ -958,20 +1080,31 @@ export class BridgeService {
     const source = this.conversationSources.get(binding.id);
     if (source === undefined) return undefined;
 
-    // Posted as agent_commentary carrying a decision turn_id rather than as an
-    // ordinary reply. ClickClack has no decision message kind, and its
-    // message.created event omits kind entirely for ordinary messages, so an
-    // ordinary reply would reach the client with nothing marking it as a
-    // decision.
-    await this.activityTransport(source).create(
-      "agent_commentary",
-      renderDecisionPrompt(decision),
-      decisionTurnId(decision.requestId, decision.revision),
-    );
-
-    return await new Promise<DecisionAnswer | undefined>((resolve) => {
-      this.presentedDecisions.set(binding.id, { decision, source, resolve });
+    let resolveAnswer!: (answer: DecisionAnswer | undefined) => void;
+    const answer = new Promise<DecisionAnswer | undefined>((resolve) => {
+      resolveAnswer = resolve;
     });
+    const presentation = { decision, source, resolve: resolveAnswer };
+    this.presentedDecisions.set(binding.id, presentation);
+
+    try {
+      // Posted as agent_commentary carrying a decision turn_id rather than as
+      // an ordinary reply. Register first so replacement or shutdown can
+      // cancel the presentation while publication is in flight.
+      await this.activityTransport(source).create(
+        "agent_commentary",
+        renderDecisionPrompt(decision),
+        decisionTurnId(decision.requestId, decision.revision),
+      );
+    } catch (error) {
+      if (this.presentedDecisions.get(binding.id) === presentation) {
+        this.presentedDecisions.delete(binding.id);
+        resolveAnswer(undefined);
+      }
+      throw error;
+    }
+
+    return await answer;
   }
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
@@ -1016,6 +1149,7 @@ export class BridgeService {
         },
       });
       this.bindActiveTurnSession(binding.id, session);
+      await this.watchWorkflowDecisions(binding, session.sessionId);
     };
 
     if (typeof runtime.setRebindSession === "function") {
@@ -1040,7 +1174,10 @@ export class BridgeService {
   ): Promise<{ cancelled: boolean }> {
     try {
       const result = await replace();
-      if (!result.cancelled) this.recordReplacementSession(binding, runtime);
+      if (!result.cancelled) {
+        this.recordReplacementSession(binding, runtime);
+        await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
+      }
       return result;
     } catch (error) {
       this.runtimes.delete(binding.id);
@@ -1197,7 +1334,7 @@ export class BridgeService {
     this.logger.warn("ClickClack realtime connection closed; reconnecting", { delayMs: reconnectDelayMs });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      void this.connectRealtime().catch((error: unknown) => {
+      void this.trackRealtime(this.connectRealtime()).catch((error: unknown) => {
         this.logger.error("ClickClack realtime reconnect failed", { error });
         this.scheduleReconnect();
       });
@@ -1236,6 +1373,20 @@ function normalizeContentType(value: string): string {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function settlesWithin(task: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      task.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function isContinueCommand(body: string): boolean {

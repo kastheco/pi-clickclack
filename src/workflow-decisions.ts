@@ -58,14 +58,14 @@ export type WorkflowDecisionClient = {
     runId?: string;
     expectedRevision?: number;
     payload?: unknown;
-  }): Promise<{ outcome: string; error?: string }>;
+  }): Promise<{ outcome: string; revision?: number; error?: string }>;
   requestDurable(options: {
     operation: string;
     idempotencyKey: string;
     runId?: string;
     expectedRevision?: number;
     payload?: unknown;
-  }): Promise<{ outcome: string; error?: string }>;
+  }): Promise<{ outcome: string; revision?: number; error?: string }>;
 };
 
 export type WorkflowDecisionWatcherOptions = {
@@ -120,11 +120,20 @@ export function claimIsLive(
   return expiry !== null && Date.parse(expiry) > now;
 }
 
+/** Extracts the view carried by one real or test session subscription event. */
+export function workflowSessionView(event: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(event)) return undefined;
+  if (event.type === "event") {
+    if (event.event !== "session_snapshot" || !isRecord(event.payload)) return undefined;
+    return event.payload;
+  }
+  return isRecord(event.view) ? event.view : undefined;
+}
+
 /** Extracts pending interactions from one session-view subscription event. */
 export function sessionInteractions(event: unknown): WorkflowInteractiveRequest[] | undefined {
-  if (!isRecord(event)) return undefined;
-  const view = event.view;
-  if (!isRecord(view)) return undefined;
+  const view = workflowSessionView(event);
+  if (view === undefined) return undefined;
   const pending = view.pendingInteractions;
   if (!Array.isArray(pending)) return undefined;
   return pending.filter((entry): entry is WorkflowInteractiveRequest =>
@@ -183,6 +192,9 @@ export class WorkflowDecisionWatcher {
   private readonly options: WorkflowDecisionWatcherOptions;
   private unwatch: (() => Promise<void>) | undefined;
   private activeRequestId: string | undefined;
+  private activeConsume: Promise<void> | undefined;
+  private pendingInteractions: readonly WorkflowInteractiveRequest[] | undefined;
+  private claimRetryTimer: NodeJS.Timeout | undefined;
   private generation = 0;
 
   constructor(options: WorkflowDecisionWatcherOptions) {
@@ -202,7 +214,7 @@ export class WorkflowDecisionWatcher {
         this.options.onError?.(error);
       }
       const interactions = sessionInteractions(event);
-      if (interactions !== undefined) void this.consume(interactions);
+      if (interactions !== undefined) this.queueInteractions(interactions, generation);
     });
     if (generation === this.generation) this.unwatch = unwatch;
     else await unwatch();
@@ -210,10 +222,65 @@ export class WorkflowDecisionWatcher {
 
   async stop(): Promise<void> {
     this.generation += 1;
+    if (this.claimRetryTimer !== undefined) clearTimeout(this.claimRetryTimer);
+    this.claimRetryTimer = undefined;
+    this.pendingInteractions = undefined;
+    const activeConsume = this.activeConsume;
+    if (activeConsume !== undefined) await activeConsume;
     this.activeRequestId = undefined;
     const unwatch = this.unwatch;
     this.unwatch = undefined;
     if (unwatch !== undefined) await unwatch();
+  }
+
+  private queueInteractions(
+    interactions: readonly WorkflowInteractiveRequest[],
+    generation: number,
+  ): void {
+    if (this.claimRetryTimer !== undefined) clearTimeout(this.claimRetryTimer);
+    this.claimRetryTimer = undefined;
+
+    const now = Date.now();
+    const retryAt = interactions.reduce<number | undefined>((earliest, interaction) => {
+      if (interaction.kind !== "decision") return earliest;
+      if (interaction.status !== "pending" && interaction.status !== "presenting") return earliest;
+      const expiry = interaction.presentationClaimExpiresAt;
+      if (expiry === null) return earliest;
+      const timestamp = Date.parse(expiry);
+      if (!Number.isFinite(timestamp) || timestamp <= now) return earliest;
+      return earliest === undefined ? timestamp : Math.min(earliest, timestamp);
+    }, undefined);
+    if (retryAt !== undefined) {
+      const delayMs = Math.min(2_147_483_647, Math.max(1, retryAt - now + 1));
+      this.claimRetryTimer = setTimeout(() => {
+        this.claimRetryTimer = undefined;
+        if (generation !== this.generation) return;
+        // Re-evaluate the lease in case the clock moved backward or a timeout
+        // longer than Node's maximum delay was chunked.
+        this.queueInteractions(interactions, generation);
+      }, delayMs);
+    }
+
+    this.pendingInteractions = interactions;
+    this.startConsumeLoop();
+  }
+
+  private startConsumeLoop(): void {
+    if (this.activeConsume !== undefined) return;
+    const consume = this.drainInteractions();
+    this.activeConsume = consume;
+    void consume.finally(() => {
+      if (this.activeConsume === consume) this.activeConsume = undefined;
+      if (this.pendingInteractions !== undefined) this.startConsumeLoop();
+    }).catch(() => undefined);
+  }
+
+  private async drainInteractions(): Promise<void> {
+    while (this.pendingInteractions !== undefined) {
+      const interactions = this.pendingInteractions;
+      this.pendingInteractions = undefined;
+      await this.consume(interactions);
+    }
   }
 
   private async consume(interactions: readonly WorkflowInteractiveRequest[]): Promise<void> {
@@ -221,19 +288,23 @@ export class WorkflowDecisionWatcher {
     const generation = this.generation;
 
     for (const interaction of interactions) {
-      if (interaction.kind !== "decision" || interaction.status !== "pending") continue;
+      if (interaction.kind !== "decision") continue;
+      if (interaction.status !== "pending" && interaction.status !== "presenting") continue;
       if (claimIsLive(interaction)) continue;
       const decision = decisionForOperator(interaction);
       if (decision === undefined) continue;
 
       this.activeRequestId = interaction.requestId;
       try {
-        if (!await this.claim(interaction)) return;
+        const presentationRevision = await this.claim(interaction);
+        if (presentationRevision === undefined) return;
         if (generation !== this.generation) return;
 
         const answer = await this.options.present(decision);
-        if (answer === undefined || generation !== this.generation) return;
-        await this.answer(interaction, answer);
+        if (answer === undefined) return;
+        // Once the operator has answered, persist it even if shutdown or a
+        // session replacement starts before this continuation runs.
+        await this.answer(interaction, presentationRevision, answer);
       } catch (error) {
         this.options.onError?.(error);
       } finally {
@@ -244,7 +315,7 @@ export class WorkflowDecisionWatcher {
   }
 
   /** Claims one decision. Resolves false when another presenter won the race. */
-  private async claim(interaction: WorkflowInteractiveRequest): Promise<boolean> {
+  private async claim(interaction: WorkflowInteractiveRequest): Promise<number | undefined> {
     const key =
       `claim-presentation-${interaction.requestId}-${interaction.revision}-${this.options.client.clientId}`;
     const response = await this.options.client.request({
@@ -255,11 +326,14 @@ export class WorkflowDecisionWatcher {
       expectedRevision: interaction.revision,
       payload: { requestId: interaction.requestId, claimPresentation: true },
     });
-    if (response.outcome === "conflict") return false;
+    if (response.outcome === "conflict") return undefined;
     if (response.outcome !== "accepted" && response.outcome !== "adopted") {
       throw new Error(response.error ?? "workflow host rejected the presentation claim");
     }
-    return true;
+    if (response.revision === undefined) {
+      throw new Error("workflow presentation claim has no revision");
+    }
+    return response.revision;
   }
 
   /**
@@ -274,6 +348,7 @@ export class WorkflowDecisionWatcher {
    */
   private async answer(
     interaction: WorkflowInteractiveRequest,
+    presentationRevision: number,
     answer: DecisionAnswer,
   ): Promise<void> {
     const submissionId = answerKey(interaction, answer);
@@ -281,7 +356,7 @@ export class WorkflowDecisionWatcher {
       operation: "decision.answer",
       idempotencyKey: submissionId,
       runId: interaction.runId,
-      expectedRevision: interaction.revision,
+      expectedRevision: presentationRevision,
       payload: {
         requestId: interaction.requestId,
         submissionId,
