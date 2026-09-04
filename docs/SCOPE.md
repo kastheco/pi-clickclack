@@ -34,8 +34,9 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 - Each project alias resolves to an approved absolute working directory.
 - Pi resource discovery starts from that working directory, including project context, skills, extensions, prompts, and settings.
 - Turns are serialized within a conversation. Different conversations may run concurrently.
-- A message arriving during an active turn steers that turn by default.
-- Turn settlement and new-message routing are atomic so one message cannot both steer an active turn and start another turn.
+- A message arriving during an active turn **queues behind it** and starts its own turn once the running turn settles. Steering is **not implemented**: the bridge never calls `session.steer()`, `session.followUp()`, or `PromptOptions.streamingBehavior`, so a mid-turn correction cannot reach a turn already in flight.
+- Per-conversation serialization is what keeps this safe. Because a second `prompt()` never lands while the first is streaming, the SDK's "streaming without `streamingBehavior` throws" path is never reached.
+- Turn settlement and new-message routing are atomic so one message cannot both queue against an active turn and start another turn.
 
 ## Invocation policy
 
@@ -121,10 +122,10 @@ The bridge claims a source message before invoking Pi. Replayed ClickClack event
 
 1. Bootstrap the package, typed configuration, SQLite state, and bot authentication.
 2. Implement cursor-safe realtime ingestion, source-message claims, and invocation gating.
-3. Implement project bindings, persistent Pi sessions, serialized turns, steering, and core commands.
+3. Implement project bindings, persistent Pi sessions, serialized turns, and core commands. (Steering was planned here and was not built; see the conversation and session model above.)
 4. Translate Pi streaming, tool activity, final messages, uploads, and interactive requests.
 5. Add crash recovery, race and replay tests, systemd installation, and operator documentation.
 
 ## Budget
 
-The locked v1 budget is 9 to 12 agentic hours. The main uncertainty is restart-safe interactive requests and settlement-versus-steering race coverage, not the basic transport bridge.
+The locked v1 budget is 9 to 12 agentic hours. The main uncertainty is restart-safe interactive requests and settlement-versus-queueing race coverage, not the basic transport bridge.
