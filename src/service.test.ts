@@ -1616,6 +1616,64 @@ function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted
 
 const nextEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("steering notice recovery does not swallow unrelated settlement failures", async () => {
+  const f = steeringFixture();
+  const errors: unknown[][] = [];
+  f.service.logger.error = (...args) => { errors.push(args); };
+  await f.service.start();
+  const mark = f.service.state.markSteeringUncertain.bind(f.service.state);
+  const failure = new Error("unrelated settlement failure");
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    let settlements = 0;
+    f.service.state.markSteeringUncertain = (turnId) => {
+      if (++settlements === 2) throw failure;
+      mark(turnId);
+    };
+    f.release(); await f.service.waitForIdle();
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0]?.[0], "conversation work failed");
+    assert.equal((errors[0]?.[1] as { error: unknown }).error, failure);
+  } finally {
+    f.service.state.markSteeringUncertain = mark;
+    f.release(); await f.service.waitForStop();
+  }
+});
+
+test("steering notice list failure does not reject turn settlement or poison later notices", async () => {
+  const f = steeringFixture({ reject: true });
+  const warnings: unknown[][] = [];
+  const errors: unknown[][] = [];
+  f.service.logger.warn = (...args) => { warnings.push(args); };
+  f.service.logger.error = (...args) => { errors.push(args); };
+  await f.service.start();
+  const list = f.service.state.listUncertainSteering.bind(f.service.state);
+  let calls = 0;
+  f.service.state.listUncertainSteering = () => {
+    if (++calls === 1) throw new Error("private state-list payload");
+    return list();
+  };
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("correction", "correction"); await nextEventLoop();
+    f.release(); await f.service.waitForIdle();
+    assert.equal(calls, 1);
+    assert.deepEqual(errors, [], "notice enumeration must not falsely fail the settled turn");
+    assert.equal(list().length, 1, "unsent notice stays unnotified");
+    assert.equal(f.service.state.getOutbound("pi-steering-uncertain-correction"), undefined);
+    assert.ok(warnings.some((args) => args[0] === "steering uncertainty notice scan deferred"));
+    assert.ok(!JSON.stringify(warnings).includes("private state-list payload"));
+    f.send("next", "next turn"); await f.service.waitForIdle();
+    assert.equal(calls, 2);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(f.prompts, ["original", "next turn"]);
+    assert.equal(f.setup.sent.filter((item) => item.body.includes("couldn't confirm delivery")).length, 1);
+    assert.ok(!JSON.stringify(f.setup.sent).includes("private state-list payload"));
+    assert.equal(f.service.state.getOutbound("pi-steering-uncertain-correction")?.status, "sent");
+    assert.deepEqual(list(), []);
+  } finally { f.release(); await f.service.waitForStop(); }
+});
+
 for (const failure of ["rejection", "abort", "unconfirmed"] as const) {
   test(`mid-turn ${failure} reports uncertainty without queued replay`, async () => {
     const f = steeringFixture({ consume: false, reject: failure === "rejection", aborted: failure === "abort" });
@@ -1910,28 +1968,35 @@ test("steering notice uncertain-create reconciles by nonce after restart", async
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-test("steering recovery rechecks binding after an awaited nonce lookup", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "steering-rebind-notice-"));
-  const setup = fixture(["main", "other"]);
-  const path = join(directory, "state.sqlite");
-  seedSteeringRecovery(setup, path);
-  const state = new StateStore(path);
-  state.reserveOutbound({ nonce: "pi-steering-uncertain-before-enqueue", targetType: "direct", targetId: "dm_recovery", messageKind: "message", body: "notice" });
-  state.close();
-  let release!: () => void;
-  let started!: () => void;
-  const waiting = new Promise<void>((resolve) => { release = resolve; });
-  const lookupStarted = new Promise<void>((resolve) => { started = resolve; });
-  setup.clickClack.messages.findByNonce = async () => { started(); await waiting; return undefined; };
-  const service = recoveryService(setup);
-  try {
-    const starting = service.start();
-    await lookupStarted;
-    service.state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("other"), invocationMode: "auto" });
-    release(); await starting;
-    assert.deepEqual(setup.sent, [], "lookup cannot authorize a later create against a changed binding");
-  } finally { release(); await service.waitForStop(); rmSync(directory, { recursive: true, force: true }); }
-});
+for (const awaited of ["source fetch", "nonce lookup"] as const) {
+  test(`steering recovery rechecks binding after an awaited ${awaited}`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "steering-rebind-notice-"));
+    const setup = fixture(["main", "other"]);
+    const path = join(directory, "state.sqlite");
+    seedSteeringRecovery(setup, path);
+    const state = new StateStore(path);
+    state.reserveOutbound({ nonce: "pi-steering-uncertain-before-enqueue", targetType: "direct", targetId: "dm_recovery", messageKind: "message", body: "notice" });
+    state.close();
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const lookupStarted = new Promise<void>((resolve) => { started = resolve; });
+    if (awaited === "nonce lookup") {
+      setup.clickClack.messages.findByNonce = async () => { started(); await waiting; return undefined; };
+    } else {
+      const get = setup.clickClack.messages.get;
+      setup.clickClack.messages.get = async (id) => { started(); await waiting; return get(id); };
+    }
+    const service = recoveryService(setup);
+    try {
+      const starting = service.start();
+      await lookupStarted;
+      service.state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("other"), invocationMode: "auto" });
+      release(); await starting;
+      assert.deepEqual(setup.sent, [], "lookup cannot authorize a later create against a changed binding");
+    } finally { release(); await service.waitForStop(); rmSync(directory, { recursive: true, force: true }); }
+  });
+}
 
 for (const changed of ["owner", "binding", "session", "target", "workspace"] as const) {
   test(`steering recovery does not leak notices after ${changed} changes`, async () => {
@@ -1947,10 +2012,18 @@ for (const changed of ["owner", "binding", "session", "target", "workspace"] as 
     if (changed === "binding") state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("other"), invocationMode: "auto" });
     if (changed === "session") state.setActivePiSession({ bindingId: binding.id, sessionId: "new-session", sessionFile: "/tmp/new-session.jsonl" });
     state.close();
+    const fetched: string[] = [];
+    const get = setup.clickClack.messages.get;
+    setup.clickClack.messages.get = async (id) => { fetched.push(id); return get(id); };
     try {
       const service = recoveryService(setup);
       if (changed === "workspace") await assert.rejects(service.start(), /wrong configured workspace/);
-      else { await service.start(); assert.deepEqual(setup.sent, []); }
+      else {
+        await service.start(); assert.deepEqual(setup.sent, []);
+        assert.equal(service.state.listUncertainSteering().length, 2, "suppressed notices are not marked notified");
+        if (changed !== "target") assert.deepEqual(fetched, [], "locally unauthorized receipts must not fetch source messages");
+        else assert.deepEqual([...new Set(fetched)].sort(), ["after-enqueue", "before-enqueue"], "source-only target changes still require hydration");
+      }
       await service.waitForStop();
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

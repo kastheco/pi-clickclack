@@ -558,9 +558,17 @@ export class BridgeService {
 
   private notifyUncertainSteering(): Promise<void> {
     this.steeringNotices = this.steeringNotices.then(async () => {
-      for (const receipt of this.state.listUncertainSteering()) {
+      let receipts: SteeringReceipt[];
+      try {
+        receipts = this.state.listUncertainSteering();
+      } catch {
+        // A failed scan must not poison later notices or reject turn settlement.
+        this.logger.warn("steering uncertainty notice scan deferred");
+        return;
+      }
+      for (const receipt of receipts) {
         try {
-          if (this.state.getActiveTurn(receipt.turnId)) continue;
+          if (this.state.getActiveTurn(receipt.turnId) || !this.steeringReceiptTarget(receipt)) continue;
           const source = await this.clickClack.messages.get(receipt.messageId);
           const target = this.steeringNoticeTarget(receipt, source);
           if (!target) continue;
@@ -601,15 +609,22 @@ export class BridgeService {
     return this.steeringNotices;
   }
 
-  private steeringNoticeTarget(receipt: SteeringReceipt, source: Message): ConversationTarget | undefined {
+  private steeringReceiptTarget(receipt: SteeringReceipt): ConversationTarget | undefined {
     if (receipt.workspaceId !== this.config.clickClack.workspaceId || receipt.botId !== this.identity?.id
       || !this.config.clickClack.ownerIds.includes(receipt.authorId)) return undefined;
-    const target = conversationTarget(source);
-    if (!target || source.author_id !== receipt.authorId || source.workspace_id !== receipt.workspaceId || source.deleted_at) return undefined;
-    const binding = this.state.getBinding(target.type, toConversationId(target.id));
-    if (binding?.id !== receipt.bindingId || binding.projectAlias !== receipt.projectAlias) return undefined;
+    const binding = this.state.getBindingById(receipt.bindingId);
+    if (!binding || binding.projectAlias !== receipt.projectAlias) return undefined;
     const latest = this.state.getActivePiSession(binding.id) ?? this.state.listArchivedPiSessions(binding.id)[0];
-    return latest?.sessionId === receipt.sessionId ? target : undefined;
+    return latest?.sessionId === receipt.sessionId
+      ? { type: binding.conversationType, id: binding.conversationId } : undefined;
+  }
+
+  private steeringNoticeTarget(receipt: SteeringReceipt, source: Message): ConversationTarget | undefined {
+    const expected = this.steeringReceiptTarget(receipt);
+    const target = conversationTarget(source);
+    if (!expected || !target || target.type !== expected.type || target.id !== expected.id
+      || source.author_id !== receipt.authorId || source.workspace_id !== receipt.workspaceId || source.deleted_at) return undefined;
+    return target;
   }
 
   private async bindProject(target: ConversationTarget, aliasValue: string, source: Message): Promise<void> {

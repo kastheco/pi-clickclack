@@ -256,6 +256,16 @@ export class StateStore {
     return row ? conversationBinding(row) : undefined;
   }
 
+  getBindingById(id: number): ConversationBinding | undefined {
+    const row = this.database
+      .prepare(`
+        SELECT id, conversation_type, conversation_id, project_alias, invocation_mode, created_at, updated_at
+        FROM conversation_bindings WHERE id = ?
+      `)
+      .get(id) as Row | undefined;
+    return row ? conversationBinding(row) : undefined;
+  }
+
   setActivePiSession(input: {
     bindingId: number;
     sessionId: string;
