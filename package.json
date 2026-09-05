@@ -7,7 +7,10 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --test dist/*.test.js dist/**/*.test.js",
+    "test": "node --test dist/*.test.js dist/**/*.test.js scripts/smoke/*.test.mjs",
+    "test:smoke": "node --test scripts/smoke/*.test.mjs",
+    "test:injector-integration": "node --experimental-vm-modules scripts/smoke/integration.mjs",
+    "test:live-smoke": "node scripts/smoke/live.mjs",
     "test:workflow-integration": "node scripts/test-orkastrator-decision-integration.mjs"
   },
   "dependencies": {

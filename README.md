@@ -26,6 +26,8 @@ pnpm build
 pnpm test
 ```
 
+The standard tests include deterministic Pi SDK persistence and smoke-assertion regressions. See [`docs/smoke-suite.md`](docs/smoke-suite.md) for the opt-in installed-injector/unchanged-guard integration and the permission-gated, isolated live read-only bridge probe. Neither opt-in command runs in CI.
+
 The Orkastrator decision integration test starts the real embedded Pi runtime, patched Pi Workflows extension, workflow host, and bridge against a disposable human-decision workflow. It uses an in-process ClickClack transport boundary and verifies that an answer resumes the workflow to completion.
 
 ```sh
