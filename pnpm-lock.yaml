@@ -15,8 +15,8 @@ importers:
         specifier: 0.85.1
         version: 0.85.1(ws@8.21.3)
       '@osolmaz/pi-workflows':
-        specifier: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz
-        version: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz(@earendil-works/pi-ai@0.84.3(ws@8.21.3))(@earendil-works/pi-coding-agent@0.85.1(ws@8.21.3))(@earendil-works/pi-tui@0.84.3)(typebox@1.3.7)
+        specifier: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz
+        version: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz(@earendil-works/pi-ai@0.84.3(ws@8.21.3))(@earendil-works/pi-coding-agent@0.85.1(ws@8.21.3))(@earendil-works/pi-tui@0.84.3)(typebox@1.3.7)
       valibot:
         specifier: ^1.4.2
         version: 1.4.2(typescript@6.0.3)
@@ -580,9 +580,9 @@ packages:
     resolution: {integrity: sha512-ABnA53mdfkGZwOFUdZNv2S0CWGO/EIuPj8Vv9xmBFmSYg/qFc7ihO6q5FcQjvoE67kZpWkEc4AhD6B/os04yuA==}
     engines: {node: '>= 10'}
 
-  '@osolmaz/pi-workflows@file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz':
-    resolution: {integrity: sha512-Govv3leFQ1/taXTfiBJSabyCkArHybNVuarzmrfuwUb6E84xoTHnC6G6YhdWK4/9s0uz/w9GyLuTJA4URCx9fQ==, tarball: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz}
-    version: 0.16.0-kas.769.2
+  '@osolmaz/pi-workflows@file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz':
+    resolution: {integrity: sha512-TNkGt8spDmWYLBaD3DK1CBUDcVYUdsjCQ0CbZGqtyaj0I844fDBKbYEdN3JES7PNtGHUggSkuY7iQE+vBsNYyw==, tarball: file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz}
+    version: 0.16.0-kas.769.3
     engines: {node: '>=22'}
     hasBin: true
     peerDependencies:
@@ -1518,7 +1518,7 @@ snapshots:
       '@mariozechner/clipboard-win32-x64-msvc': 0.3.9
     optional: true
 
-  '@osolmaz/pi-workflows@file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz(@earendil-works/pi-ai@0.84.3(ws@8.21.3))(@earendil-works/pi-coding-agent@0.85.1(ws@8.21.3))(@earendil-works/pi-tui@0.84.3)(typebox@1.3.7)':
+  '@osolmaz/pi-workflows@file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz(@earendil-works/pi-ai@0.84.3(ws@8.21.3))(@earendil-works/pi-coding-agent@0.85.1(ws@8.21.3))(@earendil-works/pi-tui@0.84.3)(typebox@1.3.7)':
     dependencies:
       '@earendil-works/pi-ai': 0.84.3(ws@8.21.3)
       '@earendil-works/pi-coding-agent': 0.85.1(ws@8.21.3)

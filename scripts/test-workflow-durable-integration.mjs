@@ -16,7 +16,7 @@ import { StateStore } from '../dist/state/store.js';
 assert.equal(process.versions.node, '24.20.0');
 const root = resolve(process.env.CLICKCLACK_CANDIDATE_ROOT ?? '../clickclack.kas-769-workflow-activity');
 const hostRoot = realpathSync('node_modules/@osolmaz/pi-workflows');
-assert.equal(JSON.parse(readFileSync(join(hostRoot, 'package.json'))).version, '0.16.0-kas.769.2');
+assert.equal(JSON.parse(readFileSync(join(hostRoot, 'package.json'))).version, '0.16.0-kas.769.3');
 assert.equal(JSON.parse(readFileSync('node_modules/@earendil-works/pi-coding-agent/package.json')).version, '0.85.1');
 const { WorkflowHost } = await import(pathToFileURL(join(hostRoot, 'dist/host/runner.js')));
 const temp = mkdtempSync(join(tmpdir(), 'bridge-durable-integration-'));

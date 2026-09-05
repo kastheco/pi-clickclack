@@ -24,31 +24,31 @@ Production workflow API requests and individual host snapshot/page requests have
 
 Use **Node 24.20.0**, pnpm 11.20.0. Embedded Pi remains **exactly 0.85.1**.
 
-The exact host candidate is vendored as `vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz`, pinned through a `file:vendor/...` dependency and integrity lock. SHA-256: `6af9d764e38f79b776ff3c6a6f631f527ba795fd097ac3250dc013717ceceb6d`. No globally installed package was modified.
+The exact host candidate is vendored as `vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz`, pinned through a `file:vendor/...` dependency and integrity lock. SHA-256: `1517d6fb98342627cc2bc0a64f56bbe6f78c9fee1b693eb4dec4d2ee281668a4`. No globally installed package was modified.
 
-The normal SDK manifest/lock path remains `file:../clickclack/packages/sdk-ts`. Until the candidate is merged, explicitly stage its built SDK locally:
+The normal SDK manifest/lock path remains `file:../clickclack/packages/sdk-ts`. The normal `/home/kas/dev/clickclack` checkout now contains SDK fix `e71e77f7` and its built SDK; install it normally, without an overlay:
 
 ```sh
 export PATH="$HOME/.nvm/versions/node/v24.20.0/bin:$PATH"
 node --version # v24.20.0
 pnpm install --frozen-lockfile
-node scripts/setup-workflow-sdk.mjs ../clickclack.kas-769-workflow-activity/packages/sdk-ts
+diff -qr ../clickclack/packages/sdk-ts/dist node_modules/@clickclack/sdk-ts/dist
 pnpm typecheck
 pnpm build
 pnpm test
-node scripts/test-workflow-durable-integration.mjs
-sha256sum vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz
+CLICKCLACK_CANDIDATE_ROOT=/home/kas/dev/clickclack CLICKCLACK_ELECTRON_EXECUTABLE=/usr/bin/electron node scripts/test-workflow-durable-integration.mjs
+sha256sum vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz
 git diff --check
 ```
 
-Candidate SDK source fix `e71e77f7` emits NodeNext-compatible declarations. Setup copies its complete built dist byte-for-byte, with **no declaration or import rewrite**. Clean candidate dist comparison and typecheck pass. The normal final dependency remains `file:../clickclack/packages/sdk-ts`; final main merge, SDK rebuild and normal file-dependency lock refresh remain parent release steps.
+Candidate SDK source fix `e71e77f7` emits NodeNext-compatible declarations. Normal file-dependency installation yields byte-identical SDK dist, with **no declaration or import rewrite**. Clean installed dist comparison and typecheck pass. The dependency remains `file:../clickclack/packages/sdk-ts`; no sibling or live runtime build was changed in this repin.
 
 The integration command stages Go API source into a temporary directory, builds there, creates disposable API/host/bridge SQLite databases, starts the actual packaged host, runs a 260-attempt repeated-node workflow plus trusted workspace preparation and final filesystem mutation, discovers through the real watcher, simulates a lost acknowledgment after the real API commits, restarts the bridge outbox without a watcher, publishes through the real SDK/API, and checks terminal history, full pagination, file evidence, privacy, idempotence/conflict and reload. It uses no models, live services, installed app profile or sibling edits. `CLICKCLACK_CANDIDATE_ROOT` can override the source fixture root. The optional `CLICKCLACK_ELECTRON_EXECUTABLE=/usr/bin/electron` gate stages built worktree web assets and opens the actual worktree desktop main/preload with disposable userData; it checks the host-produced persisted attempts/files before and after reload, never Chrome or the live profile. The harness also verifies midrun higher/stale revisions and DM scope/membership/server-derived websocket recipients.
 
 ## Release sequence / limitations
 
 1. Review bridge/host/API candidates. Merge ClickClack, rebuild SDK, refresh the normal bridge file dependency/lock (parent release step), then rerun all gates without overlay.
-2. Disposable actual host → bridge → API → Electron passed on ClickClack `b01b4f1e680bec4d913cc8b140a5ead1df67ed0c`, Electron **43.6.0**: 266 attempts, revision 540, final host file evidence and reload. This is isolated full-path proof, not live deployment proof. Rerun against final merged artifacts before cutover.
+2. Disposable actual host → bridge → API → Electron passed on ClickClack `d8dcd83779593b433119394546fd389caeaa48dd`, Electron **43.6.0**: 266 attempts, revision 540, final host file evidence and reload. This is isolated full-path proof, not live deployment proof. Rerun against final merged artifacts before cutover.
 3. Back up bridge state and the host DB/WAL with writers stopped. The host candidate has its own additive schema migration that **old host binaries cannot open**; rollback requires restoring its consistent pre-migration backup with old binaries.
 4. Deploy ClickClack API first, then coordinated host SDK/bridge cutover; preserve Pi 0.85.1. Verify scopes (`agent_activity:write`, `messages:write`, DM `dms:write`), server migrations/health, restart replay and Electron retained history before saying ready for verification.
 
@@ -56,11 +56,15 @@ Unknown runs never observed by the authorized watcher are intentionally not disc
 
 ## Follow-up verification evidence
 
-Against host `0.16.0-kas.769.2` and clean SDK built from source containing `e71e77f7`:
+Against host `0.16.0-kas.769.3` and clean SDK built from source containing `e71e77f7`:
 
-- `pnpm install --frozen-lockfile`, clean SDK setup and recursive dist comparison: pass; no import/declaration overlay. Only host tarball/integrity changed in the dependency lock.
+- `pnpm install --frozen-lockfile`, normal SDK installation and recursive dist comparison: pass; no import/declaration overlay. Only host tarball/integrity changed in the dependency lock.
 - `pnpm typecheck`, `pnpm build`, `pnpm test`: pass, **181 tests**. Added unchanged-revision paging, invalid timestamps/identifiers/pages/totals, multibyte 512 KiB trimming/file fallback, 403 persisted survival, original frozen target/rebind, resumed terminal, missing host identity and SQLite observe-fault/ephemeral regression coverage.
-- `CLICKCLACK_ELECTRON_EXECUTABLE=/usr/bin/electron node scripts/test-workflow-durable-integration.mjs`: pass against frozen ClickClack `b01b4f1e680bec4d913cc8b140a5ead1df67ed0c`, Electron **43.6.0**, isolated profile. Real host produced 266 attempts/revision 540; final.txt host evidence and attempts persisted through Electron reload. Running→terminal replacement, stale/idempotent replay, lost acknowledgment/restart, DM HTTP 403 scope/membership and member-vs-outsider websocket routing all passed.
-- `sha256sum vendor/osolmaz-pi-workflows-0.16.0-kas.769.2.tgz` matches the pin above; `git diff --check` passes. Existing `workflow-decisions.ts` and `workflow-run-publisher.ts` have no changes in this follow-up.
+- `CLICKCLACK_ELECTRON_EXECUTABLE=/usr/bin/electron node scripts/test-workflow-durable-integration.mjs`: pass against frozen ClickClack `d8dcd83779593b433119394546fd389caeaa48dd`, Electron **43.6.0**, isolated profile. Real host produced 266 attempts/revision 540; final.txt host evidence and attempts persisted through Electron reload. Running→terminal replacement, stale/idempotent replay, lost acknowledgment/restart, DM HTTP 403 scope/membership and member-vs-outsider websocket routing all passed.
+- `sha256sum vendor/osolmaz-pi-workflows-0.16.0-kas.769.3.tgz` matches the pin above; `git diff --check` passes. Existing `workflow-decisions.ts` and `workflow-run-publisher.ts` have no changes in this follow-up.
 
 Initial harness development exposed fixture-only setup errors (a release marker dirtied the workspace baseline; `bot:write` implicitly grants DM scope). The gate now removes its marker before workspace preparation, and the missing-DM-scope fixture requests explicit `messages:write`/`agent_activity:write`/`profile:read`. Final checks above were rerun after these corrections. No installed service, live database/profile, global package, or sibling source was modified.
+
+## Final matching-consumer staging
+
+Host source `3f93ad3` incorporates the installed eight-file customization patch. The immutable769.3 archive is shared with the isolated Orkastrator candidate; its old workflow patch alone is retired while rpiv2.9.0 remains patched. Final Node24 bridge181 tests and disposable Electron43.6.0 full path passed against ClickClack `d8dcd837`. Orkastrator distribution is temporarily limited to an explicit Linux-x64 bundled local release because nested vendored file dependencies do not install through ordinary npm pack. No live cutover is authorized by these checks. Three old Pi clients must explicitly exit/quiesce, production bot scopes must be confirmed, and fresh drain/backup/review gates remain.
