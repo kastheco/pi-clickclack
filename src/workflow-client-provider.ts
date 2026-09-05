@@ -14,8 +14,9 @@ export type WorkflowClientProvider = {
 /**
  * Owns the bridge process's one Pi Workflows client.
  *
- * Construction stays lazy so startup and ordinary chat do not start a workflow
- * host. The first bound Pi session that needs a watcher creates the client.
+ * The provider constructs on first get; durable publication calls get at service
+ * startup to establish stable host identity. Construction does not start the host.
+ * Watchers and persisted due publications may ensureAvailable and autostart it.
  */
 export function createWorkflowClientProvider(
   createClient: () => ManagedWorkflowClient = createDefaultWorkflowClient,

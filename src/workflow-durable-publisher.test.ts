@@ -55,7 +55,7 @@ test("scope and exact session/target fence observations and acknowledgments", as
     now = 100_000; await other.flush(); assert.equal(sends, 2); await other.stop();
   } finally { await publisher.stop(); state.close(); }
 });
-test("same revision differing digest is blocked; pointer clear still fetches final revision", async () => {
+test("delivered same revision skips collection; pointer clear still fetches final revision", async () => {
   const state = new StateStore(":memory:"); const f = fixture(); let now = 0; const sent: PublishWorkflowSnapshotRequest[] = [];
   f.view.display.status = "running";
   const publisher = new DurableWorkflowPublisher({ database: state.database, endpoint: "http://fixture", hostIdentity: "fixture-host", producerId: "bot", workspaceId: "workspace",
@@ -89,5 +89,23 @@ test("watch schema/origin fence discovery; binding, project and host namespaces 
     // after the terminal host reservation disappeared, without a new watch event.
     (f.view.queue as { originSessionId: string | null }).originSessionId = null;
     const restarted = new DurableWorkflowPublisher(options); await restarted.flush(); assert.equal(sends, 2); await restarted.stop();
+  } finally { await publisher.stop(); state.close(); }
+});
+test("403 survives undelivered, rebind preserves original target, terminal resumes at higher revision", async () => {
+  const state = new StateStore(":memory:"); const f = fixture(); let now = 0; let denied = true;
+  const sent: PublishWorkflowSnapshotRequest[] = []; const errors: unknown[] = [];
+  const publisher = new DurableWorkflowPublisher({ database: state.database, endpoint: "fixture", hostIdentity: "stable-test", producerId: "bot", workspaceId: "workspace", client: () => f.client, now: () => now,
+    onError: metadata => errors.push(metadata), publish: async input => { if (denied) throw Object.assign(new Error("Forbidden"), { status: 403 }); sent.push(input); return ack(input); } });
+  try {
+    publisher.observe(target, "session", event, "old-binding"); await publisher.flush();
+    const frozen = state.database.prepare("SELECT payload,delivered FROM workflow_publications").get()!;
+    assert.equal(frozen.delivered, 0); assert.deepEqual(errors, [{ sessionId: "session", runId: "run", attempts: 1 }]);
+    publisher.observe({ ...target, channel_id: "new-channel" }, "session", event, "new-binding");
+    denied = false; now = 1000; await publisher.flush();
+    assert.ok(sent.some(input => JSON.stringify(input) === frozen.payload)); assert.deepEqual(sent.map(x => x.channel_id).sort(), ["channel", "new-channel"]);
+    f.view.revision++; f.view.display.status = "running";
+    publisher.observe(target, "session", { view: { ...event.view, run: f.view } }, "old-binding");
+    now += 1000; await publisher.flush(); assert.equal(sent.at(-1)!.snapshot.run.status, "running");
+    const pages = f.calls.length; now += 1000; await publisher.flush(); assert.equal(f.calls.length, pages, "delivered unchanged revision does not repaginate");
   } finally { await publisher.stop(); state.close(); }
 });

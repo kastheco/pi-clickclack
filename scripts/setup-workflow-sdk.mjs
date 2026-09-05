@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Candidate-only local overlay. Never rewrites the normal SDK dependency or lock.
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+// Candidate-only clean local SDK staging. Never rewrites the normal SDK dependency or lock.
+import { cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
 assert.equal(process.versions.node, '24.20.0');
@@ -12,6 +12,3 @@ mkdirSync(target, { recursive: true });
 cpSync(resolve(source, 'dist'), resolve(target, 'dist'), { recursive: true });
 cpSync(resolve(source, 'package.json'), resolve(target, 'package.json'));
 console.log('Candidate SDK copied into isolated node_modules; manifest and lock unchanged.');
-// Temporary approved NodeNext declaration fix; parent must fix the SDK before release.
-const declaration = resolve(target, 'dist/index.d.ts');
-writeFileSync(declaration, readFileSync(declaration, 'utf8').replaceAll('"./generated/openapi"', '"./generated/openapi.js"'));

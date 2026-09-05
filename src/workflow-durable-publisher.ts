@@ -30,9 +30,10 @@ export class DurableWorkflowPublisher {
     database: DatabaseSync; endpoint: string; hostIdentity: string; producerId: string; workspaceId: string;
     client: () => WorkflowDecisionClient | undefined;
     publish: (request: PublishWorkflowSnapshotRequest) => Promise<PublishWorkflowSnapshotResponse>;
-    onError?: () => void;
+    onError?: (metadata?: { sessionId: string; runId: string; attempts: number }) => void;
     now?: () => number;
   }) {
+    if (!options.hostIdentity.trim()) throw new Error("Missing stable workflow host identity");
     this.scope = workflowDigest([options.endpoint, options.producerId, options.workspaceId, options.hostIdentity]);
   }
   start(): void {
@@ -92,11 +93,9 @@ export class DurableWorkflowPublisher {
         const client = this.options.client();
         if (client === undefined) throw new Error("Workflow host unavailable");
         await client.ensureAvailable();
-        const snapshot = await collectWorkflowSnapshot(client, job.session_id, job.run_id, true);
-        const digest = workflowDigest(snapshot);
-        if (snapshot.source.revision < job.revision) throw new Error("Workflow revision regressed");
-        if (snapshot.source.revision === job.revision && digest !== job.digest) throw new Error("Workflow revision content conflict");
-        if (snapshot.source.revision > job.revision) {
+        const snapshot = await collectWorkflowSnapshot(client, job.session_id, job.run_id, true, job.revision);
+        if (snapshot !== undefined) {
+          const digest = workflowDigest(snapshot);
           const payload = JSON.stringify({ ...JSON.parse(job.target), snapshot });
           this.options.database.prepare(`UPDATE workflow_publications SET revision=?,digest=?,payload=?,delivered=0,terminal=?
             WHERE scope=? AND target=? AND discovery=? AND session_id=? AND run_id=?`).run(snapshot.source.revision, digest, payload, terminal.has(snapshot.run.status) ? 1 : 0, ...key);
@@ -109,7 +108,7 @@ export class DurableWorkflowPublisher {
         // No host/API error payload in logs: it may contain private execution content.
         this.options.database.prepare(`UPDATE workflow_publications SET attempts=attempts+1,retry_at=? WHERE scope=? AND target=? AND discovery=? AND session_id=? AND run_id=?`)
           .run(now + Math.min(60_000, 1000 * 2 ** Math.min(job.attempts, 6)), ...key);
-        this.options.onError?.();
+        this.options.onError?.({ sessionId: job.session_id, runId: job.run_id, attempts: job.attempts + 1 });
       }
     }
   }

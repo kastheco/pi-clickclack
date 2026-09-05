@@ -15,13 +15,16 @@ const statuses = new Set(["queued", "running", "waiting", "paused", "completed",
 const outcomes = new Set(["ok", "timed_out", "failed", "cancelled"]);
 const changes = new Set(["added", "modified", "deleted", "renamed", "copied", "type_changed", "unmerged", "untracked"]);
 export function identifier(value: unknown): value is string {
-  return typeof value === "string" && [...value].length > 0 && [...value].length <= 256 && !/[\p{C}]/u.test(value);
+  return typeof value === "string" && value.trim().length > 0 && [...value].length <= 256 && !/[\p{C}]/u.test(value);
 }
 function check(condition: unknown): asserts condition {
   if (!condition) throw new Error("Invalid durable workflow projection");
 }
 function timestamp(value: unknown): value is string {
-  return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+  return typeof value === "string" && value.length <= 64
+    && /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value)
+    && Number.isFinite(Date.parse(value))
+    && Number(value.slice(8, 10)) <= new Date(Date.UTC(Number(value.slice(0, 4)) || 400, Number(value.slice(5, 7)), 0)).getUTCDate();
 }
 function safePath(value: unknown): value is string {
   return typeof value === "string" && [...value].length <= 1024 && value.length > 0
@@ -46,7 +49,9 @@ function filesProjection(files: WorkflowRunView["operatorArtifacts"]): WorkflowF
 }
 
 /** Fetch only attempt pages, never hydrate content references or compact graph history. */
-export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, sessionId: string, runId: string, discoveredSession = false): Promise<WorkflowSnapshot> {
+export function collectWorkflowSnapshot(client: WorkflowDecisionClient, sessionId: string, runId: string, discoveredSession?: boolean): Promise<WorkflowSnapshot>;
+export function collectWorkflowSnapshot(client: WorkflowDecisionClient, sessionId: string, runId: string, discoveredSession: boolean, knownRevision: number): Promise<WorkflowSnapshot | undefined>;
+export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, sessionId: string, runId: string, discoveredSession = false, knownRevision = -1): Promise<WorkflowSnapshot | undefined> {
   const response = await client.request({ operation: "view.run.get", runId, signal: AbortSignal.timeout(15_000) });
   check(response.outcome === "accepted" && isRecord(response.receipt));
   const raw = response.receipt;
@@ -60,6 +65,8 @@ export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, se
   check(view.display.reason === null || (typeof view.display.reason === "string" && [...view.display.reason].length <= 4096));
   check(view.queue.startedAt === null || timestamp(view.queue.startedAt));
   check(view.queue.finishedAt === null || timestamp(view.queue.finishedAt));
+  check(view.revision >= knownRevision);
+  if (view.revision === knownRevision) return undefined;
   const snapshot: WorkflowSnapshot = {
     schema: "clickclack.workflow-snapshot.v1",
     source: { provider: "pi-workflows", sessionId, runId, revision: view.revision },
@@ -92,7 +99,17 @@ export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, se
     cursor = start + page.items.length;
   }
   // Deterministic oldest-first prefix, bounded by count AND serialized bytes.
-  while (Buffer.byteLength(JSON.stringify(snapshot)) > 512 * 1024 && snapshot.steps.length > 0) snapshot.steps.pop();
+  const steps = snapshot.steps;
+  snapshot.steps = [];
+  const cap = 512 * 1024;
+  // Measure the fixed envelope once, then each attempt once: linear byte work.
+  if (Buffer.byteLength(JSON.stringify(snapshot)) > cap) snapshot.files = null;
+  let bytes = Buffer.byteLength(JSON.stringify(snapshot));
+  for (const step of steps) {
+    const added = Buffer.byteLength(JSON.stringify(step)) + (snapshot.steps.length ? 1 : 0);
+    if (bytes + added > cap) break;
+    snapshot.steps.push(step); bytes += added;
+  }
   snapshot.run.stepsComplete = snapshot.steps.length === view.stepTotal;
   check(Buffer.byteLength(JSON.stringify(snapshot)) <= 512 * 1024);
   return snapshot;

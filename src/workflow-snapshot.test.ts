@@ -60,3 +60,36 @@ test("durable reasons allow only static host literals, never short error/path/pr
   display.reason = "The workflow is durably paused.";
   assert.equal((await collectWorkflowSnapshot(f.client, "session", "run")).run.reason, display.reason);
 });
+test("known revision validates identity and skips all pages; regressions reject", async () => {
+  const f = fixture();
+  assert.equal(await collectWorkflowSnapshot(f.client, "session", "run", true, 4), undefined);
+  assert.deepEqual(f.calls, []);
+  await assert.rejects(collectWorkflowSnapshot(f.client, "session", "run", true, 5));
+  f.view.queue.originSessionId = "other";
+  await assert.rejects(collectWorkflowSnapshot(f.client, "session", "run", true, 4));
+});
+test("noncovering pages and total mismatch reject", async () => {
+  for (const mutate of [(p: { items: unknown[]; total: number; start: number; cursor: number }) => { p.items = []; }, (p: { items: unknown[]; total: number; start: number; cursor: number }) => { p.total++; }, (p: { items: unknown[]; total: number; start: number; cursor: number }) => { p.start = p.cursor + 1; }]) {
+    const f = fixture(); const request = f.client.request;
+    f.client.request = async options => { const result = await request(options); if (options.operation === "view.page") mutate(result.receipt as { items: unknown[]; total: number; start: number; cursor: number }); return result; };
+    await assert.rejects(collectWorkflowSnapshot(f.client, "session", "run"));
+  }
+});
+test("byte cap keeps oldest prefix and oversized file metadata becomes unavailable", async () => {
+  const f = fixture(1000);
+  for (const step of f.steps) { step.nodeId = "界".repeat(256); step.nodeType = "界".repeat(256); }
+  const snapshot = await collectWorkflowSnapshot(f.client, "session", "run");
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot)) <= 512 * 1024);
+  assert.ok(snapshot.steps.length > 0 && snapshot.steps.length < 1000); assert.equal(snapshot.run.stepsComplete, false);
+  assert.equal(snapshot.steps[0]?.attemptId, "attempt-0");
+  Object.assign(f.view, { operatorArtifacts: { changedFiles: { source: "host-git", basis: "cumulative-since-base", baseRevision: "abc", attribution: "clean-baseline", complete: true, truncated: false,
+    entries: Array.from({ length: 500 }, () => ({ path: "界".repeat(1024), change: "modified" })) } } });
+  const fallback = await collectWorkflowSnapshot(f.client, "session", "run");
+  assert.equal(fallback.files, null); assert.ok(Buffer.byteLength(JSON.stringify(fallback)) <= 512 * 1024);
+});
+test("API-invalid blank identifiers and non RFC3339 timestamps reject", async () => {
+  for (const value of ["yesterday", "2026-09-01", "2026-02-30T00:00:00Z", "2026-09-01T24:00:00Z"]) {
+    const f = fixture(); f.steps[0]!.startedAt = value; await assert.rejects(collectWorkflowSnapshot(f.client, "session", "run"));
+  }
+  const f = fixture(); f.steps[0]!.nodeId = "   "; await assert.rejects(collectWorkflowSnapshot(f.client, "session", "run"));
+});

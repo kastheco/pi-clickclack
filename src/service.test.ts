@@ -1578,6 +1578,7 @@ test("invoke reports the current mode and refuses an unknown one", async () => {
 test("authorized bound watcher feeds durable snapshots to its frozen conversation without changing chat replies", async () => {
   const { fixture: snapshotFixture } = await import("./workflow-snapshot-fixture.test-helper.js");
   const setup = fixture(); const host = snapshotFixture();
+  let emitRun: (() => void) | undefined;
   const requests: import("@clickclack/sdk-ts").PublishWorkflowSnapshotRequest[] = [];
   setup.clickClack.workflowRuns = {
     publish: async input => {
@@ -1598,7 +1599,8 @@ test("authorized bound watcher feeds durable snapshots to its frozen conversatio
     workflowClientFactory: () => ({ ...host.client, hostIdentity: "fixture-host", close: async () => undefined,
       watchSession: async (sessionId, listener) => {
         assert.equal(sessionId, "session");
-        listener({ view: { schema: "pi-workflows.session-view.v1", sessionId, run: host.view, pendingInteractions: [] } });
+        emitRun = () => listener({ view: { schema: "pi-workflows.session-view.v1", sessionId, run: host.view, pendingInteractions: [] } });
+        emitRun();
         return async () => undefined;
       },
     }),
@@ -1614,5 +1616,21 @@ test("authorized bound watcher feeds durable snapshots to its frozen conversatio
     while (!requests.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(requests.length, 1); assert.equal(requests[0]!.channel_id, "chn_durable");
     assert.equal(requests[0]!.snapshot.source.sessionId, "session");
+    application.service.state.database.exec(`CREATE TRIGGER reject_workflow_observe BEFORE INSERT ON workflow_publications BEGIN SELECT RAISE(FAIL, 'fixture storage fault'); END`);
+    const before = setup.ephemeral.filter(e => e.type === "workflow.run").length;
+    host.view.revision++; host.view.display.status = "running"; emitRun!();
+    const frameDeadline = Date.now() + 2000;
+    while (setup.ephemeral.filter(e => e.type === "workflow.run").length === before && Date.now() < frameDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(setup.ephemeral.filter(e => e.type === "workflow.run").length > before, "durable SQLite observation fault cannot suppress ephemeral frame");
   } finally { assert.equal(await application.stop(), "completed"); }
+});
+
+test("durable startup fails closed without an explicit stable workflow host identity", async () => {
+  const setup = fixture(); const { fixture: hostFixture } = await import("./workflow-snapshot-fixture.test-helper.js");
+  setup.clickClack.workflowRuns = { publish: async () => { throw new Error("must not publish"); }, listChannel: async () => ({ runs: [] }), listDirect: async () => ({ runs: [] }) };
+  const state = new StateStore(":memory:");
+  const service = new BridgeService(setup.config, { clickClack: setup.clickClack, stateStore: state, workflowClient: () => hostFixture().client,
+    logger: createLogger({ sink() {} }) });
+  try { await assert.rejects(service.start(), /Missing stable workflow host identity/); assert.equal(setup.subscriptionCount(), 0); }
+  finally { await service.waitForStop(); }
 });

@@ -161,12 +161,14 @@ export class BridgeService {
     this.identity = identity;
     this.workspace = workspace;
     if (this.clickClack.workflowRuns !== undefined && this.workflowClient !== undefined) {
+      const hostIdentity = this.workflowClient()?.hostIdentity;
+      if (!hostIdentity?.trim()) throw new Error("Missing stable workflow host identity");
       this.durableWorkflows = new DurableWorkflowPublisher({
         database: this.state.database, endpoint: this.config.clickClack.baseUrl,
         producerId: identity.id, workspaceId: workspace.id, client: this.workflowClient,
-        hostIdentity: this.workflowClient()?.hostIdentity ?? "injected-client",
+        hostIdentity,
         publish: (input) => this.clickClack.workflowRuns!.publish(input),
-        onError: () => this.logger.warn("durable workflow publication deferred"),
+        onError: (metadata) => this.logger.warn("durable workflow publication deferred", metadata),
       });
       this.durableWorkflows.start();
     }
@@ -983,11 +985,15 @@ export class BridgeService {
       sessionId,
       present: async (decision) => await this.presentDecision(binding, decision),
       onRun: (event) => {
-        this.durableWorkflows?.observe({
-          workspace_id: this.config.clickClack.workspaceId,
-          ...(binding.conversationType === "channel" ? { channel_id: binding.conversationId }
-            : { direct_conversation_id: binding.conversationId }),
-        }, sessionId, event, JSON.stringify([binding.id, binding.projectAlias, this.config.projects.get(binding.projectAlias)?.cwd]));
+        try {
+          this.durableWorkflows?.observe({
+            workspace_id: this.config.clickClack.workspaceId,
+            ...(binding.conversationType === "channel" ? { channel_id: binding.conversationId }
+              : { direct_conversation_id: binding.conversationId }),
+          }, sessionId, event, JSON.stringify([binding.id, binding.projectAlias, this.config.projects.get(binding.projectAlias)?.cwd]));
+        } catch {
+          this.logger.warn("durable workflow observation deferred", { sessionId, bindingId: binding.id });
+        }
         reporter.report(sessionRun(event));
       },
       onError: (error) =>
