@@ -1574,3 +1574,45 @@ test("invoke reports the current mode and refuses an unknown one", async () => {
   assert.equal(service.state.getBinding("channel", "chn_2" as never)?.invocationMode, "mention");
   service.stop();
 });
+
+test("authorized bound watcher feeds durable snapshots to its frozen conversation without changing chat replies", async () => {
+  const { fixture: snapshotFixture } = await import("./workflow-snapshot-fixture.test-helper.js");
+  const setup = fixture(); const host = snapshotFixture();
+  const requests: import("@clickclack/sdk-ts").PublishWorkflowSnapshotRequest[] = [];
+  setup.clickClack.workflowRuns = {
+    publish: async input => {
+      requests.push(input);
+      return { changed: true, record: { ...input, id: "record", producer_id: "usr_bot", updated_at: "2026-09-01T00:00:00Z" } };
+    },
+    listChannel: async () => ({ runs: [] }), listDirect: async () => ({ runs: [] }),
+  };
+  const messages: unknown[] = [];
+  const runtime = { session: { sessionId: "session", sessionFile: "/tmp/fixture-session.jsonl", messages,
+    subscribe: () => () => undefined,
+    prompt: async () => { messages.push({ role: "assistant", content: [{ type: "text", text: "normal reply" }], stopReason: "stop" }); },
+  }, dispose: async () => undefined };
+  const application = createBridgeApplication(setup.config, {
+    clickClack: setup.clickClack, logger: createLogger({ sink() {} }),
+    piRuntime: { kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtime } as unknown as EmbeddedPiRuntimeBoundary,
+    workflowClientFactory: () => ({ ...host.client, hostIdentity: "fixture-host", close: async () => undefined,
+      watchSession: async (sessionId, listener) => {
+        assert.equal(sessionId, "session");
+        listener({ view: { schema: "pi-workflows.session-view.v1", sessionId, run: host.view, pendingInteractions: [] } });
+        return async () => undefined;
+      },
+    }),
+  });
+  try {
+    const source = message({ id: "msg_durable", body: "@bridge hello", channelId: "chn_durable" });
+    setup.messages.set(source.id, source); await application.service.start();
+    setup.emit(createdEvent({ messageId: source.id, cursor: "cur_durable", channelId: "chn_durable", mentionedUserIds: ["usr_bot"] }));
+    await application.service.waitForIdle();
+    assert.deepEqual(setup.sent, [{ target: "channel", id: "chn_durable", body: "normal reply" }]);
+    assert.equal(application.service.state.database.prepare("SELECT count(*) AS n FROM workflow_publications").get()!.n, 1);
+    const deadline = Date.now() + 5000;
+    while (!requests.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(requests.length, 1); assert.equal(requests[0]!.channel_id, "chn_durable");
+    assert.equal(requests[0]!.snapshot.source.sessionId, "session");
+  } finally { assert.equal(await application.stop(), "completed"); }
+});

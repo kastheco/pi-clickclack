@@ -46,6 +46,7 @@ export type ClaimedWorkflowDecision = {
 
 export type WorkflowDecisionClient = {
   clientId: string;
+  hostIdentity?: string;
   ensureAvailable(): Promise<unknown>;
   watchSession(
     sessionId: string,
@@ -57,15 +58,17 @@ export type WorkflowDecisionClient = {
     idempotencyKey?: string;
     runId?: string;
     expectedRevision?: number;
+    signal?: AbortSignal;
     payload?: unknown;
-  }): Promise<{ outcome: string; revision?: number; error?: string }>;
+  }): Promise<{ outcome: string; revision?: number; error?: string; receipt?: unknown }>;
   requestDurable(options: {
     operation: string;
     idempotencyKey: string;
     runId?: string;
     expectedRevision?: number;
+    signal?: AbortSignal;
     payload?: unknown;
-  }): Promise<{ outcome: string; revision?: number; error?: string }>;
+  }): Promise<{ outcome: string; revision?: number; error?: string; receipt?: unknown }>;
 };
 
 export type WorkflowDecisionWatcherOptions = {

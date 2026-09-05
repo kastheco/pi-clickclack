@@ -11,12 +11,13 @@
     "test:smoke": "node --test scripts/smoke/*.test.mjs",
     "test:injector-integration": "node --experimental-vm-modules scripts/smoke/integration.mjs",
     "test:live-smoke": "node scripts/smoke/live.mjs",
-    "test:workflow-integration": "node scripts/test-orkastrator-decision-integration.mjs"
+    "test:workflow-integration": "node scripts/test-orkastrator-decision-integration.mjs",
+    "test:workflow-durable-integration": "node scripts/test-workflow-durable-integration.mjs"
   },
   "dependencies": {
     "@clickclack/sdk-ts": "file:../clickclack/packages/sdk-ts",
     "@earendil-works/pi-coding-agent": "0.85.1",
-    "@osolmaz/pi-workflows": "0.16.0",
+    "@osolmaz/pi-workflows": "file:vendor/osolmaz-pi-workflows-0.16.0-kas.769.1.tgz",
     "valibot": "^1.4.2"
   },
   "devDependencies": {

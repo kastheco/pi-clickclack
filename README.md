@@ -35,3 +35,7 @@ pnpm test:workflow-integration
 ```
 
 The test packs the sibling `../orkastrator` checkout and installs that archive in a disposable consumer before running. It does not modify the sibling checkout. Set `ORKASTRATOR_ROOT` when the checkout is elsewhere.
+
+### Durable workflow history
+
+KAS-769 adds restart-safe absolute workflow snapshots alongside live presence. See [durable publication and release gates](docs/durable-workflow-publication.md) for migration, safe projection, candidate SDK setup, isolated real-host/API verification and parent-owned Electron/deployment sequencing. Implemented and tested; not live.

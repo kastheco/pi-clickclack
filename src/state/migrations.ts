@@ -110,6 +110,27 @@ export const migrations: readonly Migration[] = [
       ON outbound_nonce_reconciliation(status, updated_at);
     `,
   },
+  {
+    version: 4,
+    name: "durable-workflow-publication",
+    sql: `
+      CREATE TABLE workflow_publications (
+        scope TEXT NOT NULL,
+        target TEXT NOT NULL,
+        discovery TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT -1,
+        digest TEXT,
+        payload TEXT,
+        delivered INTEGER NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
+        terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        retry_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (scope, target, discovery, session_id, run_id)
+      ) STRICT;
+    `,
+  },
 ] as const;
 
 export function applyMigrations(

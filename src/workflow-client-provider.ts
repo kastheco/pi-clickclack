@@ -43,6 +43,7 @@ function createDefaultWorkflowClient(): ManagedWorkflowClient {
   const client = new WorkflowClient({ clientId: "pi-clickclack" });
   return {
     clientId: client.clientId,
+    hostIdentity: client.databasePath,
     ensureAvailable: async () => await client.ensureAvailable(),
     watchSession: async (sessionId, listener) =>
       await client.watchSession(sessionId, listener as Parameters<WorkflowClient["watchSession"]>[1]),

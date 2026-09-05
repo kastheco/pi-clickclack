@@ -41,3 +41,18 @@ test("a failed migration rolls back its schema and receipt", () => {
     database.close();
   }
 });
+
+test("durable workflow migration preserves existing cursor and bindings without cascading history", () => {
+  const database = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  try {
+    applyMigrations(database, migrations.filter(migration => migration.version < 4));
+    database.exec(`INSERT INTO realtime_cursor VALUES(1,'cursor-before','2026-09-01');
+      INSERT INTO conversation_bindings VALUES(1,'channel','channel','project','mention','2026-09-01','2026-09-01');`);
+    applyMigrations(database);
+    database.exec(`INSERT INTO workflow_publications(scope,target,discovery,session_id,run_id)
+      VALUES('scope','target','discovery','session','run'); DELETE FROM conversation_bindings WHERE id=1;`);
+    assert.equal(database.prepare("SELECT cursor FROM realtime_cursor").get()!.cursor, "cursor-before");
+    assert.equal(database.prepare("SELECT count(*) AS n FROM workflow_publications").get()!.n, 1);
+    applyMigrations(database);
+  } finally { database.close(); }
+});

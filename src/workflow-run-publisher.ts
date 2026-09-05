@@ -19,8 +19,8 @@
  *
  * Frames are ephemeral. They are the live state of a run, not a record of it,
  * and there is no replay: a client that reconnects sees nothing for a run whose
- * visible state never changes again. That is a real gap rather than a design
- * choice, and a reconnect-triggered republish belongs here later.
+ * visible state never changes again. DurableWorkflowPublisher now supplies the
+ * separate restart-safe history path; this class remains live presence only.
  */
 
 import type { RunView } from "./workflow-run-view.js";

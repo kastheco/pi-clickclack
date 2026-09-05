@@ -22,6 +22,7 @@ import {
   type WorkflowDecisionClient,
 } from "./workflow-decisions.js";
 import { sessionRun, type RunView } from "./workflow-run-view.js";
+import { DurableWorkflowPublisher } from "./workflow-durable-publisher.js";
 import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
@@ -113,7 +114,9 @@ export class BridgeService {
   private readonly workflowSessionIds = new Map<number, string>();
   /** Timed-out watcher detaches that shutdown must still account for. */
   private readonly pendingWorkflowCleanup = new Set<Promise<void>>();
-  /** Publishes each bound conversation's workflow run state. */
+  /** Owns durable replay independently of any individual watcher lifetime. */
+  private durableWorkflows: DurableWorkflowPublisher | undefined;
+  /** Publishes each bound conversation's ephemeral workflow run state. */
   private readonly runReporters = new Map<number, WorkflowRunReporter>();
   private readonly presentedDecisions = new Map<number, PresentedDecision>();
   /** Last owner message per binding, used as the conversation to post decisions into. */
@@ -157,6 +160,16 @@ export class BridgeService {
 
     this.identity = identity;
     this.workspace = workspace;
+    if (this.clickClack.workflowRuns !== undefined && this.workflowClient !== undefined) {
+      this.durableWorkflows = new DurableWorkflowPublisher({
+        database: this.state.database, endpoint: this.config.clickClack.baseUrl,
+        producerId: identity.id, workspaceId: workspace.id, client: this.workflowClient,
+        hostIdentity: this.workflowClient()?.hostIdentity ?? "injected-client",
+        publish: (input) => this.clickClack.workflowRuns!.publish(input),
+        onError: () => this.logger.warn("durable workflow publication deferred"),
+      });
+      this.durableWorkflows.start();
+    }
     await this.publishCommandMenu();
     if (this.stopped) return;
     const interruptedTurns = this.state.recoverInterruptedTurns();
@@ -226,6 +239,7 @@ export class BridgeService {
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((failure) => failure.reason);
     try {
+      await this.durableWorkflows?.stop();
       this.state.close();
     } catch (error) {
       cleanupFailures.push(error);
@@ -968,7 +982,14 @@ export class BridgeService {
       client,
       sessionId,
       present: async (decision) => await this.presentDecision(binding, decision),
-      onRun: (event) => reporter.report(sessionRun(event)),
+      onRun: (event) => {
+        this.durableWorkflows?.observe({
+          workspace_id: this.config.clickClack.workspaceId,
+          ...(binding.conversationType === "channel" ? { channel_id: binding.conversationId }
+            : { direct_conversation_id: binding.conversationId }),
+        }, sessionId, event, JSON.stringify([binding.id, binding.projectAlias, this.config.projects.get(binding.projectAlias)?.cwd]));
+        reporter.report(sessionRun(event));
+      },
       onError: (error) =>
         this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
     });
