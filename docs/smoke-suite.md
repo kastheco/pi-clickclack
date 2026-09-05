@@ -117,9 +117,17 @@ node --env-file=/absolute/path/to/bridge.env scripts/smoke/live.mjs \
 This calls the real `createEmbeddedPiRuntime` with a unique SDK-generated header
 in a temporary probe session, pinned to the configured project's cwd. It does not
 start the bridge service, bind/replace ClickClack conversations, continue the most
-recent session, recover old sessions, or run KAS-772. The only enabled agent tool
-is `read`; the prompt requests exactly this checkout's `package.json`, resolved
-from the script location, then the exact pinned SDK version. Assertions require
+recent session, recover old sessions, or run KAS-772. Initially only `read` is
+advertised; startup hooks may activate additional tools (including context-mode).
+A smoke-only public `Agent.beforeToolCall` gate permits at most one `read`, with
+only the exact checkout `package.json` path argument. It blocks all other calls
+before tool execution, preserves the SDK extension hook for the permitted call,
+and rechecks arguments after that hook in case extensions mutate them. This is
+the documented Pi 0.85.1 agent-core hook (README “Agent Options” and “Tool Execution”;
+`dist/agent.d.ts`, `dist/types.d.ts`); `dist/agent-loop.js` checks its block result
+before `execute()`. No production runtime or installed extension is patched.
+The prompt requests that file, resolved from the script location, then the exact
+pinned SDK version. Assertions still reject extra calls, even blocked ones, and require
 one matching successful read and a later normally completed assistant response.
 The expected version is not included in the prompt.
 
@@ -132,7 +140,8 @@ its scope explicitly excludes full extension health. Best-effort failures swallo
 internally by extensions cannot be inferred from a successful read. In particular,
 a native pi-lcm ABI mismatch is not fixed or waived by this probe.
 
-**Safety boundary:** active tools are read-only, not a sandbox around installed
+**Safety boundary:** model-requested tool execution is gated, not merely aborted
+from observational `tool_execution_start` events. This is not a sandbox around installed
 code. Real configured extensions, hooks, OAuth refresh, and services may perform
 their normal IO/side effects, including outside the probe directory. Review those
 extensions before granting permission; do not run this against a project whose
