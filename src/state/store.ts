@@ -13,6 +13,19 @@ export type SourceMessageClaim = {
   claimedAt: string;
 };
 
+export type SteeringReceipt = {
+  messageId: MessageId;
+  bindingId: number;
+  sessionId: string;
+  turnId: TurnId;
+  projectAlias: string;
+  authorId: string;
+  workspaceId: string;
+  botId: string;
+  status: "pending" | "consumed" | "uncertain";
+  runtimeRetired: boolean;
+};
+
 export type ClaimResult =
   | { claimed: true; claim: SourceMessageClaim }
   | { claimed: false; claim: SourceMessageClaim };
@@ -133,6 +146,7 @@ export class StateStore {
     messageId: MessageId;
     eventId?: string;
     eventCursor?: string;
+    steering?: Omit<SteeringReceipt, "messageId" | "status" | "runtimeRetired">;
   }): ClaimResult {
     const messageId = requiredValue(input.messageId, "messageId") as MessageId;
     return this.transaction(() => {
@@ -143,10 +157,54 @@ export class StateStore {
           VALUES (?, ?, ?, ?)
         `)
         .run(messageId, input.eventId ?? null, input.eventCursor ?? null, now);
+      if (result.changes === 1 && input.steering) {
+        const receipt = input.steering;
+        this.database.prepare(`INSERT INTO steering_receipts
+          (message_id, binding_id, session_id, turn_id, project_alias, author_id, workspace_id, bot_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(messageId, receipt.bindingId, receipt.sessionId, receipt.turnId, receipt.projectAlias,
+            receipt.authorId, receipt.workspaceId, receipt.botId);
+      }
       const claim = this.getSourceMessageClaim(messageId);
       if (!claim) throw new Error("source-message claim disappeared inside transaction");
       return result.changes === 1 ? { claimed: true, claim } : { claimed: false, claim };
     });
+  }
+
+  consumeSteering(messageId: MessageId): void {
+    this.database.prepare("UPDATE steering_receipts SET status = 'consumed' WHERE message_id = ? AND notified = 0").run(messageId);
+  }
+
+  markSteeringMessageUncertain(messageId: MessageId): void {
+    this.database.prepare("UPDATE steering_receipts SET status = 'uncertain' WHERE message_id = ? AND status = 'pending'").run(messageId);
+  }
+
+  markSteeringUncertain(turnId?: TurnId): void {
+    this.database.prepare(`UPDATE steering_receipts SET status = 'uncertain'
+      WHERE status = 'pending' ${turnId ? "AND turn_id = ?" : ""}`).run(...(turnId ? [turnId] : []));
+  }
+
+  hasUnconsumedSteering(turnId: TurnId, sessionId: string): boolean {
+    return this.database.prepare("SELECT 1 FROM steering_receipts WHERE turn_id = ? AND session_id = ? AND status <> 'consumed' LIMIT 1")
+      .get(turnId, sessionId) !== undefined;
+  }
+
+  markSteeringRuntimeRetired(turnId: TurnId): void {
+    this.database.prepare("UPDATE steering_receipts SET runtime_retired = 1 WHERE turn_id = ? AND status <> 'consumed'").run(turnId);
+  }
+
+  markSteeringNotified(messageId: MessageId): void {
+    this.database.prepare("UPDATE steering_receipts SET notified = 1 WHERE message_id = ?").run(messageId);
+  }
+
+  listUncertainSteering(): SteeringReceipt[] {
+    return (this.database.prepare("SELECT * FROM steering_receipts WHERE status = 'uncertain' AND notified = 0").all() as Row[])
+      .map((row) => ({
+        messageId: text(row.message_id) as MessageId, bindingId: integer(row.binding_id),
+        sessionId: text(row.session_id), turnId: text(row.turn_id) as TurnId,
+        projectAlias: text(row.project_alias), authorId: text(row.author_id),
+        workspaceId: text(row.workspace_id), botId: text(row.bot_id), status: "uncertain", runtimeRetired: integer(row.runtime_retired) === 1,
+      }));
   }
 
   getSourceMessageClaim(messageId: MessageId): SourceMessageClaim | undefined {

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+
 import type { BotCommandInput, Message, MessageInput, RealtimeEvent } from "@clickclack/sdk-ts";
 
 import { createBridgeApplication } from "./application.js";
@@ -84,6 +86,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
       },
     },
     messages: {
+      findByNonce: async () => undefined,
       get: async (messageId: string) => {
         const message = messages.get(messageId);
         if (!message) throw new Error(`missing fake message ${messageId}`);
@@ -1448,7 +1451,7 @@ test("a slow turn in one conversation does not block a turn in another", async (
   service.stop();
 });
 
-test("two messages in one conversation run in order, not concurrently", async () => {
+test("messages received before SDK streaming still run serialized turns", async () => {
   const setup = fixture();
   const events: string[] = [];
   let active = 0;
@@ -1499,6 +1502,459 @@ test("two messages in one conversation run in order, not concurrently", async ()
   assert.deepEqual(events, ["start:first", "end:first", "start:second", "end:second"]);
   service.stop();
 });
+
+test("mid-turn messages steer before the original prompt settles", async () => {
+  const setup = fixture();
+  const delivered: string[] = [];
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const agent = { steer(message: object) { queueMicrotask(() => listener?.({ type: "message_start", message } as AgentSessionEvent)); } };
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const runtime = {
+    session: {
+      sessionId: "session-steer", sessionFile: "/tmp/session-steer.jsonl",
+      messages: [] as unknown[], isStreaming: false,
+      agent,
+      subscribe(callback: (event: AgentSessionEvent) => void) { listener = callback; return () => { listener = undefined; }; },
+      async steer(text: string) {
+        delivered.push(text);
+        agent.steer({ role: "user", content: [{ type: "text", text }] });
+      },
+      async prompt(text: string) {
+        delivered.push(`prompt:${text}`);
+        this.isStreaming = true;
+        await blocked;
+        this.isStreaming = false;
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: "stop" });
+      },
+    },
+    async dispose() {},
+  };
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime: {
+      kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtime,
+    } as unknown as EmbeddedPiRuntimeBoundary,
+    logger: createLogger({ sink() {} }),
+  });
+  await service.start();
+  const send = (id: string, body: string) => {
+    setup.messages.set(id, message({ id, body, directConversationId: "dm_steer" }));
+    setup.emit(createdEvent({ messageId: id, cursor: `cur_${id}` }));
+  };
+  try {
+    send("first", "original");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.session.isStreaming, true);
+    send("second", "correction");
+    send("second", "correction");
+    send("third", "another correction");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(delivered, ["prompt:original", "correction", "another correction"]);
+    assert.equal(setup.sent.length, 0, "original turn is still unsettled");
+  } finally {
+    release();
+    await service.waitForIdle();
+    service.stop();
+  }
+  assert.deepEqual(delivered, ["prompt:original", "correction", "another correction"]);
+});
+
+function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted?: boolean; failed?: boolean } = {}) {
+  const setup = fixture();
+  const prompts: string[] = [];
+  const steering: Array<{ text: string; images: unknown }> = [];
+  const pending: object[] = [];
+  let disposed = false;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const runtime = {
+    session: {
+      sessionId: "session-steering", sessionFile: "/tmp/session-steering.jsonl",
+      extensionRunner: { getCommand() { return undefined; } }, promptTemplates: [],
+      messages: [] as unknown[], isStreaming: false,
+      getSteeringMessages() { return pending.map(() => "pending"); },
+      agent: { steer(message: object) {
+        pending.push(message);
+        if (options.consume !== false) queueMicrotask(() => {
+          pending.splice(pending.indexOf(message), 1);
+          listener?.({ type: "message_start", message } as AgentSessionEvent);
+        });
+      } },
+      subscribe(callback: (event: AgentSessionEvent) => void) { listener = callback; return () => { listener = undefined; }; },
+      async steer(text: string, images: unknown) {
+        steering.push({ text, images });
+        if (options.reject) throw new Error("SDK rejected steering");
+        this.agent.steer({ role: "user", content: [{ type: "text", text }] });
+      },
+      async prompt(text: string) {
+        prompts.push(text); this.isStreaming = true;
+        await blocked;
+        this.isStreaming = false;
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: options.aborted ? "aborted" : options.failed ? "error" : "stop" });
+      },
+    },
+    async dispose() { disposed = true; },
+  };
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime: {
+      kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtime,
+    } as unknown as EmbeddedPiRuntimeBoundary,
+    logger: createLogger({ sink() {} }),
+  });
+  const send = (id: string, body: string, extra: Partial<Parameters<typeof message>[0]> = {}, mentionedUserIds?: string[]) => {
+    const source = message({ id, body, directConversationId: "dm_steering", ...extra });
+    setup.messages.set(id, source);
+    setup.emit(createdEvent({ messageId: id, cursor: `cur_${id}`, ...(source.channel_id ? { channelId: source.channel_id } : {}), ...(mentionedUserIds ? { mentionedUserIds } : {}) }));
+  };
+  return { setup, service, runtime, prompts, steering, send, release, disposed: () => disposed };
+}
+
+const nextEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+for (const failure of ["rejection", "abort", "unconfirmed"] as const) {
+  test(`mid-turn ${failure} reports uncertainty without queued replay`, async () => {
+    const f = steeringFixture({ consume: false, reject: failure === "rejection", aborted: failure === "abort" });
+    await f.service.start();
+    try {
+      f.send("original", "original"); await nextEventLoop();
+      f.send("correction", "same"); f.send("correction", "same"); await nextEventLoop();
+      assert.equal(f.steering.length, 1);
+      f.release(); await f.service.waitForIdle();
+      assert.deepEqual(f.prompts, ["original"]);
+      assert.equal(f.setup.sent.filter((item) => item.body.includes("couldn't confirm delivery")).length, 1);
+      assert.ok(f.service.state.getSourceMessageClaim("correction" as never));
+      assert.equal(f.service.state.getOutbound("pi-steering-uncertain-correction")?.status, "sent");
+      f.send("correction", "same"); await f.service.waitForIdle();
+      assert.equal(f.steering.length, 1);
+      assert.deepEqual(f.prompts, ["original"]);
+    } finally { f.release(); await f.service.waitForStop(); }
+  });
+}
+
+for (const failure of ["abort", "failure", "successful-but-still-queued"] as const) {
+  test(`mid-turn ${failure} retires pending runtime before the next ordinary prompt`, async () => {
+    const f = steeringFixture({ consume: false, aborted: failure === "abort", failed: failure === "failure" });
+    await f.service.start();
+    try {
+      f.send("original", "original"); await nextEventLoop();
+      f.send("correction", "old correction"); await nextEventLoop();
+      f.release(); await f.service.waitForIdle();
+      assert.equal(f.disposed(), true);
+      const binding = f.service.state.getBinding("direct", "dm_steering" as never)!;
+      assert.equal(f.service.state.getActivePiSession(binding.id), undefined);
+      assert.equal(f.service.state.listArchivedPiSessions(binding.id)[0]?.sessionId, "session-steering");
+      assert.ok(f.setup.sent.some((item) => item.body.includes("runtime was retired")));
+      const freshPrompts: string[] = [];
+      f.service.piRuntime.createSessionRuntime = async (request) => {
+        assert.equal(request.sessionFile, undefined, "must not implicitly resume retired session");
+        const messages: unknown[] = [];
+        return {
+          session: {
+            sessionId: "fresh-session", sessionFile: "/tmp/fresh-session.jsonl", messages,
+            subscribe() { return () => {}; },
+            async prompt(text: string) { freshPrompts.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "fresh" }], stopReason: "stop" }); },
+          }, async dispose() {},
+        } as never;
+      };
+      f.send("next", "new turn"); await f.service.waitForIdle();
+      assert.deepEqual(freshPrompts, ["new turn"]);
+      assert.deepEqual(f.prompts, ["original"], "retired queue is never run again");
+    } finally { f.release(); await f.service.waitForStop(); }
+  });
+}
+
+for (const options of [{ reject: true }, { consume: true, aborted: true }]) {
+  test(`mid-turn ${options.reject ? "pre-enqueue rejection" : "consumed correction then abort"} does not retire a healthy empty queue`, async () => {
+    const f = steeringFixture(options);
+    await f.service.start();
+    try {
+      f.send("original", "original"); await nextEventLoop();
+      f.send("correction", "correction"); await nextEventLoop();
+      f.release(); await f.service.waitForIdle();
+      assert.equal(f.disposed(), false);
+      const binding = f.service.state.getBinding("direct", "dm_steering" as never)!;
+      assert.equal(f.service.state.getActivePiSession(binding.id)?.sessionId, "session-steering");
+    } finally { f.release(); await f.service.waitForStop(); }
+  });
+}
+
+test("consumed steering plus a later pre-enqueue rejection does not retire extension-owned queued work", async () => {
+  const f = steeringFixture();
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("consumed", "consumed correction"); await nextEventLoop();
+    f.runtime.session.steer = async () => { throw new Error("pre-enqueue rejection"); };
+    f.runtime.session.getSteeringMessages = () => ["extension-owned queued message"];
+    f.send("rejected", "rejected correction"); await nextEventLoop();
+    f.release(); await f.service.waitForIdle();
+    assert.equal(f.disposed(), false);
+  } finally { f.release(); await f.service.waitForStop(); }
+});
+
+test("mid-turn steering and retirement stay isolated across two active DMs and reconnect replay", async () => {
+  const first = steeringFixture({ consume: false, aborted: true });
+  const second = steeringFixture();
+  second.runtime.session.sessionId = "session-other";
+  second.runtime.session.sessionFile = "/tmp/session-other.jsonl";
+  let creations = 0;
+  first.service.piRuntime.createSessionRuntime = async () => (++creations === 1 ? first.runtime : second.runtime) as never;
+  await first.service.start();
+  try {
+    first.send("original", "original"); await nextEventLoop();
+    first.send("other", "other original", { directConversationId: "dm_other" }); await nextEventLoop();
+    first.send("correction", "first correction");
+    first.send("other-correction", "second correction", { directConversationId: "dm_other" });
+    await nextEventLoop();
+    const reconnect = first.service as unknown as { connectRealtime(): Promise<void> };
+    await reconnect.connectRealtime();
+    first.send("correction", "first correction"); await nextEventLoop();
+    assert.deepEqual(first.steering.map((m) => m.text), ["first correction"]);
+    assert.deepEqual(second.steering.map((m) => m.text), ["second correction"]);
+    first.release(); await nextEventLoop();
+    assert.equal(first.disposed(), true);
+    assert.equal(second.disposed(), false);
+    assert.equal(second.runtime.session.isStreaming, true);
+    first.send("another", "still working", { directConversationId: "dm_other" }); await nextEventLoop();
+    assert.deepEqual(second.steering.map((m) => m.text), ["second correction", "still working"]);
+  } finally {
+    first.release(); second.release(); await first.service.waitForStop(); await second.service.waitForStop();
+  }
+});
+
+test("explicit continue after steering retirement creates a fresh runtime from history only", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "steering-continue-"));
+  const f = steeringFixture({ consume: false, aborted: true });
+  const sessionFile = join(directory, "session.jsonl");
+  writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "session-steering" }) + "\n");
+  f.runtime.session.sessionFile = sessionFile;
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("correction", "old correction"); await nextEventLoop();
+    f.release(); await f.service.waitForIdle();
+    assert.equal(f.disposed(), true);
+    const resumed: string[] = [];
+    let recreated = false;
+    f.service.piRuntime.createSessionRuntime = async (request) => {
+      assert.equal(request.sessionFile, sessionFile);
+      recreated = true;
+      const messages: unknown[] = [];
+      return { session: {
+        sessionId: "session-steering", sessionFile, messages,
+        subscribe() { return () => {}; },
+        async prompt(text: string) { resumed.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "resumed" }], stopReason: "stop" }); },
+      }, async dispose() {} } as never;
+    };
+    f.send("continue", "/continue"); await f.service.waitForIdle();
+    assert.equal(recreated, true);
+    assert.equal(resumed.length, 1);
+    assert.match(resumed[0]!, /^Continue from where the interrupted session left off/);
+    assert.equal(resumed.includes("old correction"), false);
+  } finally { f.release(); await f.service.waitForStop(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("mid-turn routing preserves owner, conversation, mention and slash-command isolation", async () => {
+  const f = steeringFixture();
+  await f.service.start();
+  try {
+    f.send("original", "original", { channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    await nextEventLoop();
+    f.send("outsider", "correction", { authorId: "usr_outsider", channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    f.send("unmentioned", "correction", { channelId: "chn_steering", directConversationId: "" });
+    f.send("bot", "correction", { authorId: "usr_bot", channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    f.send("other-channel", "correction", { channelId: "chn_other", directConversationId: "" });
+    f.send("accepted", "@bridge use this", { channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    await nextEventLoop();
+    assert.deepEqual(f.steering.map((m) => m.text), ["use this"]);
+    f.send("command", "/abort", { channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    f.send("after-command", "ordered", { channelId: "chn_steering", directConversationId: "" }, ["usr_bot"]);
+    await nextEventLoop();
+    assert.equal(f.steering.length, 1, "do not bypass commands queued ahead of an input");
+    f.release(); await f.service.waitForIdle();
+    assert.deepEqual(f.prompts, ["original", "ordered"]);
+    assert.ok(f.setup.sent.some((item) => item.body.includes("unknown Pi command `/abort`")), "preserve existing abort-command semantics");
+    for (const id of ["outsider", "unmentioned", "bot", "other-channel"]) assert.equal(f.service.state.getSourceMessageClaim(id as never), undefined);
+  } finally { f.release(); await f.service.waitForStop(); }
+});
+
+test("mid-turn decision replies take precedence over steering", async () => {
+  const f = steeringFixture();
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    const binding = f.service.state.getBinding("direct", "dm_steering" as never)!;
+    const internals = f.service as unknown as {
+      presentDecision(binding: ConversationBinding, decision: ClaimedWorkflowDecision): Promise<DecisionAnswer | undefined>;
+    };
+    const decision = internals.presentDecision(binding, {
+      requestId: "request-steer", runId: "run-steer", revision: 1, title: "Continue?", summary: "Choose.",
+      choices: [{ key: "yes", label: "Continue", expectsInput: false }],
+    });
+    await nextEventLoop();
+    f.send("answer", "1"); await nextEventLoop();
+    assert.ok(await decision);
+    assert.deepEqual(f.steering, []);
+    assert.deepEqual(f.prompts, ["original"]);
+    f.send("correction", "not a decision reply"); await nextEventLoop();
+    assert.equal(f.steering.length, 1);
+  } finally { f.release(); await f.service.waitForStop(); }
+});
+
+test("mid-turn image download settlement race queues once instead of steering an idle session", async () => {
+  const f = steeringFixture();
+  let download!: () => void;
+  const downloading = new Promise<void>((resolve) => { download = resolve; });
+  f.setup.clickClack.uploads = { download: async () => { await downloading; return new Blob(["img"]); } } as never;
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("image", "image correction", { attachments: [{ id: "upl_image", content_type: "image/png", byte_size: 3 } as never] });
+    await nextEventLoop();
+    f.release(); await nextEventLoop();
+    download(); await f.service.waitForIdle();
+    assert.deepEqual(f.prompts, ["original", "image correction"]);
+    assert.equal(f.steering.length, 0);
+    f.send("image", "image correction"); await f.service.waitForIdle();
+    assert.equal(f.prompts.length, 2);
+  } finally { download(); f.release(); await f.service.waitForStop(); }
+});
+
+test("mid-turn images are downloaded safely and passed to steering; failed downloads never steer text alone", async () => {
+  const f = steeringFixture();
+  f.setup.clickClack.uploads = { download: async () => new Blob(["img"]) } as never;
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("image", "image correction", { attachments: [{ id: "upl_image", content_type: "image/png", byte_size: 3 } as never] });
+    await nextEventLoop();
+    assert.deepEqual(f.steering, [{ text: "image correction", images: [{ type: "image", data: "aW1n", mimeType: "image/png" }] }]);
+    f.send("bad-image", "incomplete", { attachments: [{ id: "upl_bad", content_type: "image/png", byte_size: 4 } as never] });
+    await nextEventLoop();
+    assert.equal(f.steering.length, 1);
+    assert.ok(f.setup.sent.some((item) => item.body.includes("couldn't load every attachment")));
+  } finally { f.release(); await f.service.waitForStop(); }
+});
+
+function seedSteeringRecovery(setup: Fixture, path: string) {
+  setup.config.statePath = path;
+  const state = new StateStore(path);
+  const binding = state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
+  state.setActivePiSession({ bindingId: binding.id, sessionId: "session-recovery", sessionFile: "/tmp/session-recovery.jsonl" });
+  state.claimSourceMessage({ messageId: "original" as never });
+  state.startActiveTurn({ turnId: "turn_recovery" as never, bindingId: binding.id, sourceMessageId: "original" as never });
+  for (const id of ["before-enqueue", "after-enqueue", "consumed"]) {
+    setup.messages.set(id, message({ id, body: "identical correction", directConversationId: "dm_recovery" }));
+    state.claimSourceMessage({ messageId: id as never, steering: {
+      bindingId: binding.id, sessionId: "session-recovery", turnId: "turn_recovery" as never,
+      projectAlias: "main", authorId: "usr_owner", workspaceId: "wsp_test", botId: "usr_bot",
+    } });
+  }
+  state.consumeSteering("consumed" as never);
+  state.close();
+}
+
+function recoveryService(setup: Fixture) {
+  return new BridgeService(setup.config, {
+    clickClack: setup.clickClack, logger: createLogger({ sink() {} }),
+    piRuntime: { kind: "embedded-pi-sdk", createSessionRuntime: async () => { throw new Error("recovery must not prompt Pi"); } } as unknown as EmbeddedPiRuntimeBoundary,
+  });
+}
+
+test("steering recovery retains claims across crash windows and repeated restarts without replay", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "steering-recovery-"));
+  const setup = fixture();
+  seedSteeringRecovery(setup, join(directory, "state.sqlite"));
+  try {
+    for (let restart = 0; restart < 2; restart += 1) {
+      const service = recoveryService(setup);
+      await service.start();
+      assert.equal(setup.sent.length, 2, "only unconfirmed receipts get notices; consumed receipt does not");
+      for (const id of ["before-enqueue", "after-enqueue", "consumed"]) {
+        assert.ok(service.state.getSourceMessageClaim(id as never));
+        setup.emit(createdEvent({ messageId: id, cursor: `cur_${restart}_${id}` }));
+      }
+      await service.waitForIdle();
+      assert.equal(setup.sent.length, 2);
+      await service.waitForStop();
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("steering notice uncertain-create reconciles by nonce after restart", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "steering-notice-"));
+  const setup = fixture();
+  seedSteeringRecovery(setup, join(directory, "state.sqlite"));
+  const created = new Map<string, Message>();
+  const send = setup.clickClack.dms.sendMessage;
+  setup.clickClack.dms.sendMessage = async (...args) => {
+    const result = await send(...args);
+    created.set(args[1].nonce!, { ...setup.messages.get("before-enqueue")!, id: result.id });
+    throw new Error("connection lost after create");
+  };
+  setup.clickClack.messages.findByNonce = async (_workspace, nonce) => created.get(nonce);
+  try {
+    const first = recoveryService(setup); await first.start(); await first.waitForStop();
+    assert.equal(setup.sent.length, 2);
+    const second = recoveryService(setup); await second.start();
+    assert.equal(setup.sent.length, 2, "nonce lookup must prevent duplicate notice creates");
+    for (const id of ["before-enqueue", "after-enqueue"]) {
+      assert.equal(second.state.getOutbound(`pi-steering-uncertain-${id}`)?.status, "reconciled");
+    }
+    await second.waitForStop();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("steering recovery rechecks binding after an awaited nonce lookup", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "steering-rebind-notice-"));
+  const setup = fixture(["main", "other"]);
+  const path = join(directory, "state.sqlite");
+  seedSteeringRecovery(setup, path);
+  const state = new StateStore(path);
+  state.reserveOutbound({ nonce: "pi-steering-uncertain-before-enqueue", targetType: "direct", targetId: "dm_recovery", messageKind: "message", body: "notice" });
+  state.close();
+  let release!: () => void;
+  let started!: () => void;
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const lookupStarted = new Promise<void>((resolve) => { started = resolve; });
+  setup.clickClack.messages.findByNonce = async () => { started(); await waiting; return undefined; };
+  const service = recoveryService(setup);
+  try {
+    const starting = service.start();
+    await lookupStarted;
+    service.state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("other"), invocationMode: "auto" });
+    release(); await starting;
+    assert.deepEqual(setup.sent, [], "lookup cannot authorize a later create against a changed binding");
+  } finally { release(); await service.waitForStop(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+for (const changed of ["owner", "binding", "session", "target", "workspace"] as const) {
+  test(`steering recovery does not leak notices after ${changed} changes`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "steering-isolation-"));
+    const setup = fixture(["main", "other"]);
+    const path = join(directory, "state.sqlite");
+    seedSteeringRecovery(setup, path);
+    if (changed === "owner") setup.config.clickClack.ownerIds = ["usr_new_owner"];
+    if (changed === "workspace") setup.config.clickClack.workspaceId = "wsp_other";
+    if (changed === "target") for (const source of setup.messages.values()) source.direct_conversation_id = "dm_other";
+    const state = new StateStore(path);
+    const binding = state.getBinding("direct", "dm_recovery" as never)!;
+    if (changed === "binding") state.upsertBinding({ conversationType: "direct", conversationId: "dm_recovery" as never, projectAlias: toProjectAlias("other"), invocationMode: "auto" });
+    if (changed === "session") state.setActivePiSession({ bindingId: binding.id, sessionId: "new-session", sessionFile: "/tmp/new-session.jsonl" });
+    state.close();
+    try {
+      const service = recoveryService(setup);
+      if (changed === "workspace") await assert.rejects(service.start(), /wrong configured workspace/);
+      else { await service.start(); assert.deepEqual(setup.sent, []); }
+      await service.waitForStop();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("the invoke command switches a channel to always-on and survives a rebind", async () => {
   const setup = fixture(["main", "other"]);

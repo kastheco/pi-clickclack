@@ -131,6 +131,25 @@ export const migrations: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    version: 5,
+    name: "mid-turn-steering-receipts",
+    sql: `
+      CREATE TABLE steering_receipts (
+        message_id TEXT PRIMARY KEY REFERENCES source_message_claims(message_id),
+        binding_id INTEGER NOT NULL REFERENCES conversation_bindings(id),
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        project_alias TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consumed', 'uncertain')),
+        notified INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0, 1)),
+        runtime_retired INTEGER NOT NULL DEFAULT 0 CHECK (runtime_retired IN (0, 1))
+      ) STRICT;
+    `,
+  },
 ] as const;
 
 export function applyMigrations(

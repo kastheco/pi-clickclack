@@ -26,7 +26,8 @@ import { DurableWorkflowPublisher } from "./workflow-durable-publisher.js";
 import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
-import { StateStore, type ConversationBinding } from "./state/store.js";
+import { steerWithReceipt } from "./pi-steering.js";
+import { StateStore, type ConversationBinding, type SteeringReceipt } from "./state/store.js";
 import {
   toConversationId,
   toMessageId,
@@ -34,6 +35,8 @@ import {
   toTurnId,
   type ConversationType,
   type InvocationMode,
+  type MessageId,
+  type TurnId,
 } from "./types.js";
 
 export type BridgeServiceDependencies = {
@@ -65,7 +68,9 @@ const maxPiImageTotalBytes = 20 * 1024 * 1024;
 const piImageContentTypes = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
 
 type ActiveSessionTurn = {
+  turnId: TurnId;
   activity: TurnActivity;
+  unconsumedSteering: Set<MessageId>;
   session: AgentSessionRuntime["session"];
   messageStart: number;
   unsubscribe: (() => void) | undefined;
@@ -108,6 +113,9 @@ export class BridgeService {
    * a message in another.
    */
   private readonly conversationQueues = new Map<number, Promise<void>>();
+  private readonly queuedConversationWork = new Map<number, number>();
+  private readonly steeringMessages = new WeakMap<object, MessageId>();
+  private steeringNotices: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
@@ -178,6 +186,8 @@ export class BridgeService {
     if (interruptedTurns > 0) {
       this.logger.warn("recovered interrupted Pi turns from previous bridge process", { interruptedTurns });
     }
+    this.state.markSteeringUncertain();
+    await this.notifyUncertainSteering();
     this.started = true;
     await this.trackRealtime(this.connectRealtime());
     this.logger.info("bridge service started", {
@@ -273,8 +283,14 @@ export class BridgeService {
    */
   private enqueueConversationWork(bindingId: number, work: () => Promise<void>): void {
     const previous = this.conversationQueues.get(bindingId) ?? Promise.resolve();
+    this.queuedConversationWork.set(bindingId, (this.queuedConversationWork.get(bindingId) ?? 0) + 1);
     const next: Promise<void> = previous
-      .then(work)
+      .then(() => {
+        const remaining = (this.queuedConversationWork.get(bindingId) ?? 1) - 1;
+        if (remaining === 0) this.queuedConversationWork.delete(bindingId);
+        else this.queuedConversationWork.set(bindingId, remaining);
+        return work();
+      })
       .catch((error: unknown) => {
         this.logger.error("conversation work failed", { bindingId, error });
       })
@@ -291,6 +307,8 @@ export class BridgeService {
   }
 
   private async connectRealtime(): Promise<void> {
+    if (this.stopped) return;
+    await this.notifyUncertainSteering();
     if (this.stopped) return;
     let cursor = this.state.getRealtimeCursor();
 
@@ -462,6 +480,13 @@ export class BridgeService {
       return;
     }
     message = hydrated;
+    const hasImage = message.attachments?.some((attachment) =>
+      piImageContentTypes.has(normalizeContentType(attachment.content_type))
+    );
+    const prompt = cleanBody || (hasImage
+      ? "Review the attached image."
+      : "say hello and briefly identify the project connected to this conversation.");
+    if (!parseSlashInvocation(cleanBody) && await this.trySteer(event, binding, message, prompt)) return;
     const claim = this.state.claimSourceMessage({
       messageId: toMessageId(message.id),
       eventId: event.id,
@@ -483,13 +508,108 @@ export class BridgeService {
       return;
     }
 
-    const hasImage = message.attachments?.some((attachment) =>
-      piImageContentTypes.has(normalizeContentType(attachment.content_type))
-    );
-    const prompt = cleanBody || (hasImage
-      ? "Review the attached image."
-      : "say hello and briefly identify the project connected to this conversation.");
     this.enqueueConversationWork(bound.id, () => this.runTurn(bound, claimed, prompt));
+  }
+
+  private async trySteer(
+    event: RealtimeEvent, binding: ConversationBinding, source: Message, prompt: string,
+  ): Promise<boolean> {
+    const active = this.activeSessionTurns.get(binding.id);
+    if (!active?.session.isStreaming || this.queuedConversationWork.has(binding.id)) return false;
+    const session = active.session;
+    if (this.state.getSourceMessageClaim(toMessageId(source.id))) return true;
+    let images: PromptOptions["images"];
+    try {
+      images = await this.loadPromptImages(source);
+    } catch (error) {
+      const claim = this.state.claimSourceMessage({ messageId: toMessageId(source.id), eventId: event.id, eventCursor: event.cursor });
+      if (claim.claimed) await this.sendReply(source, "i couldn't load every attachment. please resend the message and try again.", `pi-attachment-error-${source.id}`);
+      this.logger.warn("steering attachment preparation failed", { sourceMessageId: source.id, error });
+      return true;
+    }
+    // No await between this check, the durable claim/receipt, and Pi 0.85.1's
+    // synchronous enqueue. Settlement cannot route this input a second time.
+    if (this.activeSessionTurns.get(binding.id) !== active || active.session !== session || !session.isStreaming
+      || this.queuedConversationWork.has(binding.id)) return false;
+    const claim = this.state.claimSourceMessage({
+      messageId: toMessageId(source.id), eventId: event.id, eventCursor: event.cursor,
+      steering: {
+        bindingId: binding.id, sessionId: active.session.sessionId, turnId: active.turnId,
+        projectAlias: binding.projectAlias, authorId: source.author_id,
+        workspaceId: this.config.clickClack.workspaceId, botId: this.identity!.id,
+      },
+    });
+    if (!claim.claimed) return true;
+    let captured = false;
+    try {
+      await steerWithReceipt(active.session, prompt, images, (message) => {
+        captured = true;
+        active.unconsumedSteering.add(toMessageId(source.id));
+        this.steeringMessages.set(message, toMessageId(source.id));
+      });
+      if (!captured) active.unconsumedSteering.add(toMessageId(source.id));
+    } catch (error) {
+      // A rejection does not prove enqueue never happened. Never queue a fallback.
+      this.state.markSteeringMessageUncertain(toMessageId(source.id));
+      this.logger.warn("Pi steering delivery uncertain", { sourceMessageId: source.id, error });
+    }
+    return true;
+  }
+
+  private notifyUncertainSteering(): Promise<void> {
+    this.steeringNotices = this.steeringNotices.then(async () => {
+      for (const receipt of this.state.listUncertainSteering()) {
+        try {
+          if (this.state.getActiveTurn(receipt.turnId)) continue;
+          const source = await this.clickClack.messages.get(receipt.messageId);
+          const target = this.steeringNoticeTarget(receipt, source);
+          if (!target) continue;
+          const nonce = `pi-steering-uncertain-${receipt.messageId}`;
+          const body = `i couldn't confirm delivery of your mid-turn message (${receipt.messageId}). it may have reached Pi; i won't replay it automatically. please check the result before resending.${receipt.runtimeRetired ? " the Pi runtime was retired to prevent its pending queue reaching another turn; session history is preserved." : ""}`;
+          const existing = this.state.getOutbound(nonce);
+          if (existing?.status === "sent" || existing?.status === "reconciled") {
+            this.state.markSteeringNotified(receipt.messageId);
+            continue;
+          }
+          const outbound = existing ?? this.state.reserveOutbound({ nonce, targetType: target.type, targetId: target.id, messageKind: "message", body });
+          if (existing) {
+            const found = await this.clickClack.messages.findByNonce(receipt.workspaceId, nonce);
+            if (found) {
+              if (outbound.status === "pending") this.state.transitionOutbound({ nonce, expected: "pending", next: "uncertain" });
+              this.state.transitionOutbound({ nonce, expected: "uncertain", next: "reconciled", messageId: toMessageId(found.id) });
+              this.state.markSteeringNotified(receipt.messageId);
+              continue;
+            }
+          }
+          try {
+            // Nonce lookup can cross a rebind or owner-policy change.
+            if (!this.steeringNoticeTarget(receipt, source)) continue;
+            const sent = target.type === "channel"
+              ? await this.clickClack.channels.sendMessage(target.id, { body, nonce })
+              : await this.clickClack.dms.sendMessage(target.id, { body, nonce });
+            this.state.transitionOutbound({ nonce, expected: outbound.status, next: "sent", messageId: toMessageId(sent.id) });
+            this.state.markSteeringNotified(receipt.messageId);
+          } catch (error) {
+            if (outbound.status === "pending") this.state.transitionOutbound({ nonce, expected: "pending", next: "uncertain" });
+            throw error;
+          }
+        } catch (error) {
+          this.logger.warn("steering uncertainty notice deferred", { sourceMessageId: receipt.messageId, error });
+        }
+      }
+    });
+    return this.steeringNotices;
+  }
+
+  private steeringNoticeTarget(receipt: SteeringReceipt, source: Message): ConversationTarget | undefined {
+    if (receipt.workspaceId !== this.config.clickClack.workspaceId || receipt.botId !== this.identity?.id
+      || !this.config.clickClack.ownerIds.includes(receipt.authorId)) return undefined;
+    const target = conversationTarget(source);
+    if (!target || source.author_id !== receipt.authorId || source.workspace_id !== receipt.workspaceId || source.deleted_at) return undefined;
+    const binding = this.state.getBinding(target.type, toConversationId(target.id));
+    if (binding?.id !== receipt.bindingId || binding.projectAlias !== receipt.projectAlias) return undefined;
+    const latest = this.state.getActivePiSession(binding.id) ?? this.state.listArchivedPiSessions(binding.id)[0];
+    return latest?.sessionId === receipt.sessionId ? target : undefined;
   }
 
   private async bindProject(target: ConversationTarget, aliasValue: string, source: Message): Promise<void> {
@@ -803,7 +923,9 @@ export class BridgeService {
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
       });
       activeSessionTurn = {
+        turnId,
         activity,
+        unconsumedSteering: new Set(),
         session: runtime.session,
         messageStart: runtime.session.messages.length,
         unsubscribe: undefined,
@@ -823,6 +945,7 @@ export class BridgeService {
         if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
         this.activeExtensionErrors.delete(binding.id);
+        this.state.markSteeringUncertain(turnId);
         this.activeSessionTurns.delete(binding.id);
         activeSessionTurn.unsubscribe?.();
         activeSessionTurn.unsubscribe = undefined;
@@ -866,6 +989,19 @@ export class BridgeService {
         }
       }
       await this.sendReply(source, "pi couldn't complete that turn. check the bridge log for the error.", `pi-error-${source.id}`);
+    } finally {
+      this.state.markSteeringUncertain(turnId);
+      const session = activeSessionTurn?.session;
+      // Never clear extension-owned queues. Retire only this runtime when our
+      // unconfirmed input could survive in its queue and leak into a later turn.
+      if (session && activeSessionTurn?.unconsumedSteering.size
+        && this.state.hasUnconsumedSteering(turnId, session.sessionId)
+        && session.getSteeringMessages?.().length > 0
+        && this.runtimes.get(binding.id)?.session === session) {
+        await this.quarantineUnresponsiveSession(binding);
+        this.state.markSteeringRuntimeRetired(turnId);
+      }
+      await this.notifyUncertainSteering();
     }
   }
 
@@ -1191,7 +1327,17 @@ export class BridgeService {
     activeTurn.unsubscribe?.();
     activeTurn.session = session;
     activeTurn.messageStart = session.messages.length;
-    activeTurn.unsubscribe = session.subscribe((event) => activeTurn.activity.handle(event));
+    activeTurn.unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_start") {
+        const sourceId = this.steeringMessages.get(event.message);
+        if (sourceId) {
+          activeTurn.unconsumedSteering.delete(sourceId);
+          this.state.consumeSteering(sourceId);
+          this.steeringMessages.delete(event.message);
+        }
+      }
+      activeTurn.activity.handle(event);
+    });
   }
 
   private async replaceRuntimeSession(

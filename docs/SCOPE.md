@@ -33,10 +33,11 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 - Each conversation binds to one configured project alias.
 - Each project alias resolves to an approved absolute working directory.
 - Pi resource discovery starts from that working directory, including project context, skills, extensions, prompts, and settings.
-- Turns are serialized within a conversation. Different conversations may run concurrently.
-- A message arriving during an active turn **queues behind it** and starts its own turn once the running turn settles. Steering is **not implemented**: the bridge never calls `session.steer()`, `session.followUp()`, or `PromptOptions.streamingBehavior`, so a mid-turn correction cannot reach a turn already in flight.
-- Per-conversation serialization is what keeps this safe. Because a second `prompt()` never lands while the first is streaming, the SDK's "streaming without `streamingBehavior` throws" path is never reached.
-- Turn settlement and new-message routing are atomic so one message cannot both queue against an active turn and start another turn.
+- New turns are serialized within a conversation. Different conversations may run concurrently.
+- An invoke-eligible owner message arriving while that conversation's Pi session is streaming uses `session.steer(text, images)`. It belongs to the running ClickClack turn, not a second turn. No prose-based correction detection, separate control UI, or `followUp()` path is used.
+- Pi consumes steering at its next supported agent-loop boundary (after the current assistant response/tool calls, before the next model call), not in the middle of a token or tool execution. If no session is streaming, or previously queued work/commands must run first, the message starts a normal serialized turn instead.
+- Decision replies retain precedence. Slash commands, including extension/resource commands and `/continue`, retain their existing serialized behavior. This change does not add an `/abort` command.
+- Images use the existing hydration, byte limits and download validation. Routing rechecks the exact active session after attachment I/O. Claim/receipt persistence and the pinned SDK's synchronous enqueue have no intervening await, so settlement cannot both steer and queue the same input.
 
 ## Invocation policy
 
@@ -95,7 +96,15 @@ A local SQLite database stores:
 
 Pi remains the source of truth for agent session history. ClickClack remains the source of truth for chat messages. The bridge does not create a third transcript.
 
-The bridge claims a source message before invoking Pi. Replayed ClickClack events therefore cannot start the same agent turn twice. Outbound durable messages use deterministic nonces and reconcile uncertain creates through ClickClack's nonce lookup endpoint.
+The bridge claims a source message before invoking Pi. Replayed ClickClack events therefore cannot start the same agent turn twice. Steering adds a small receipt in the same SQLite transaction as its source claim, recording the source ID, owner, binding/project, session, active turn, workspace and bot identity; it does not copy prompt text into bridge state.
+
+### Steering delivery and recovery
+
+- Pi 0.85.1's `AgentSession.steer()` expands skills/templates and synchronously calls the public `agent.steer(userMessage)` before its first await. Unlike `prompt()`, it does not run extension input hooks. `src/pi-steering.ts` temporarily intercepts that public call and restores it synchronously in `finally`, forwarding arguments, receiver and return value unchanged.
+- The adapter correlates only the exact queued object with the SDK's `message_start` event. Identical text is not identity. That event marks a receipt consumed: the SDK accepted the user message into its running history, **not** proof that the model followed it or finished its work. Nested captures, clones or asynchronous enqueue cannot falsely confirm a receipt. `src/pi-steering.test.ts` pins this compatibility assumption to 0.85.1 using real SDK streaming with an injected, network-free response stream.
+- A receipt still unconfirmed after settlement/restart becomes uncertain. The source claim remains held; ambiguous messages are never automatically replayed. The owner receives an uncertainty notice in the original conversation only if the original authorization, binding and session identity still match. Revoked/changed targets keep their receipts without leaking a notice elsewhere. Failed notices retry at reconnect/startup and subsequent settlements, using the existing outbound reconciliation table, deterministic nonce and nonce lookup.
+- If submitted, unconfirmed steering is still queued at settlement, only that runtime is retired and its session reference archived, preserving history. Extension-owned queues are not cleared or carried into another implicit turn. A rejection before enqueue with an empty queue does not retire a healthy runtime. `/continue` explicitly reconstructs a fresh runtime from recoverable history, not the old in-memory queue.
+- SQLite claims/receipts and Pi session history are not one transaction. A crash after SDK consumption but before receipt confirmation can produce an uncertainty notice for an already consumed message. This is **not exactly-once delivery**; the owner should inspect the result before resending. Ordinary pre-stream/queued-turn recovery is unchanged and remains memory-queued, not a new durable input queue.
 
 ## Security boundary
 
@@ -122,7 +131,7 @@ The bridge claims a source message before invoking Pi. Replayed ClickClack event
 
 1. Bootstrap the package, typed configuration, SQLite state, and bot authentication.
 2. Implement cursor-safe realtime ingestion, source-message claims, and invocation gating.
-3. Implement project bindings, persistent Pi sessions, serialized turns, and core commands. (Steering was planned here and was not built; see the conversation and session model above.)
+3. Implement project bindings, persistent Pi sessions, serialized turns, core commands, and supported-boundary mid-turn steering.
 4. Translate Pi streaming, tool activity, final messages, uploads, and interactive requests.
 5. Add crash recovery, race and replay tests, systemd installation, and operator documentation.
 

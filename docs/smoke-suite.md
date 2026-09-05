@@ -157,3 +157,19 @@ side effects; the stderr failure is not a health pass. Normal success/failure
 removes the probe directory and disposes the runtime. Exit 0 means the scoped
 checks passed; any assertion, timeout, configuration, or cleanup failure is nonzero.
 Never infer success solely from a model's text or a historical session transcript.
+
+
+## Mid-turn steering (KAS765)
+
+The standard offline suite includes `src/pi-steering.test.ts` and the message-routing regressions in `src/service.test.ts`. The SDK fixture asserts the exact embedded version (0.85.1), injects a mock response stream without model calls, holds the original prompt open, and confirms distinct receipts for identical corrections before that prompt settles. No installed extensions or live conversations are loaded.
+
+Targeted check (Node 24):
+
+```sh
+pnpm build
+node --test dist/pi-steering.test.js
+node --test --test-name-pattern='mid-turn|steering recovery|steering notice|explicit continue after steering' dist/service.test.js
+node --test dist/state/*.test.js
+```
+
+These checks cover synchronous receipt capture/restoration, unsupported identity behavior, claim atomicity, duplicate/reconnect events, images and settlement races, decision/command/auth isolation, pending-queue retirement, and restart/uncertain-notice reconciliation. They are source validation, not a deployment or live-app verification gate. See [steering recovery limits](SCOPE.md#steering-delivery-and-recovery) before changing the SDK pin.

@@ -187,3 +187,26 @@ test("outbound nonces track uncertain creates through reconciliation", () => {
     store.close();
   }
 });
+
+
+test("steering receipt and source claim commit atomically; duplicate claims cannot change identity", () => {
+  const store = new StateStore(":memory:");
+  try {
+    const binding = bindingFixture(store);
+    const messageId = toMessageId("steering-source");
+    const steering = {
+      bindingId: binding.id, sessionId: "session-a", turnId: toTurnId("turn-a"), projectAlias: "main",
+      authorId: "owner", workspaceId: "workspace", botId: "bot",
+    };
+    assert.throws(() => store.claimSourceMessage({ messageId, steering: { ...steering, bindingId: 999 } }), /FOREIGN KEY/);
+    assert.equal(store.getSourceMessageClaim(messageId), undefined, "failed receipt rolls claim back");
+    assert.equal(store.claimSourceMessage({ messageId, steering }).claimed, true);
+    assert.equal(store.claimSourceMessage({ messageId, steering: { ...steering, sessionId: "wrong-session" } }).claimed, false);
+    store.markSteeringUncertain();
+    assert.equal(store.listUncertainSteering()[0]?.sessionId, "session-a");
+    store.consumeSteering(messageId);
+    assert.equal(store.hasUnconsumedSteering(toTurnId("turn-a"), "session-a"), false);
+    store.markSteeringUncertain();
+    assert.deepEqual(store.listUncertainSteering(), [], "recovery cannot downgrade consumed receipts");
+  } finally { store.close(); }
+});

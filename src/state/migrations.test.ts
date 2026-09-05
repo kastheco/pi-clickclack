@@ -56,3 +56,20 @@ test("durable workflow migration preserves existing cursor and bindings without 
     applyMigrations(database);
   } finally { database.close(); }
 });
+
+
+test("steering migration preserves preexisting claims, bindings and workflow publications", () => {
+  const database = new DatabaseSync(":memory:", { enableForeignKeyConstraints: true });
+  try {
+    applyMigrations(database, migrations.filter((migration) => migration.version < 5));
+    database.exec(`INSERT INTO source_message_claims VALUES('message','event','cursor','2026-09-01');
+      INSERT INTO conversation_bindings VALUES(1,'direct','dm','project','auto','2026-09-01','2026-09-01');
+      INSERT INTO workflow_publications(scope,target,discovery,session_id,run_id)
+      VALUES('scope','target','discovery','session','run');`);
+    applyMigrations(database);
+    assert.equal(database.prepare("SELECT message_id FROM source_message_claims").get()!.message_id, "message");
+    assert.equal(database.prepare("SELECT conversation_id FROM conversation_bindings").get()!.conversation_id, "dm");
+    assert.equal(database.prepare("SELECT count(*) AS n FROM workflow_publications").get()!.n, 1);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM steering_receipts").get()!.n, 0);
+  } finally { database.close(); }
+});
