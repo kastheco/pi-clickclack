@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-05.
 
-This is the running record of local package changes made during the bridge recovery. It isn't a complete inventory of every historical customization on this machine. Update this file whenever a package is patched, rebuilt, pinned, restored, or returned to upstream. Mirror it to the Notion operations page once Notion authentication is available.
+This is the running record of local package changes made during the bridge recovery. It isn't a complete inventory of every historical customization on this machine. Update this file whenever a package is patched, rebuilt, pinned, restored, or returned to upstream. Mirror it to the [Notion package-customization ledger](https://app.notion.com/p/Package-customizations-and-update-checks-3d2b3a0a9c1981398003f31d42068ecf) under the pi-clickclack project page.
 
 ## Before updating
 
@@ -23,7 +23,7 @@ Don't run a blanket package update until the installed local patches below have 
 | `@luxusai/pi-hindsight` | `0.12.0` with a local runtime patch | Recall becomes a persistent per-prompt message. The injection path no longer reuses its cross-session-prone result cache. Source commit `064cae7`. | Both legacy `injectionPosition` values now append durably. New recall per prompt can add latency, and history grows until compaction. Preserve memory scope, enablement and error behavior when updating. |
 | `pi-lcm` → `better-sqlite3` | Dependency `11.10.0`, rebuilt for Node `24.20.0`, ABI `137` | Native binary rebuild only, no LCM source or database edits. In-memory SQLite load passes and reports SQLite `3.49.2`. | Rebuilding/installing under Node 22 produces ABI `127` and breaks the bridge. Align runtime before installing native dependencies. Existing processes that failed initialization may need a coordinated restart. |
 | `pi-clickclack` → `@earendil-works/pi-coding-agent` | Exactly `0.85.1` in package and lockfile, deployed | Pin commit `c3c6348`. Lockfile includes narrow release-age exclusions for six `@earendil-works` packages at `0.85.1`. | This is the embedded SDK, not global Pi. Validate the extension loader as well as the bridge's unit tests before changing it. |
-| `@monotykamary/pi-better-openai` | Installed `0.1.37`, compatibility fix pending | The strict smoke suite reports a loader failure resolving the Codex API subpath beneath `dist/compat.js`. No fix installed yet. | Blocks full live-smoke success with Pi `0.85.1`. Diagnosis is in progress; don't label this package patched or healthy yet. |
+| `@monotykamary/pi-better-openai` | `0.1.37` with local compatibility patch installed; full-stack verification pending | Commit `171c36d` uses explicitly aliased `/compat` and `/providers/all` exports while preserving the Codex provider. | Valid deep imports were incorrectly rewritten beneath `dist/compat.js` by the SDK loader. Keep the adaptation until the upstream package/loader combination passes the committed loader test. No SDK or provider guard patch. |
 | `pi-background-tasks` attribution guard | Unchanged during this repair | No guard, signature, or lineage-diagnostic bypass. | Preserve the guard. The repaired injectors must conform to it, not the reverse. |
 
 The context-mode and Hindsight installed package versions were not incremented by these local patches. Use the source commits and backup manifest, not package version alone, to identify the customized installation.
@@ -67,4 +67,5 @@ Nvm default now points to Node `24.20.0`. Existing shells don't change automatic
 - Deployed embedded Pi `0.85.1` and preserved the failed 772 transcript. The affected binding was archived through the bridge state API so the next invocation starts fresh. Kas also confirmed `/new` recovered `#utmco`.
 - Rebuilt Pi LCM's SQLite module for Node 24 and changed the future-shell default with approval.
 - Committed the reusable smoke suite. Its stricter checks exposed the separate `pi-better-openai` compatibility problem.
-- Notion publication is blocked: `ntn` reports no authentication token for the current workspace. This committed file is the source record until the mirror can be published.
+- Published and re-fetched the Notion ledger under pi-clickclack. Package entries and the reused project artwork are present. This file is its version-controlled source.
+- Installed `pi-better-openai` compatibility commit `171c36d` after source-fidelity checks, a red/green actual Pi 0.85.1 loader test, and package checks. Its baseline suite required local-only provisioning of a missing dev dependency, not a tracked dependency upgrade. The previous `codex-models.ts` and installed hash are in the backup root.
