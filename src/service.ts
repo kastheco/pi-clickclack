@@ -1,3 +1,4 @@
+import { decisionPublicationNonce } from "./workflow-decision-publication.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -13,6 +14,7 @@ import {
   type SlashInvocation,
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
+import { errorReply } from "./error-reply.js";
 import type { BridgeConfig } from "./config.js";
 import { decisionTurnId, readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
 import {
@@ -787,7 +789,7 @@ export class BridgeService {
         projectAlias: binding.projectAlias,
         error,
       });
-      await this.sendReply(source, `Pi command \`/${invocation.name}\` failed. check the bridge log for the error.`, `pi-command-error-${source.id}`);
+      await this.sendReply(source, errorReply("pi couldn't complete that command.", error, source.id, [this.config.clickClack.botToken]), `pi-command-error-${source.id}`);
     }
   }
 
@@ -1003,7 +1005,7 @@ export class BridgeService {
           return;
         }
       }
-      await this.sendReply(source, "pi couldn't complete that turn. check the bridge log for the error.", `pi-error-${source.id}`);
+      await this.sendReply(source, errorReply("pi couldn't complete that turn.", error, turnId, [this.config.clickClack.botToken]), `pi-error-${source.id}`);
     } finally {
       this.state.markSteeringUncertain(turnId);
       const session = activeSessionTurn?.session;
@@ -1134,7 +1136,7 @@ export class BridgeService {
     const watcher = new WorkflowDecisionWatcher({
       client,
       sessionId,
-      present: async (decision) => await this.presentDecision(binding, decision),
+      present: async (decision, signal) => await this.presentDecision(binding, decision, signal),
       onRun: (event) => {
         try {
           this.durableWorkflows?.observe({
@@ -1254,6 +1256,7 @@ export class BridgeService {
   private async presentDecision(
     binding: ConversationBinding,
     decision: ClaimedWorkflowDecision,
+    signal: AbortSignal,
   ): Promise<DecisionAnswer | undefined> {
     const source = this.conversationSources.get(binding.id);
     if (source === undefined) return undefined;
@@ -1262,19 +1265,28 @@ export class BridgeService {
     const answer = new Promise<DecisionAnswer | undefined>((resolve) => {
       resolveAnswer = resolve;
     });
+    if (signal.aborted) return undefined;
     const presentation = { decision, source, resolve: resolveAnswer };
+    const cancel = () => {
+      if (this.presentedDecisions.get(binding.id) === presentation) this.presentedDecisions.delete(binding.id);
+      resolveAnswer(undefined);
+    };
+    signal.addEventListener("abort", cancel, { once: true });
     this.presentedDecisions.set(binding.id, presentation);
 
     try {
       // Posted as agent_commentary carrying a decision turn_id rather than as
       // an ordinary reply. Register first so replacement or shutdown can
       // cancel the presentation while publication is in flight.
-      await this.activityTransport(source).create(
-        "agent_commentary",
-        renderDecisionPrompt(decision),
-        decisionTurnId(decision.requestId, decision.revision),
-      );
+      const hostIdentity = this.workflowClient?.()?.hostIdentity;
+      if (!hostIdentity || !this.identity?.id) throw new Error("Decision publication requires stable host and producer identity");
+      const message = { kind: "agent_commentary" as const, body: renderDecisionPrompt(decision), turn_id: decisionTurnId(decision.requestId, decision.revision),
+        nonce: decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision }) };
+      if (source.channel_id) await this.clickClack.channels.sendMessage(source.channel_id, message);
+      else if (source.direct_conversation_id) await this.clickClack.dms.sendMessage(source.direct_conversation_id, message);
+      else throw new Error("Decision publication target is missing");
     } catch (error) {
+      signal.removeEventListener("abort", cancel);
       if (this.presentedDecisions.get(binding.id) === presentation) {
         this.presentedDecisions.delete(binding.id);
         resolveAnswer(undefined);
@@ -1282,7 +1294,7 @@ export class BridgeService {
       throw error;
     }
 
-    return await answer;
+    try { return await answer; } finally { signal.removeEventListener("abort", cancel); }
   }
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {

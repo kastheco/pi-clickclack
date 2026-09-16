@@ -1,4 +1,6 @@
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 
 import {
   type AgentSessionRuntime,
@@ -29,6 +31,29 @@ export const bridgeAppendSystemPrompt = [
   "Shell tools already execute in the pinned project's current working directory.",
   "Do not prepend `cd <project cwd> &&` to shell commands unless the command genuinely needs a different directory.",
 ].join(" ");
+
+// This host has no interactive UI. Exclude the question tool before building
+// the prompt, rather than letting its before_agent_start hook remove it after
+// another extension has captured the old prompt for an override.
+export const bridgeExcludedTools: string[] = ["ask_user_question"];
+
+export function loadBridgeSystemPrompts(
+  voiceProfilePath = join(homedir(), ".config", "unslop", "kas-voice-profile.md"),
+): string[] {
+  let profile: string;
+  try {
+    profile = readFileSync(voiceProfilePath, "utf8");
+  } catch (cause) {
+    throw new Error(`Could not load the bridge voice profile: ${voiceProfilePath}`, { cause });
+  }
+  if (!profile.trim()) throw new Error(`Bridge voice profile is empty: ${voiceProfilePath}`);
+  return [
+    bridgeAppendSystemPrompt,
+    "The user's standing voice profile is already loaded below. Apply it from the first reply; "
+      + "no separate file-read tool call is required. Preserve its distinction between chat and document registers.\n\n"
+      + profile,
+  ];
+}
 
 /**
  * Constructs the embedded SDK boundary only. No ModelRuntime, resource loader,
@@ -87,13 +112,14 @@ export function createEmbeddedPiRuntime(config: BridgeConfig): EmbeddedPiRuntime
           agentDir: config.pi.agentDir,
           modelRuntime: models,
           resourceLoaderOptions: {
-            appendSystemPrompt: [bridgeAppendSystemPrompt],
+            appendSystemPrompt: loadBridgeSystemPrompts(),
           },
         });
         return {
           ...(await createAgentSessionFromServices({
             services,
             sessionManager,
+            excludeTools: bridgeExcludedTools,
             ...(sessionStartEvent ? { sessionStartEvent } : {}),
             model,
             thinkingLevel: resolved.thinkingLevel ?? config.pi.thinkingLevel,

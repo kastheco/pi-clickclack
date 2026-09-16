@@ -1,34 +1,14 @@
-/**
- * Surfaces Pi Workflows human decisions in ClickClack.
- *
- * A workflow that reaches a `humanDecision` node stops and waits for a person.
- * Pi Workflows 0.16.0 delivers those through one versioned client protocol: a
- * presenter watches a session, claims one pending decision at an exact
- * revision, presents it, then answers. A claim held by another presenter is
- * skipped rather than contested, so the Pi TUI and this bridge can watch the
- * same session without stealing decisions from each other.
- *
- * This module owns only the watch-and-claim half. Rendering the decision into a
- * conversation and collecting the operator's reply belong to the service, which
- * already owns ClickClack transport and the durable turn claim.
- */
-
-/**
- * Mirrors `ClientInteractiveRequest` from `@osolmaz/pi-workflows/client`.
- *
- * Pi Workflows 0.16.0 defines the type in `dist/client/view.d.ts` but omits it
- * from the `./client` barrel, and package exports block the deep path. Only the
- * fields this watcher reads are declared. Replace this with the upstream import
- * once the barrel re-exports it.
+/** Host-side external decision watching for the latest Pi Workflows protocol.
+ * The subscription advertises external presentation without taking agent coordination.
+ * Message publication is nonce-deduplicated by ClickClack; answers remain revision-fenced.
  */
 export type WorkflowInteractiveRequest = {
   requestId: string;
   runId: string;
   revision: number;
   kind: "agent" | "assistant" | "decision";
-  status: "pending" | "presenting" | "settled" | "cancelled";
+  status: "pending" | "settled" | "cancelled";
   contract: unknown;
-  presentationClaimExpiresAt: string | null;
 };
 
 /** One decision this bridge has claimed and must now present. */
@@ -51,6 +31,7 @@ export type WorkflowDecisionClient = {
   watchSession(
     sessionId: string,
     listener: (event: unknown) => void,
+    options?: { externalPresenter?: boolean },
   ): Promise<() => Promise<void>>;
   request(options: {
     operation: string;
@@ -75,7 +56,7 @@ export type WorkflowDecisionWatcherOptions = {
   client: WorkflowDecisionClient;
   sessionId: string;
   /** Presents one claimed decision. Resolves to the chosen key, or undefined to release it. */
-  present: (decision: ClaimedWorkflowDecision) => Promise<DecisionAnswer | undefined>;
+  present: (decision: ClaimedWorkflowDecision, signal: AbortSignal) => Promise<DecisionAnswer | undefined>;
   /**
    * Reports the session's run state on every view event.
    *
@@ -112,15 +93,6 @@ function answerKey(
 ): string {
   const input = answer.input === undefined ? "" : JSON.stringify(answer.input);
   return `${interaction.requestId}:${interaction.revision}:${answer.choice}:${input}`;
-}
-
-/** True when another presenter holds an unexpired claim on this decision. */
-export function claimIsLive(
-  interaction: WorkflowInteractiveRequest,
-  now: number = Date.now(),
-): boolean {
-  const expiry = interaction.presentationClaimExpiresAt;
-  return expiry !== null && Date.parse(expiry) > now;
 }
 
 /** Extracts the view carried by one real or test session subscription event. */
@@ -197,7 +169,8 @@ export class WorkflowDecisionWatcher {
   private activeRequestId: string | undefined;
   private activeConsume: Promise<void> | undefined;
   private pendingInteractions: readonly WorkflowInteractiveRequest[] | undefined;
-  private claimRetryTimer: NodeJS.Timeout | undefined;
+  private activePresentation: { key: string; abort: AbortController } | undefined;
+  private readonly presented = new Set<string>();
   private generation = 0;
 
   constructor(options: WorkflowDecisionWatcherOptions) {
@@ -218,15 +191,14 @@ export class WorkflowDecisionWatcher {
       }
       const interactions = sessionInteractions(event);
       if (interactions !== undefined) this.queueInteractions(interactions, generation);
-    });
+    }, { externalPresenter: true });
     if (generation === this.generation) this.unwatch = unwatch;
     else await unwatch();
   }
 
   async stop(): Promise<void> {
     this.generation += 1;
-    if (this.claimRetryTimer !== undefined) clearTimeout(this.claimRetryTimer);
-    this.claimRetryTimer = undefined;
+    this.activePresentation?.abort.abort("stopped");
     this.pendingInteractions = undefined;
     const activeConsume = this.activeConsume;
     if (activeConsume !== undefined) await activeConsume;
@@ -240,30 +212,9 @@ export class WorkflowDecisionWatcher {
     interactions: readonly WorkflowInteractiveRequest[],
     generation: number,
   ): void {
-    if (this.claimRetryTimer !== undefined) clearTimeout(this.claimRetryTimer);
-    this.claimRetryTimer = undefined;
-
-    const now = Date.now();
-    const retryAt = interactions.reduce<number | undefined>((earliest, interaction) => {
-      if (interaction.kind !== "decision") return earliest;
-      if (interaction.status !== "pending" && interaction.status !== "presenting") return earliest;
-      const expiry = interaction.presentationClaimExpiresAt;
-      if (expiry === null) return earliest;
-      const timestamp = Date.parse(expiry);
-      if (!Number.isFinite(timestamp) || timestamp <= now) return earliest;
-      return earliest === undefined ? timestamp : Math.min(earliest, timestamp);
-    }, undefined);
-    if (retryAt !== undefined) {
-      const delayMs = Math.min(2_147_483_647, Math.max(1, retryAt - now + 1));
-      this.claimRetryTimer = setTimeout(() => {
-        this.claimRetryTimer = undefined;
-        if (generation !== this.generation) return;
-        // Re-evaluate the lease in case the clock moved backward or a timeout
-        // longer than Node's maximum delay was chunked.
-        this.queueInteractions(interactions, generation);
-      }, delayMs);
-    }
-
+    const active = this.activePresentation;
+    if (active && !interactions.some(interaction => interaction.kind === "decision" && interaction.status === "pending" && `${interaction.requestId}:${interaction.revision}` === active.key)) active.abort.abort("stale");
+    if (generation !== this.generation) return;
     this.pendingInteractions = interactions;
     this.startConsumeLoop();
   }
@@ -292,55 +243,37 @@ export class WorkflowDecisionWatcher {
 
     for (const interaction of interactions) {
       if (interaction.kind !== "decision") continue;
-      if (interaction.status !== "pending" && interaction.status !== "presenting") continue;
-      if (claimIsLive(interaction)) continue;
+      if (interaction.status !== "pending") continue;
+      const key = `${interaction.requestId}:${interaction.revision}`;
+      if (this.presented.has(key)) continue;
       const decision = decisionForOperator(interaction);
       if (decision === undefined) continue;
 
       this.activeRequestId = interaction.requestId;
       try {
-        const presentationRevision = await this.claim(interaction);
-        if (presentationRevision === undefined) return;
+        const abort = new AbortController();
+        this.activePresentation = { key, abort };
+        this.presented.add(key);
         if (generation !== this.generation) return;
-
-        const answer = await this.options.present(decision);
+        const answer = await this.options.present(decision, abort.signal);
+        if (abort.signal.reason === "stale") { this.presented.delete(key); return; }
         if (answer === undefined) return;
-        // Once the operator has answered, persist it even if shutdown or a
-        // session replacement starts before this continuation runs.
-        await this.answer(interaction, presentationRevision, answer);
+        // A chosen answer is durably submitted even if shutdown began meanwhile.
+        await this.answer(interaction, interaction.revision, answer);
       } catch (error) {
+        this.presented.delete(key);
         this.options.onError?.(error);
       } finally {
+        this.activePresentation?.abort.abort("finished");
+        this.activePresentation = undefined;
         if (this.activeRequestId === interaction.requestId) this.activeRequestId = undefined;
       }
       return;
     }
   }
 
-  /** Claims one decision. Resolves false when another presenter won the race. */
-  private async claim(interaction: WorkflowInteractiveRequest): Promise<number | undefined> {
-    const key =
-      `claim-presentation-${interaction.requestId}-${interaction.revision}-${this.options.client.clientId}`;
-    const response = await this.options.client.request({
-      operation: "interaction.update",
-      requestId: key,
-      idempotencyKey: key,
-      runId: interaction.runId,
-      expectedRevision: interaction.revision,
-      payload: { requestId: interaction.requestId, claimPresentation: true },
-    });
-    if (response.outcome === "conflict") return undefined;
-    if (response.outcome !== "accepted" && response.outcome !== "adopted") {
-      throw new Error(response.error ?? "workflow host rejected the presentation claim");
-    }
-    if (response.revision === undefined) {
-      throw new Error("workflow presentation claim has no revision");
-    }
-    return response.revision;
-  }
-
   /**
-   * Answers one claimed decision.
+   * Answers one presented decision.
    *
    * The host derives its acceptance attempt id from the idempotency key and
    * treats a repeat of the same key as the same answer, so the key is derived

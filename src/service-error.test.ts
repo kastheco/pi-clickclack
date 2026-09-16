@@ -10,7 +10,8 @@ import type { EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { BridgeService } from "./service.js";
 import { toProjectAlias } from "./types.js";
 
-test("does not reuse an earlier assistant message when the current Pi turn fails", async () => {
+for (const failure of ["message", "throw", "command"] as const) {
+test(`publishes the current Pi ${failure} error without reusing an earlier answer`, async () => {
   const alias = toProjectAlias("main");
   const config: BridgeConfig = {
     clickClack: {
@@ -30,7 +31,7 @@ test("does not reuse an earlier assistant message when the current Pi turn fails
     direct_conversation_id: "dm_test",
     author_id: "usr_owner",
     thread_root_id: "msg_failed",
-    body: "do the task",
+    body: failure === "command" ? "/compact" : "do the task",
     body_format: "markdown",
     created_at: "2026-01-01T00:00:00Z",
     kind: "message",
@@ -57,7 +58,9 @@ test("does not reuse an earlier assistant message when the current Pi turn fails
       sessionFile: "/tmp/session-failed.jsonl",
       messages,
       subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
+      async compact() { throw new Error("provider rejected the transcript ccb_secret"); },
       async prompt() {
+        if (failure === "throw") throw new Error("provider rejected the transcript ccb_secret");
         const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "provider rejected the transcript" };
         listener?.({ type: "message_end", message: failed });
         messages.push(failed);
@@ -83,10 +86,13 @@ test("does not reuse an earlier assistant message when the current Pi turn fails
   });
   await service.waitForIdle();
 
-  assert.deepEqual(sent, ["pi couldn't complete that turn. check the bridge log for the error."]);
-  assert.doesNotMatch(sent[0] ?? "", /stale response/u);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0] ?? "", /provider rejected the transcript/u);
+  assert.match(sent[0] ?? "", failure === "command" ? /reference: msg_failed/u : /reference: turn_/u);
+  assert.doesNotMatch(sent[0] ?? "", /stale response|ccb_secret/u);
   service.stop();
 });
+}
 
 test("quarantines an empty Pi session so the next message gets a fresh runtime", async () => {
   const alias = toProjectAlias("main");

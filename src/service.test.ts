@@ -261,6 +261,7 @@ test("shutdown cancels a decision while its message is still publishing", async 
   const setup = fixture();
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
+    workflowClient: () => ({ ...workflowClientRecorder().factory(), hostIdentity: "test-host" }),
     logger: createLogger({ sink() {} }),
   });
   const binding = service.state.upsertBinding({
@@ -280,6 +281,7 @@ test("shutdown cancels a decision while its message is still publishing", async 
     presentDecision(
       binding: ConversationBinding,
       decision: ClaimedWorkflowDecision,
+      signal: AbortSignal,
     ): Promise<DecisionAnswer | undefined>;
   };
   internals.conversationSources.set(binding.id, source);
@@ -302,7 +304,7 @@ test("shutdown cancels a decision while its message is still publishing", async 
     title: "Continue?",
     summary: "Choose whether to continue.",
     choices: [{ key: "continue", label: "Continue", expectsInput: false }],
-  });
+  }, new AbortController().signal);
   await publishStarted;
   const stopping = service.waitForStop();
   releasePublish();
@@ -838,11 +840,11 @@ test("oversized images are rejected before the bridge downloads them", async () 
   assert.equal(downloads, 0);
   assert.equal(prompts, 0);
   assert.match(logLines.join("\n"), /image attachments total/u);
-  assert.deepEqual(setup.sent, [{
-    target: "direct",
-    id: "dm_1",
-    body: "pi couldn't complete that turn. check the bridge log for the error.",
-  }]);
+  assert.equal(setup.sent.length, 1);
+  assert.equal(setup.sent[0]?.target, "direct");
+  assert.equal(setup.sent[0]?.id, "dm_1");
+  assert.match(setup.sent[0]?.body ?? "", /image attachments total 26214400 bytes; Pi's limit is 20971520/u);
+  assert.match(setup.sent[0]?.body ?? "", /reference: turn_/u);
   service.stop();
 });
 
@@ -1848,12 +1850,14 @@ test("mid-turn decision replies take precedence over steering", async () => {
     f.send("original", "original"); await nextEventLoop();
     const binding = f.service.state.getBinding("direct", "dm_steering" as never)!;
     const internals = f.service as unknown as {
-      presentDecision(binding: ConversationBinding, decision: ClaimedWorkflowDecision): Promise<DecisionAnswer | undefined>;
+      workflowClient: () => unknown;
+      presentDecision(binding: ConversationBinding, decision: ClaimedWorkflowDecision, signal: AbortSignal): Promise<DecisionAnswer | undefined>;
     };
+    internals.workflowClient = () => ({ ...workflowClientRecorder().factory(), hostIdentity: "test-host" });
     const decision = internals.presentDecision(binding, {
       requestId: "request-steer", runId: "run-steer", revision: 1, title: "Continue?", summary: "Choose.",
       choices: [{ key: "yes", label: "Continue", expectsInput: false }],
-    });
+    }, new AbortController().signal);
     await nextEventLoop();
     f.send("answer", "1"); await nextEventLoop();
     assert.ok(await decision);
@@ -2163,3 +2167,33 @@ test("durable startup fails closed without an explicit stable workflow host iden
   try { await assert.rejects(service.start(), /Missing stable workflow host identity/); assert.equal(setup.subscriptionCount(), 0); }
   finally { await service.waitForStop(); }
 });
+
+for (const target of ["direct", "channel"] as const) {
+  test(`independent bridge instances publish one ${target} decision under the API nonce contract`, async () => {
+    const setup = fixture();
+    // The real author+nonce uniqueness/conflict contract is covered by ClickClack's SQLite tests.
+    const remote = new Map<string, { id: string; body: string }>();
+    const nonces: string[] = [];
+    const api = target === "direct" ? setup.clickClack.dms : setup.clickClack.channels;
+    api.sendMessage = async (_id: string, input: MessageInput) => {
+      assert.ok(input.nonce); nonces.push(input.nonce);
+      const prior = remote.get(input.nonce);
+      if (prior) { assert.equal(prior.body,input.body); return prior as never; }
+      const result={id:`msg_${remote.size}`,body:input.body}; remote.set(input.nonce,result); return result as never;
+    };
+    const publish = async (clientId: string) => {
+      const service = new BridgeService(setup.config, {clickClack:setup.clickClack,
+        workflowClient:()=>({...workflowClientRecorder().factory(),clientId,hostIdentity:"shared-host"}),logger:createLogger({sink(){}})});
+      await service.start();
+      const binding=service.state.upsertBinding({conversationType:target,conversationId:"target" as never,projectAlias:toProjectAlias("main"),invocationMode:target === "direct" ? "auto" : "mention"});
+      const internals=service as unknown as {conversationSources:Map<number,Message>;presentDecision(binding:ConversationBinding,decision:ClaimedWorkflowDecision,signal:AbortSignal):Promise<DecisionAnswer|undefined>};
+      internals.conversationSources.set(binding.id,message({id:"source",body:"start",...(target==="direct"?{directConversationId:"target"}:{channelId:"target",directConversationId:""})}));
+      const abort=new AbortController();
+      const pending=internals.presentDecision(binding,{runId:"shared-run",requestId:"shared-request",revision:4,title:"Continue?",summary:"Choose.",choices:[{key:"yes",label:"Continue",expectsInput:false}]},abort.signal);
+      await nextEventLoop(); abort.abort(); await pending; await service.waitForStop();
+    };
+    await Promise.all([publish("bridge-a"),publish("bridge-b")]);
+    await publish("restarted-bridge");
+    assert.equal(nonces.length,3); assert.equal(new Set(nonces).size,1); assert.equal(remote.size,1);
+  });
+}

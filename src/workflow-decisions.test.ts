@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  claimIsLive,
   decisionForOperator,
   sessionInteractions,
   WorkflowDecisionWatcher,
@@ -18,7 +17,6 @@ function decisionRequest(): WorkflowInteractiveRequest {
     revision: 3,
     kind: "decision",
     status: "pending",
-    presentationClaimExpiresAt: null,
     contract: {
       request: {
         title: "Approve the implementation plan",
@@ -90,23 +88,11 @@ async function settle(): Promise<void> {
   for (let tick = 0; tick < 10; tick += 1) await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
-test("a live claim held by another presenter is not contested", () => {
-  const now = Date.parse("2026-09-03T00:00:00.000Z");
-  assert.equal(claimIsLive(decisionRequest(), now), false);
-  assert.equal(
-    claimIsLive(
-      { ...decisionRequest(), presentationClaimExpiresAt: "2026-09-03T00:00:30.000Z" },
-      now,
-    ),
-    true,
-  );
-  assert.equal(
-    claimIsLive(
-      { ...decisionRequest(), presentationClaimExpiresAt: "2026-09-02T23:59:30.000Z" },
-      now,
-    ),
-    false,
-  );
+test("external subscription advertises ownership without taking agent coordination", async () => {
+  let options: unknown;
+  const transport = client({ watchSession: async (_session,next,opts) => { options=opts; return async () => {}; } });
+  const watcher = new WorkflowDecisionWatcher({ client: transport, sessionId: "s", present: async () => undefined });
+  await watcher.start(); assert.deepEqual(options,{externalPresenter:true}); await watcher.stop();
 });
 
 test("the operator view carries the authored presentation and never the subject", () => {
@@ -134,7 +120,7 @@ test("session events without a pending interaction list are ignored", () => {
   assert.deepEqual(sessionInteractions(sessionEvent([])), []);
 });
 
-test("a pending decision is claimed, presented, and answered", async () => {
+test("a pending decision is presented and answered at its current revision", async () => {
   const transport = client();
   const presented: string[] = [];
   const watcher = new WorkflowDecisionWatcher({
@@ -152,109 +138,31 @@ test("a pending decision is claimed, presented, and answered", async () => {
 
   assert.deepEqual(presented, ["Approve the implementation plan"]);
   assert.deepEqual(transport.recorded.map((entry) => entry.operation), [
-    "interaction.update",
     "decision.answer",
   ]);
-  assert.deepEqual(transport.recorded.map((entry) => entry.expectedRevision), [3, 4]);
-  assert.deepEqual((transport.recorded[1]?.payload as { response: unknown }).response, {
+  assert.deepEqual(transport.recorded.map((entry) => entry.expectedRevision), [3]);
+  assert.deepEqual((transport.recorded[0]?.payload as { response: unknown }).response, {
     choice: "replan",
     input: { instructions: "Use the existing island." },
   });
 });
 
-test("a decision already claimed by another presenter is skipped", async () => {
-  const transport = client();
-  let presented = 0;
-  const watcher = new WorkflowDecisionWatcher({
-    client: transport,
-    sessionId: "session-1",
-    present: async () => {
-      presented += 1;
-      return undefined;
-    },
-  });
-
-  await watcher.start();
-  transport.emit(sessionEvent([{
-    ...decisionRequest(),
-    presentationClaimExpiresAt: new Date(Date.now() + 60_000).toISOString(),
-  }]));
-  await settle();
-
-  assert.equal(presented, 0);
-  assert.deepEqual(transport.recorded, []);
-  await watcher.stop();
+test("duplicate snapshots do not reopen the same decision revision", async () => {
+  const transport=client(); let count=0;
+  const watcher=new WorkflowDecisionWatcher({client:transport,sessionId:"s",present:async()=>{count++;return undefined;}});
+  await watcher.start(); transport.emit(sessionEvent([decisionRequest()])); await settle();
+  transport.emit(sessionEvent([decisionRequest()])); await settle(); assert.equal(count,1); await watcher.stop();
 });
 
-test("an expired presenting decision is reclaimed", async () => {
-  const transport = client();
-  let presented = 0;
-  const watcher = new WorkflowDecisionWatcher({
-    client: transport,
-    sessionId: "session-1",
-    present: async () => {
-      presented += 1;
-      return undefined;
-    },
-  });
-
-  await watcher.start();
-  transport.emit(sessionEvent([{
-    ...decisionRequest(),
-    status: "presenting",
-    presentationClaimExpiresAt: new Date(Date.now() - 1_000).toISOString(),
-  }]));
-  await settle();
-
-  assert.equal(presented, 1);
-  assert.deepEqual(transport.recorded.map((entry) => entry.operation), ["interaction.update"]);
-});
-
-test("a live presentation claim is retried after its lease expires", async () => {
-  const transport = client();
-  let presented = 0;
-  const watcher = new WorkflowDecisionWatcher({
-    client: transport,
-    sessionId: "session-1",
-    present: async () => {
-      presented += 1;
-      return undefined;
-    },
-  });
-
-  await watcher.start();
-  transport.emit(sessionEvent([{
-    ...decisionRequest(),
-    status: "presenting",
-    presentationClaimExpiresAt: new Date(Date.now() + 25).toISOString(),
-  }]));
-  await settle();
-  assert.equal(presented, 0);
-
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  assert.equal(presented, 1);
-  assert.deepEqual(transport.recorded.map((entry) => entry.operation), ["interaction.update"]);
-});
-
-test("losing the claim race stops before presenting", async () => {
-  const transport = client({
-    request: async () => ({ outcome: "conflict" }),
-  });
-  let presented = 0;
-  const watcher = new WorkflowDecisionWatcher({
-    client: transport,
-    sessionId: "session-1",
-    present: async () => {
-      presented += 1;
-      return undefined;
-    },
-  });
-
-  await watcher.start();
-  transport.emit(sessionEvent([decisionRequest()]));
-  await settle();
-
-  assert.equal(presented, 0);
+test("a new revision cancels stale presentation and fences its answer", async () => {
+  const transport=client(); const signals: AbortSignal[]=[];
+  const watcher=new WorkflowDecisionWatcher({client:transport,sessionId:"s",present:async (_decision,signal)=>{
+    signals.push(signal); if(signals.length===1) await new Promise<void>(resolve=>signal.addEventListener("abort",()=>resolve(),{once:true}));
+    return {choice:"continue"};
+  }});
+  await watcher.start();transport.emit(sessionEvent([decisionRequest()]));await settle();
+  transport.emit(sessionEvent([{...decisionRequest(),revision:4}]));await settle();
+  assert.equal(signals[0]?.aborted,true);assert.deepEqual(transport.recorded.map(r=>r.expectedRevision),[4]);await watcher.stop();
 });
 
 test("releasing a decision without an answer does not settle the run", async () => {
@@ -269,7 +177,7 @@ test("releasing a decision without an answer does not settle the run", async () 
   transport.emit(sessionEvent([decisionRequest()]));
   await settle();
 
-  assert.deepEqual(transport.recorded.map((entry) => entry.operation), ["interaction.update"]);
+  assert.deepEqual(transport.recorded.map((entry) => entry.operation), []);
 });
 
 test("stopping the watcher waits for an in-flight presentation to release", async () => {
@@ -288,7 +196,7 @@ test("stopping the watcher waits for an in-flight presentation to release", asyn
   finish?.(undefined);
   await stopping;
 
-  assert.deepEqual(transport.recorded.map((entry) => entry.operation), ["interaction.update"]);
+  assert.deepEqual(transport.recorded.map((entry) => entry.operation), []);
 });
 
 test("stopping the watcher drains an acknowledged decision answer", async () => {
@@ -328,7 +236,6 @@ test("stopping the watcher drains an acknowledged decision answer", async () => 
   await stopping;
 
   assert.deepEqual(transport.recorded.map((entry) => entry.operation), [
-    "interaction.update",
     "decision.answer",
   ]);
 });
@@ -351,7 +258,7 @@ test("a decision snapshot arriving behind active consumption is drained", async 
   await settle();
 
   assert.equal(presented, 1);
-  assert.deepEqual(transport.recorded.map((entry) => entry.operation), ["interaction.update"]);
+  assert.deepEqual(transport.recorded.map((entry) => entry.operation), []);
 });
 
 test("only one decision is presented at a time", async () => {
@@ -473,4 +380,15 @@ test("a watcher with no run observer works unchanged", async () => {
   await settle();
   assert.deepEqual(presented, ["request-1"]);
   await watcher.stop();
+});
+
+
+test("a decision omitted by a bounded page can reappear at the same revision", async()=>{
+ const transport=client();let presentations=0;
+ const watcher=new WorkflowDecisionWatcher({client:transport,sessionId:"s",present:async(_decision,signal)=>{
+ presentations++;if(presentations===1) await new Promise<void>(resolve=>signal.addEventListener("abort",()=>resolve(),{once:true}));return undefined;
+ }});
+ await watcher.start();transport.emit(sessionEvent([decisionRequest()]));await settle();
+ transport.emit(sessionEvent([]));await settle();transport.emit(sessionEvent([decisionRequest()]));await settle();
+ assert.equal(presentations,2);assert.deepEqual(transport.recorded,[]);await watcher.stop();
 });
