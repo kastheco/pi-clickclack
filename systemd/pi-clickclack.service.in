@@ -1,0 +1,17 @@
+[Unit]
+Description=Pi ClickClack bridge
+After=network-online.target clickclack.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKING_DIRECTORY@
+ExecStart=@NODE_EXECUTABLE@ @ENV_ARGUMENT@ @ENTRYPOINT@
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

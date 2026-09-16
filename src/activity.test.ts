@@ -6,11 +6,13 @@ import type { GitActivityRecord } from "./git-activity.js";
 
 function fixture() {
   const created: Array<{ kind: string; body: string; turnId: string }> = [];
+  const nonces: string[] = [];
   const updated: Array<{ messageId: string; body: string }> = [];
   const progress: Array<{ op: string; line?: { id: string; kind: string; text?: string; status?: string; tool_name?: string } }> = [];
   const transport: ActivityTransport = {
-    async create(kind, body, turnId) {
+    async create(kind, body, turnId, nonce) {
       created.push({ kind, body, turnId });
+      nonces.push(nonce);
       return { id: `msg_${created.length}` };
     },
     async update(messageId, body) {
@@ -26,11 +28,11 @@ function fixture() {
     transport,
     flushMs: 0,
   });
-  return { activity, created, updated, progress };
+  return { activity, created, nonces, updated, progress };
 }
 
 test("publishes pre-tool prose and tools as durable ClickClack activity", async () => {
-  const { activity, created } = fixture();
+  const { activity, created, nonces } = fixture();
 
   activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
   activity.handle({
@@ -59,6 +61,8 @@ test("publishes pre-tool prose and tools as durable ClickClack activity", async 
     { kind: "agent_commentary", body: "I'll inspect the file.", turnId: "turn_1" },
     { kind: "agent_tool", body: "**read**\n\n/repo/src/service.ts", turnId: "turn_1" },
   ]);
+  assert.equal(new Set(nonces).size, 2);
+  assert.ok(nonces.every((nonce) => /^pi-activity-[a-f0-9]{48}$/u.test(nonce)));
 });
 
 test("keeps the final assistant answer out of the activity preamble", async () => {
@@ -115,6 +119,7 @@ test("streams throttled text and tool lifecycle as targeted progress", async () 
     { op: "append", id: "tool-call_1", kind: "tool", status: "running" },
     { op: "finalize", id: "tool-call_1", kind: "tool", status: "succeeded" },
     { op: "finalize", id: "lifecycle", kind: "lifecycle", status: "done" },
+    { op: "clear", id: undefined, kind: undefined, status: undefined },
   ]);
 });
 

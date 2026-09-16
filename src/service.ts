@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 
-import type { BotCommandInput, Message, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
+import type { AgentProgressPayload, BotCommandInput, Message, MessageInput, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
 import {
   resolveCliModel,
   type AgentSessionRuntime,
@@ -42,7 +42,13 @@ import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { steerWithReceipt } from "./pi-steering.js";
-import { StateStore, type ConversationBinding, type SteeringReceipt } from "./state/store.js";
+import {
+  StateStore,
+  type ActiveTurn,
+  type ConversationBinding,
+  type OutboundMessageKind,
+  type SteeringReceipt,
+} from "./state/store.js";
 import {
   toConversationId,
   toMessageId,
@@ -62,6 +68,7 @@ export type BridgeServiceDependencies = {
   sleep?: (milliseconds: number) => Promise<void>;
   workflowObservationStopTimeoutMs?: number;
   interactiveTimeoutMs?: number;
+  reconnectDelayMs?: number;
   /**
    * Supplies the Pi Workflows client used to deliver human decisions.
    *
@@ -76,7 +83,7 @@ type ConversationTarget = {
   id: string;
 };
 
-const reconnectDelayMs = 1_000;
+const defaultReconnectDelayMs = 1_000;
 const attachmentHydrationDelayMs = 80;
 const attachmentHydrationAttempts = 25;
 const maxPiImageBytes = 5 * 1024 * 1024;
@@ -131,6 +138,7 @@ export class BridgeService {
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly workflowObservationStopTimeoutMs: number;
   private readonly interactiveTimeoutMs: number;
+  private readonly reconnectDelayMs: number;
   private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
   private started = false;
   private stopped = false;
@@ -182,6 +190,7 @@ export class BridgeService {
     this.sleep = dependencies.sleep ?? delay;
     this.workflowObservationStopTimeoutMs = dependencies.workflowObservationStopTimeoutMs ?? 1_000;
     this.interactiveTimeoutMs = dependencies.interactiveTimeoutMs ?? defaultInteractiveTimeoutMs;
+    this.reconnectDelayMs = dependencies.reconnectDelayMs ?? defaultReconnectDelayMs;
     this.workflowClient = dependencies.workflowClient;
   }
 
@@ -219,14 +228,15 @@ export class BridgeService {
     }
     await this.publishCommandMenu();
     if (this.stopped) return;
+    const interrupted = this.state.listActiveTurns();
     const interruptedTurns = this.state.recoverInterruptedTurns();
     if (interruptedTurns > 0) {
+      await this.clearInterruptedProgress(interrupted);
       this.logger.warn("recovered interrupted Pi turns from previous bridge process", { interruptedTurns });
     }
     this.state.markSteeringUncertain();
-    await this.notifyUncertainSteering();
     this.started = true;
-    await this.trackRealtime(this.connectRealtime());
+    await this.trackRealtime(this.connectRealtime(true));
     this.logger.info("bridge service started", {
       botUserId: identity.id,
       botHandle: identity.handle,
@@ -236,6 +246,62 @@ export class BridgeService {
       publishedCommands: botCommandMenu.length,
       sessionsStarted: this.runtimes.size,
     });
+  }
+
+  private async clearInterruptedProgress(interrupted: ActiveTurn[]): Promise<void> {
+    const results = await Promise.allSettled(interrupted.map(async (turn) => {
+      const binding = this.state.getBindingById(turn.bindingId);
+      if (!binding) return;
+      const payload: AgentProgressPayload = { turn_id: turn.turnId, op: "clear" };
+      await this.clickClack.events.publishEphemeral({
+        workspaceId: this.config.clickClack.workspaceId,
+        ...(binding.conversationType === "channel"
+          ? { channelId: binding.conversationId }
+          : { directConversationId: binding.conversationId }),
+        type: "agent.progress",
+        payload,
+      });
+    }));
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length > 0) {
+      this.logger.warn("interrupted agent progress could not be cleared immediately", {
+        failed: failures.length,
+        total: interrupted.length,
+      });
+    }
+  }
+
+  private async reconcileAbandonedOutbound(includePending: boolean): Promise<void> {
+    const pending = includePending ? this.state.listOutboundByStatus("pending") : [];
+    for (const outbound of pending) {
+      this.state.transitionOutbound({ nonce: outbound.nonce, expected: "pending", next: "uncertain" });
+    }
+    const uncertain = this.state.listOutboundByStatus("uncertain");
+    let reconciled = 0;
+    for (const outbound of uncertain) {
+      try {
+        const found = await this.clickClack.messages.findByNonce(
+          this.config.clickClack.workspaceId,
+          outbound.nonce,
+        );
+        if (!found) continue;
+        if (this.state.transitionOutbound({
+          nonce: outbound.nonce,
+          expected: "uncertain",
+          next: "reconciled",
+          messageId: toMessageId(found.id),
+        })) reconciled += 1;
+      } catch (error) {
+        this.logger.warn("outbound nonce reconciliation deferred", { nonce: outbound.nonce, error });
+      }
+    }
+    if (pending.length > 0 || uncertain.length > 0) {
+      this.logger.info("checked abandoned outbound creates", {
+        pending: pending.length,
+        uncertain: uncertain.length,
+        reconciled,
+      });
+    }
   }
 
   stop(): void {
@@ -346,8 +412,9 @@ export class BridgeService {
     return task;
   }
 
-  private async connectRealtime(): Promise<void> {
+  private async connectRealtime(includePendingOutbound = false): Promise<void> {
     if (this.stopped) return;
+    await this.reconcileAbandonedOutbound(includePendingOutbound);
     await this.notifyUncertainSteering();
     if (this.stopped) return;
     let cursor = this.state.getRealtimeCursor();
@@ -1400,11 +1467,19 @@ export class BridgeService {
       // cancel the presentation while publication is in flight.
       const hostIdentity = this.workflowClient?.()?.hostIdentity;
       if (!hostIdentity || !this.identity?.id) throw new Error("Decision publication requires stable host and producer identity");
-      const message = { kind: "agent_commentary" as const, body: renderDecisionPrompt(decision), turn_id: decisionTurnId(decision.requestId, decision.revision),
-        nonce: decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision }) };
-      if (source.channel_id) await this.clickClack.channels.sendMessage(source.channel_id, message);
-      else if (source.direct_conversation_id) await this.clickClack.dms.sendMessage(source.direct_conversation_id, message);
-      else throw new Error("Decision publication target is missing");
+      const turnId = decisionTurnId(decision.requestId, decision.revision);
+      const message = {
+        kind: "agent_commentary" as const,
+        body: renderDecisionPrompt(decision),
+        turn_id: turnId,
+        nonce: decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision }),
+      };
+      await this.sendDurableMessage(
+        { type: binding.conversationType, id: binding.conversationId },
+        message,
+        "agent_commentary",
+        toTurnId(turnId),
+      );
     } catch (error) {
       signal.removeEventListener("abort", cancel);
       if (this.presentedDecisions.get(binding.id) === presentation) {
@@ -1440,12 +1515,14 @@ export class BridgeService {
       turn_id: active.turnId,
       nonce: requestId,
     };
-    const prompt = source.channel_id
-      ? await this.clickClack.channels.sendMessage(source.channel_id, input)
-      : source.direct_conversation_id
-        ? await this.clickClack.dms.sendMessage(source.direct_conversation_id, input)
-        : undefined;
-    if (!prompt) return failClosed;
+    const target = conversationTarget(source);
+    if (!target) return failClosed;
+    const prompt = await this.sendDurableMessage(
+      target,
+      input,
+      "interactive_request",
+      active.turnId,
+    );
 
     this.state.createInteractiveRequest({
       requestId,
@@ -1773,36 +1850,30 @@ export class BridgeService {
 
   private activityTransport(source: Message): ActivityTransport {
     const gitActivityChannelId = this.config.clickClack.gitActivityChannelId;
+    const target = conversationTarget(source);
+    if (!target) throw new Error("source message has no activity conversation");
     return {
-      create: async (kind, body, turnId) => {
-        if (source.channel_id) {
-          return this.clickClack.channels.sendMessage(source.channel_id, {
-            body,
-            kind,
-            turn_id: turnId,
-          });
-        }
-        if (source.direct_conversation_id) {
-          return this.clickClack.dms.sendMessage(source.direct_conversation_id, {
-            body,
-            kind,
-            turn_id: turnId,
-          });
-        }
-        throw new Error("source message has no activity conversation");
-      },
+      create: async (kind, body, turnId, nonce) => await this.sendDurableMessage(
+        target,
+        { body, kind, turn_id: turnId, nonce },
+        kind,
+        toTurnId(turnId),
+      ),
       update: (messageId, body) => this.clickClack.messages.update(messageId, { body }),
       progress: (payload) => this.clickClack.events.publishEphemeral({
         workspaceId: this.config.clickClack.workspaceId,
-        ...(source.channel_id
-          ? { channelId: source.channel_id }
-          : { directConversationId: source.direct_conversation_id! }),
+        ...(target.type === "channel"
+          ? { channelId: target.id }
+          : { directConversationId: target.id }),
         type: "agent.progress",
         payload,
       }),
       ...(gitActivityChannelId ? {
-        publishGit: (body: string, nonce: string) =>
-          this.clickClack.channels.sendMessage(gitActivityChannelId, { body, nonce }),
+        publishGit: (body: string, nonce: string) => this.sendDurableMessage(
+          { type: "channel", id: gitActivityChannelId },
+          { body, nonce },
+          "message",
+        ),
       } : {}),
     };
   }
@@ -1813,33 +1884,122 @@ export class BridgeService {
     nonce?: string,
     turnId?: TurnId,
   ): Promise<{ id: string }> {
-    if (source.channel_id) {
-      return await this.clickClack.channels.sendMessage(source.channel_id, {
-        body,
-        ...(nonce ? { nonce } : {}),
-        ...(turnId ? { turn_id: turnId } : {}),
+    const target = conversationTarget(source);
+    if (!target) throw new Error("source message has no replyable conversation");
+    const input: MessageInput = {
+      body,
+      ...(nonce ? { nonce } : {}),
+      ...(turnId ? { turn_id: turnId } : {}),
+    };
+    if (nonce) return await this.sendDurableMessage(target, { ...input, nonce }, "message", turnId);
+    return target.type === "channel"
+      ? await this.clickClack.channels.sendMessage(target.id, input)
+      : await this.clickClack.dms.sendMessage(target.id, input);
+  }
+
+  private async sendDurableMessage(
+    target: ConversationTarget,
+    input: MessageInput & { nonce: string },
+    messageKind: OutboundMessageKind,
+    turnId?: TurnId,
+  ): Promise<{ id: string }> {
+    const bodySha256 = createHash("sha256").update(input.body).digest("hex");
+    let outbound = this.state.getOutbound(input.nonce);
+    if (outbound) {
+      if (
+        outbound.targetType !== target.type
+        || outbound.targetId !== target.id
+        || outbound.messageKind !== messageKind
+        || outbound.bodySha256 !== bodySha256
+        || outbound.turnId !== turnId
+      ) throw new Error(`outbound nonce collision: ${input.nonce}`);
+      if ((outbound.status === "sent" || outbound.status === "reconciled") && outbound.messageId) {
+        return { id: outbound.messageId };
+      }
+      if (outbound.status === "failed") throw new Error(`outbound create is terminal: ${input.nonce}`);
+      try {
+        const found = await this.clickClack.messages.findByNonce(
+          this.config.clickClack.workspaceId,
+          input.nonce,
+        );
+        if (found) {
+          if (outbound.status === "pending") {
+            this.state.transitionOutbound({ nonce: input.nonce, expected: "pending", next: "uncertain" });
+            outbound = this.state.getOutbound(input.nonce)!;
+          }
+          this.state.transitionOutbound({
+            nonce: input.nonce,
+            expected: "uncertain",
+            next: "reconciled",
+            messageId: toMessageId(found.id),
+          });
+          return { id: found.id };
+        }
+      } catch (error) {
+        if (outbound.status === "pending") {
+          this.state.transitionOutbound({ nonce: input.nonce, expected: "pending", next: "uncertain" });
+        }
+        throw error;
+      }
+    } else {
+      outbound = this.state.reserveOutbound({
+        nonce: input.nonce,
+        targetType: target.type,
+        targetId: target.id,
+        messageKind,
+        body: input.body,
+        ...(turnId ? { turnId } : {}),
       });
     }
-    if (source.direct_conversation_id) {
-      return await this.clickClack.dms.sendMessage(source.direct_conversation_id, {
-        body,
-        ...(nonce ? { nonce } : {}),
-        ...(turnId ? { turn_id: turnId } : {}),
+
+    try {
+      const sent = target.type === "channel"
+        ? await this.clickClack.channels.sendMessage(target.id, input)
+        : await this.clickClack.dms.sendMessage(target.id, input);
+      this.state.transitionOutbound({
+        nonce: input.nonce,
+        expected: outbound.status,
+        next: "sent",
+        messageId: toMessageId(sent.id),
       });
+      return sent;
+    } catch (error) {
+      if (outbound.status === "pending") {
+        this.state.transitionOutbound({
+          nonce: input.nonce,
+          expected: "pending",
+          next: "uncertain",
+          errorCode: error instanceof Error ? error.name : "unknown",
+        });
+      }
+      try {
+        const found = await this.clickClack.messages.findByNonce(
+          this.config.clickClack.workspaceId,
+          input.nonce,
+        );
+        if (found && this.state.transitionOutbound({
+          nonce: input.nonce,
+          expected: "uncertain",
+          next: "reconciled",
+          messageId: toMessageId(found.id),
+        })) return { id: found.id };
+      } catch (lookupError) {
+        this.logger.warn("outbound create reconciliation deferred", { nonce: input.nonce, error: lookupError });
+      }
+      throw error;
     }
-    throw new Error("source message has no replyable conversation");
   }
 
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return;
-    this.logger.warn("ClickClack realtime connection closed; reconnecting", { delayMs: reconnectDelayMs });
+    this.logger.warn("ClickClack realtime connection closed; reconnecting", { delayMs: this.reconnectDelayMs });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.trackRealtime(this.connectRealtime()).catch((error: unknown) => {
         this.logger.error("ClickClack realtime reconnect failed", { error });
         this.scheduleReconnect();
       });
-    }, reconnectDelayMs);
+    }, this.reconnectDelayMs);
   }
 }
 

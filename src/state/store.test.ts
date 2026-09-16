@@ -111,6 +111,7 @@ test("active turns use compare-and-set transitions", () => {
     });
     const interruptedTurnId = toTurnId("turn_interrupted");
     store.startActiveTurn({ turnId: interruptedTurnId, bindingId: binding.id, sourceMessageId: interruptedMessageId });
+    assert.deepEqual(store.listActiveTurns().map((active) => active.turnId), [interruptedTurnId]);
     assert.equal(store.recoverInterruptedTurns(), 1);
     assert.equal(store.getActiveTurn(interruptedTurnId), undefined);
     assert.equal(store.getActivePiSession(binding.id), undefined);

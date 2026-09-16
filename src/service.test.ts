@@ -16,7 +16,7 @@ import type { EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { BridgeService } from "./service.js";
 import { StateStore, type ConversationBinding } from "./state/store.js";
 import type { ClaimedWorkflowDecision, DecisionAnswer } from "./workflow-decisions.js";
-import { toProjectAlias } from "./types.js";
+import { toConversationId, toMessageId, toProjectAlias, toTurnId } from "./types.js";
 
 type EventHandler = (event: RealtimeEvent) => void;
 
@@ -30,6 +30,7 @@ type Fixture = {
   commandMenu: BotCommandInput[];
   ephemeral: Array<{ type: string; channelId?: string; directConversationId?: string; payload: unknown }>;
   emit(event: RealtimeEvent): void;
+  closeRealtime(): void;
   subscriptionCount(): number;
 };
 
@@ -61,6 +62,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
   const commandMenu: BotCommandInput[] = [];
   const ephemeral: Fixture["ephemeral"] = [];
   let onEvent: EventHandler | undefined;
+  let onClose: (() => void) | undefined;
   let subscriptions = 0;
   const clickClack = {
     me: async () => ({
@@ -140,9 +142,10 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
         });
         return { id: `eph_${ephemeral.length}` };
       },
-      subscribe: (options: { onEvent: EventHandler }) => {
+      subscribe: (options: { onEvent: EventHandler; onClose?: () => void }) => {
         subscriptions += 1;
         onEvent = options.onEvent;
+        onClose = options.onClose;
         return { close() {} };
       },
     },
@@ -159,6 +162,10 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     emit(event) {
       if (!onEvent) throw new Error("fake realtime subscription has not started");
       onEvent(event);
+    },
+    closeRealtime() {
+      if (!onClose) throw new Error("fake realtime subscription has not started");
+      onClose();
     },
     subscriptionCount: () => subscriptions,
   };
@@ -260,6 +267,103 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
   await service.waitForStop();
   assert.throws(() => stateStore.database.prepare("SELECT 1"), /not open|closed/u);
+});
+
+test("startup clears interrupted progress, fails interactions closed, and reconciles uncertain creates", async () => {
+  const setup = fixture();
+  const stateStore = new StateStore(":memory:");
+  const binding = stateStore.upsertBinding({
+    conversationType: "direct",
+    conversationId: toConversationId("dm_recovery"),
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const sourceMessageId = toMessageId("msg_recovery");
+  const turnId = toTurnId("turn_recovery");
+  stateStore.claimSourceMessage({ messageId: sourceMessageId });
+  stateStore.setActivePiSession({
+    bindingId: binding.id,
+    sessionId: "session-recovery",
+    sessionFile: "/tmp/session-recovery.jsonl",
+  });
+  stateStore.startActiveTurn({ turnId, bindingId: binding.id, sourceMessageId });
+  stateStore.transitionActiveTurn(turnId, "starting", "running");
+  stateStore.createInteractiveRequest({
+    requestId: "request-recovery",
+    turnId,
+    kind: "confirmation",
+    promptMessageId: toMessageId("msg_prompt_recovery"),
+  });
+  stateStore.reserveOutbound({
+    nonce: "pi-recovery-outbound",
+    targetType: "direct",
+    targetId: "dm_recovery",
+    messageKind: "message",
+    body: "already created",
+    turnId,
+  });
+  setup.clickClack.messages.findByNonce = async (_workspaceId, nonce) => nonce === "pi-recovery-outbound"
+    ? { id: "msg_reconciled" } as never
+    : undefined;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    stateStore,
+    piRuntime: {
+      kind: "embedded-pi-sdk",
+      project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => { throw new Error("startup must not reopen interrupted sessions"); },
+    },
+    logger: createLogger({ sink() {} }),
+  });
+
+  await service.start();
+
+  assert.equal(stateStore.getActiveTurn(turnId), undefined);
+  assert.equal(stateStore.getActivePiSession(binding.id), undefined);
+  assert.equal(
+    (stateStore.database.prepare("SELECT COUNT(*) AS count FROM pending_interactive_requests").get() as { count: number }).count,
+    0,
+  );
+  assert.equal(stateStore.getOutbound("pi-recovery-outbound")?.status, "reconciled");
+  assert.deepEqual(setup.ephemeral, [{
+    type: "agent.progress",
+    directConversationId: "dm_recovery",
+    payload: { turn_id: turnId, op: "clear" },
+  }]);
+  await service.waitForStop();
+});
+
+test("a lost durable create response reconciles by nonce without retrying", async () => {
+  const setup = fixture();
+  let creates = 0;
+  let committed: { id: string } | undefined;
+  setup.clickClack.dms.sendMessage = async () => {
+    creates += 1;
+    committed = { id: "msg_committed" };
+    throw new Error("connection reset after commit");
+  };
+  setup.clickClack.messages.findByNonce = async (_workspaceId, nonce) => nonce === "pi-test-durable"
+    ? committed as never
+    : undefined;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime: {
+      kind: "embedded-pi-sdk",
+      project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => { throw new Error("not used"); },
+    },
+    logger: createLogger({ sink() {} }),
+  });
+  const source = message({ id: "msg_source_durable", body: "hello", directConversationId: "dm_durable" });
+  const sendReply = (service as unknown as {
+    sendReply(sourceMessage: Message, body: string, nonce: string): Promise<{ id: string }>;
+  }).sendReply.bind(service);
+
+  assert.deepEqual(await sendReply(source, "durable answer", "pi-test-durable"), { id: "msg_committed" });
+  assert.equal(service.state.getOutbound("pi-test-durable")?.status, "reconciled");
+  assert.deepEqual(await sendReply(source, "durable answer", "pi-test-durable"), { id: "msg_committed" });
+  assert.equal(creates, 1);
+  await service.waitForStop();
 });
 
 test("shutdown cancels a decision while its message is still publishing", async () => {
@@ -446,6 +550,7 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
     clickClack: setup.clickClack,
     piRuntime,
     logger: createLogger({ sink() {} }),
+    reconnectDelayMs: 0,
     workflowClientFactory: () => {
       workflowClientCreated += 1;
       return {
@@ -473,8 +578,20 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
     mentionedUserIds: ["usr_bot"],
   }));
   await service.waitForIdle();
+  setup.emit(createdEvent({
+    messageId: source.id,
+    cursor: "cur_200",
+    channelId: "chn_1",
+    mentionedUserIds: ["usr_bot"],
+  }));
+  await service.waitForIdle();
+  setup.closeRealtime();
+  for (let attempt = 0; attempt < 20 && setup.subscriptionCount() < 2; attempt += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
 
   assert.equal(receivedPrompt, "hello");
+  assert.equal(setup.subscriptionCount(), 2, "a dropped realtime socket reconnects from the durable cursor");
   assert.deepEqual(setup.sent, [{ target: "channel", id: "chn_1", body: "hello from pi" }]);
   assert.equal(setup.activity.length, 2);
   assert.deepEqual(setup.activity.map(({ body, kind }) => ({ body, kind })), [

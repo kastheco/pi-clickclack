@@ -391,6 +391,15 @@ export class StateStore {
     return row ? activeTurn(row) : undefined;
   }
 
+  listActiveTurns(): ActiveTurn[] {
+    return (this.database
+      .prepare(`
+        SELECT turn_id, binding_id, source_message_id, status, started_at, updated_at
+        FROM active_turns ORDER BY started_at, turn_id
+      `)
+      .all() as Row[]).map(activeTurn);
+  }
+
   transitionActiveTurn(turnId: TurnId, expected: ActiveTurnStatus, next: ActiveTurnStatus): boolean {
     const allowed =
       (expected === "starting" && (next === "running" || next === "stopping")) ||

@@ -98,6 +98,10 @@ Pi remains the source of truth for agent session history. ClickClack remains the
 
 The bridge claims a source message before invoking Pi. Replayed ClickClack events therefore cannot start the same agent turn twice. Steering adds a small receipt in the same SQLite transaction as its source claim, recording the source ID, owner, binding/project, session, active turn, workspace and bot identity; it does not copy prompt text into bridge state.
 
+Nonce-bearing final answers, activity rows, interactive prompts, command replies, and git cards reserve an outbound record before the create request. The record stores target identity and a body digest, not message text. A lost create response is checked through ClickClack's nonce lookup before the bridge retries the same bytes. Startup moves abandoned pending writes to uncertain and reconciles any create that ClickClack already committed.
+
+Startup archives interrupted Pi session references, removes pending interactive requests through the active-turn foreign key, and publishes a targeted `agent.progress` clear for every interrupted turn. Normal turn settlement also clears its progress frame. If the clear request fails during an outage, ClickClack's progress TTL remains the final cleanup boundary.
+
 ### Steering delivery and recovery
 
 - Pi 0.85.1's `AgentSession.steer()` expands skills/templates and synchronously calls the public `agent.steer(userMessage)` before its first await. Unlike `prompt()`, it does not run extension input hooks. `src/pi-steering.ts` temporarily intercepts that public call and restores it synchronously in `finally`, forwarding arguments, receiver and return value unchanged.

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import type { AgentProgressPayload, Message } from "@clickclack/sdk-ts";
@@ -19,7 +20,12 @@ export type ActivitySource = Pick<Message, "channel_id" | "direct_conversation_i
 export type ActivityMessage = { id: string };
 
 export type ActivityTransport = {
-  create(kind: "agent_commentary" | "agent_tool", body: string, turnId: string): Promise<ActivityMessage>;
+  create(
+    kind: "agent_commentary" | "agent_tool",
+    body: string,
+    turnId: string,
+    nonce: string,
+  ): Promise<ActivityMessage>;
   update(messageId: string, body: string): Promise<unknown>;
   progress?(payload: AgentProgressPayload): Promise<unknown>;
   publishGit?(body: string, nonce: string): Promise<unknown>;
@@ -75,6 +81,7 @@ export class TurnActivity {
   private queue: Promise<void> = Promise.resolve();
   private assistantSequence = 0;
   private progressSequence = 0;
+  private progressPublished = false;
   private currentText = "";
   private textProgress: TextProgressRow | undefined;
   private readonly toolRows = new Map<string, ToolRow>();
@@ -148,6 +155,8 @@ export class TurnActivity {
   async finalize(): Promise<void> {
     this.flushTextProgress("finalize");
     await this.queue;
+    this.publishProgressClear();
+    await this.queue;
   }
 
   referencedGeneratedPaths(answer: string): string[] {
@@ -213,7 +222,12 @@ export class TurnActivity {
     this.currentText = "";
     if (!body) return;
     this.enqueue(async () => {
-      await this.transport.create("agent_commentary", body, this.turnId);
+      await this.transport.create(
+        "agent_commentary",
+        body,
+        this.turnId,
+        activityNonce(this.turnId, "commentary", String(this.assistantSequence)),
+      );
     });
   }
 
@@ -234,7 +248,12 @@ export class TurnActivity {
       status: "running",
     });
     this.enqueue(async () => {
-      const posted = await this.transport.create("agent_tool", row.body, this.turnId);
+      const posted = await this.transport.create(
+        "agent_tool",
+        row.body,
+        this.turnId,
+        activityNonce(this.turnId, "tool", id),
+      );
       row.messageId = posted.id;
       row.sentBody = row.body;
     });
@@ -294,6 +313,7 @@ export class TurnActivity {
   ): void {
     if (!this.transport.progress) return;
     const progress = this.transport.progress;
+    this.progressPublished = true;
     const payload: AgentProgressPayload = {
       turn_id: this.turnId,
       seq: ++this.progressSequence,
@@ -303,9 +323,25 @@ export class TurnActivity {
     this.enqueue(async () => { await progress(payload); });
   }
 
+  private publishProgressClear(): void {
+    if (!this.transport.progress || !this.progressPublished) return;
+    const progress = this.transport.progress;
+    const payload: AgentProgressPayload = {
+      turn_id: this.turnId,
+      seq: ++this.progressSequence,
+      op: "clear",
+    };
+    this.enqueue(async () => { await progress(payload); });
+  }
+
   private enqueue(work: () => Promise<void>): void {
     this.queue = this.queue.then(work).catch((error: unknown) => this.onError(error));
   }
+}
+
+function activityNonce(turnId: string, kind: string, identity: string): string {
+  const digest = createHash("sha256").update(`${turnId}\0${kind}\0${identity}`).digest("hex");
+  return `pi-activity-${digest.slice(0, 48)}`;
 }
 
 function generatedPath(
