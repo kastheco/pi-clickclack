@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,6 +25,7 @@ type Fixture = {
   clickClack: ClickClackBoundary;
   messages: Map<string, Message>;
   sent: Array<{ target: "channel" | "direct"; id: string; body: string }>;
+  sentInputs: MessageInput[];
   activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }>;
   commandMenu: BotCommandInput[];
   ephemeral: Array<{ type: string; channelId?: string; directConversationId?: string; payload: unknown }>;
@@ -55,6 +56,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
   };
   const messages = new Map<string, Message>();
   const sent: Array<{ target: "channel" | "direct"; id: string; body: string }> = [];
+  const sentInputs: MessageInput[] = [];
   const activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }> = [];
   const commandMenu: BotCommandInput[] = [];
   const ephemeral: Fixture["ephemeral"] = [];
@@ -105,6 +107,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
           activity.push({ target: "channel", id, body: input.body, kind: input.kind, ...(input.turn_id ? { turnId: input.turn_id } : {}) });
           return { id };
         }
+        sentInputs.push(input);
         sent.push({ target: "channel", id: channelId, body: input.body });
         return { id: `sent_${sent.length}` };
       },
@@ -116,6 +119,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
           activity.push({ target: "direct", id, body: input.body, kind: input.kind, ...(input.turn_id ? { turnId: input.turn_id } : {}) });
           return { id };
         }
+        sentInputs.push(input);
         sent.push({ target: "direct", id: conversationId, body: input.body });
         return { id: `sent_${sent.length}` };
       },
@@ -148,6 +152,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     clickClack,
     messages,
     sent,
+    sentInputs,
     activity,
     commandMenu,
     ephemeral,
@@ -477,6 +482,8 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
     { body: "**read**\n\n/tmp/main/package.json", kind: "agent_tool" },
   ]);
   assert.equal(setup.activity[0]?.turnId, setup.activity[1]?.turnId);
+  assert.equal(setup.sentInputs.at(-1)?.turn_id, setup.activity[0]?.turnId);
+  assert.ok(setup.ephemeral.some((frame) => frame.type === "agent.progress" && frame.channelId === "chn_1"));
   assert.equal(service.state.getBinding("channel", "chn_1" as never)?.projectAlias, "main");
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-1");
   assert.equal(workflowClientCreated, 1);
@@ -484,6 +491,110 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   await application.stop();
   assert.equal(workflowWatcherStopped, 1);
   assert.equal(workflowClientClosed, 1);
+});
+
+test("Pi confirmation pauses for a correlated owner reply and resumes the same turn", async () => {
+  const setup = fixture();
+  let uiContext: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  let confirmed: boolean | undefined;
+  const sessionMessages: unknown[] = [];
+  const runtime = {
+    session: {
+      sessionId: "session-confirm",
+      sessionFile: "/tmp/session-confirm.jsonl",
+      messages: sessionMessages,
+      extensionRunner: { getUIContext: () => ({}) },
+      async bindExtensions(binding: { uiContext: typeof uiContext }) { uiContext = binding.uiContext; },
+      subscribe() { return () => {}; },
+      async prompt() {
+        confirmed = await uiContext!.confirm("Deploy?", "Ship this release.");
+        sessionMessages.push({
+          role: "assistant",
+          content: [{ type: "text", text: confirmed ? "approved" : "declined" }],
+          stopReason: "stop",
+        });
+      },
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  const source = message({ id: "msg_confirm", body: "deploy", directConversationId: "dm_confirm" });
+  setup.messages.set(source.id, source);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  for (let attempt = 0; attempt < 20 && setup.activity.length === 0; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(setup.activity[0]?.body ?? "", /Reply `yes` or `no`/u);
+  assert.equal(
+    (service.state.database.prepare("SELECT status FROM pending_interactive_requests").get() as { status: string }).status,
+    "pending",
+  );
+
+  const reply = message({ id: "msg_confirm_reply", body: "yes", directConversationId: "dm_confirm" });
+  setup.messages.set(reply.id, reply);
+  setup.emit(createdEvent({ messageId: reply.id, cursor: "cur_201" }));
+  await service.waitForIdle();
+
+  assert.equal(confirmed, true);
+  assert.deepEqual(setup.sent.map((row) => row.body), ["answer recorded; resuming Pi.", "approved"]);
+  assert.equal(
+    service.state.database.prepare("SELECT status FROM pending_interactive_requests").get(),
+    undefined,
+    "completed turn cleanup removes its settled interaction row",
+  );
+  await service.waitForStop();
+});
+
+test("Pi confirmation fails closed on timeout", async () => {
+  const setup = fixture();
+  let uiContext: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  let confirmed: boolean | undefined;
+  const sessionMessages: unknown[] = [];
+  const runtime = {
+    session: {
+      sessionId: "session-confirm-timeout",
+      sessionFile: "/tmp/session-confirm-timeout.jsonl",
+      messages: sessionMessages,
+      extensionRunner: { getUIContext: () => ({}) },
+      async bindExtensions(binding: { uiContext: typeof uiContext }) { uiContext = binding.uiContext; },
+      subscribe() { return () => {}; },
+      async prompt() {
+        confirmed = await uiContext!.confirm("Delete?", "Remove the artifact.");
+        sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "safe" }], stopReason: "stop" });
+      },
+    },
+    async dispose() {},
+  };
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime: {
+      kind: "embedded-pi-sdk" as const,
+      project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtime,
+    } as unknown as EmbeddedPiRuntimeBoundary,
+    logger: createLogger({ sink() {} }),
+    interactiveTimeoutMs: 1,
+  });
+  const source = message({ id: "msg_confirm_timeout", body: "ask", directConversationId: "dm_confirm_timeout" });
+  setup.messages.set(source.id, source);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await service.waitForIdle();
+
+  assert.equal(confirmed, false);
+  assert.ok(setup.sent.some((row) => row.body.includes("request timed out")));
+  assert.equal(service.state.database.prepare("SELECT status FROM pending_interactive_requests").get(), undefined);
+  await service.waitForStop();
 });
 
 test("application shutdown reports a stuck runtime and keeps the process safety deadline actionable", async () => {
@@ -734,6 +845,136 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
   }]);
   assert.deepEqual(setup.sent, [{ target: "direct", id: "dm_1", body: "seen" }]);
   service.stop();
+});
+
+test("non-image attachments are materialized as safe Pi inputs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-clickclack-input-"));
+  try {
+    const setup = fixture();
+    setup.config.pi.agentDir = root;
+    const upload = {
+      id: "upl_notes",
+      workspace_id: "wsp_test",
+      owner_id: "usr_owner",
+      filename: "../notes.txt",
+      content_type: "text/plain",
+      byte_size: 4,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const source = message({
+      id: "msg_file",
+      body: "summarize this",
+      directConversationId: "dm_file",
+      attachments: [upload],
+    });
+    setup.messages.set(source.id, source);
+    Object.assign(setup.clickClack, {
+      uploads: { download: async () => new Blob(["note"], { type: "text/plain" }) },
+    });
+    let receivedPrompt = "";
+    const sessionMessages: unknown[] = [];
+    const runtime = {
+      session: {
+        sessionId: "session-file",
+        sessionFile: join(root, "session-file.jsonl"),
+        messages: sessionMessages,
+        subscribe() { return () => {}; },
+        async prompt(text: string) {
+          receivedPrompt = text;
+          sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "read" }], stopReason: "stop" });
+        },
+      },
+      async dispose() {},
+    };
+    const service = new BridgeService(setup.config, {
+      clickClack: setup.clickClack,
+      piRuntime: {
+        kind: "embedded-pi-sdk" as const,
+        project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+        createSessionRuntime: async () => runtime,
+      } as unknown as EmbeddedPiRuntimeBoundary,
+      logger: createLogger({ sink() {} }),
+    });
+
+    await service.start();
+    setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+    await service.waitForIdle();
+
+    const expectedPath = join(root, "clickclack-inputs", "main", upload.id, "notes.txt");
+    assert.match(receivedPrompt, /The user attached files that are available locally/u);
+    assert.ok(receivedPrompt.includes(JSON.stringify(expectedPath)));
+    assert.equal(readFileSync(expectedPath, "utf8"), "note");
+    await service.waitForStop();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("successful referenced write outputs are uploaded and attached to the final reply", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-clickclack-output-"));
+  try {
+    const setup = fixture();
+    const alias = toProjectAlias("main");
+    (setup.config.projects as Map<typeof alias, ProjectConfig>).set(alias, { alias, cwd: root });
+    const created: Array<{ filename: string; nonce?: string; body: string }> = [];
+    const attached: Array<{ messageId: string; uploadId: string }> = [];
+    Object.assign(setup.clickClack, {
+      uploads: {
+        create: async (_workspaceId: string, blob: Blob, filename: string, options: { nonce?: string }) => {
+          created.push({ filename, ...(options.nonce ? { nonce: options.nonce } : {}), body: await blob.text() });
+          return { id: "upl_generated" };
+        },
+        findByNonce: async () => undefined,
+        attach: async (messageId: string, uploadId: string) => { attached.push({ messageId, uploadId }); },
+      },
+    });
+    let listener: ((event: unknown) => void) | undefined;
+    const sessionMessages: unknown[] = [];
+    const runtime = {
+      session: {
+        sessionId: "session-output",
+        sessionFile: join(root, "session-output.jsonl"),
+        messages: sessionMessages,
+        subscribe(callback: (event: unknown) => void) { listener = callback; return () => { listener = undefined; }; },
+        async prompt() {
+          const outputPath = join(root, "artifacts", "report.pdf");
+          mkdirSync(join(root, "artifacts"), { recursive: true });
+          writeFileSync(outputPath, "PDF", { flag: "w" });
+          listener?.({ type: "tool_execution_start", toolCallId: "write_1", toolName: "write", args: { path: "artifacts/report.pdf" } });
+          listener?.({ type: "tool_execution_end", toolCallId: "write_1", toolName: "write", isError: false });
+          sessionMessages.push({
+            role: "assistant",
+            content: [{ type: "text", text: "Created `artifacts/report.pdf`." }],
+            stopReason: "stop",
+          });
+        },
+      },
+      async dispose() {},
+    };
+    const service = new BridgeService(setup.config, {
+      clickClack: setup.clickClack,
+      piRuntime: {
+        kind: "embedded-pi-sdk" as const,
+        project: (projectAlias: string) => setup.config.projects.get(toProjectAlias(projectAlias))!,
+        createSessionRuntime: async () => runtime,
+      } as unknown as EmbeddedPiRuntimeBoundary,
+      logger: createLogger({ sink() {} }),
+    });
+    const source = message({ id: "msg_output", body: "make a report", directConversationId: "dm_output" });
+    setup.messages.set(source.id, source);
+
+    await service.start();
+    setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+    await service.waitForIdle();
+
+    assert.equal(created.length, 1);
+    assert.deepEqual({ filename: created[0]?.filename, body: created[0]?.body }, { filename: "report.pdf", body: "PDF" });
+    assert.match(created[0]?.nonce ?? "", /^pi-output-/u);
+    assert.deepEqual(attached, [{ messageId: "sent_1", uploadId: "upl_generated" }]);
+    await service.waitForStop();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("an incomplete attachment set fails visibly without prompting Pi", async () => {

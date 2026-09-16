@@ -30,11 +30,12 @@ export type EmbeddedPiRuntimeBoundary = {
 export const bridgeAppendSystemPrompt = [
   "Shell tools already execute in the pinned project's current working directory.",
   "Do not prepend `cd <project cwd> &&` to shell commands unless the command genuinely needs a different directory.",
+  "When you create a user-facing artifact with the write tool, mention its project-relative path in the final answer so ClickClack can attach it.",
 ].join(" ");
 
-// This host has no interactive UI. Exclude the question tool before building
-// the prompt, rather than letting its before_agent_start hook remove it after
-// another extension has captured the old prompt for an override.
+// ClickClack bridges extension dialogs after the runtime is bound, but it does
+// not expose the model-callable question tool. Exclude that tool before prompt
+// construction so another extension cannot capture a stale prompt override.
 export const bridgeExcludedTools: string[] = ["ask_user_question"];
 
 export function loadBridgeSystemPrompts(

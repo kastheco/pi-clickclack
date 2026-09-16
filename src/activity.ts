@@ -1,4 +1,6 @@
-import type { Message } from "@clickclack/sdk-ts";
+import { isAbsolute, relative, resolve } from "node:path";
+
+import type { AgentProgressPayload, Message } from "@clickclack/sdk-ts";
 
 import {
   classifyGitCommand,
@@ -19,6 +21,7 @@ export type ActivityMessage = { id: string };
 export type ActivityTransport = {
   create(kind: "agent_commentary" | "agent_tool", body: string, turnId: string): Promise<ActivityMessage>;
   update(messageId: string, body: string): Promise<unknown>;
+  progress?(payload: AgentProgressPayload): Promise<unknown>;
   publishGit?(body: string, nonce: string): Promise<unknown>;
 };
 
@@ -31,25 +34,28 @@ export type TurnActivityOptions = {
   transport: ActivityTransport;
   onError?: (error: unknown) => void;
   flushMs?: number;
+  progressMs?: number;
   collectGitActivity?: (context: GitActivityContext) => Promise<GitActivityRecord>;
 };
 
-type CommentaryRow = {
-  body: string;
-  dirty: boolean;
-  messageId?: string;
-  sentBody?: string;
+type TextProgressRow = {
+  id: string;
+  text: string;
+  sent: boolean;
+  finalized: boolean;
   timer?: NodeJS.Timeout;
 };
 
 type ToolRow = {
   body: string;
   gitOperations: GitOperation[];
+  generatedPath?: string;
   messageId?: string;
   sentBody?: string;
 };
 
 const maximumCommentaryLength = 12_000;
+const maximumProgressLength = 1_000;
 const maximumToolDetailLength = 800;
 
 /**
@@ -64,13 +70,15 @@ export class TurnActivity {
   private readonly sessionId: string | undefined;
   private readonly transport: ActivityTransport;
   private readonly onError: (error: unknown) => void;
-  private readonly flushMs: number;
+  private readonly progressMs: number;
   private readonly collectGit: (context: GitActivityContext) => Promise<GitActivityRecord>;
   private queue: Promise<void> = Promise.resolve();
   private assistantSequence = 0;
+  private progressSequence = 0;
   private currentText = "";
-  private readonly thinkingRows = new Map<string, CommentaryRow>();
+  private textProgress: TextProgressRow | undefined;
   private readonly toolRows = new Map<string, ToolRow>();
+  private readonly generatedPaths = new Set<string>();
 
   constructor(options: TurnActivityOptions) {
     this.turnId = options.turnId;
@@ -79,7 +87,7 @@ export class TurnActivity {
     this.sessionId = options.sessionId;
     this.transport = options.transport;
     this.onError = options.onError ?? (() => {});
-    this.flushMs = options.flushMs ?? 700;
+    this.progressMs = options.progressMs ?? options.flushMs ?? 150;
     this.collectGit = options.collectGitActivity ?? collectGitActivity;
     if (!options.source.channel_id && !options.source.direct_conversation_id) {
       throw new Error("activity source has no conversation target");
@@ -88,10 +96,29 @@ export class TurnActivity {
 
   handle(event: unknown): void {
     if (!isRecord(event) || typeof event.type !== "string") return;
+    if (event.type === "agent_start") {
+      this.publishProgress("append", {
+        id: "lifecycle",
+        kind: "lifecycle",
+        text: "Pi is working",
+        status: "running",
+      });
+      return;
+    }
+    if (event.type === "agent_end") {
+      this.publishProgress("finalize", {
+        id: "lifecycle",
+        kind: "lifecycle",
+        status: "done",
+      });
+      return;
+    }
     if (event.type === "message_start") {
       if (isAssistantMessage(event.message)) {
+        this.flushTextProgress("finalize");
         this.assistantSequence += 1;
         this.currentText = "";
+        this.textProgress = undefined;
       }
       return;
     }
@@ -119,75 +146,74 @@ export class TurnActivity {
   }
 
   async finalize(): Promise<void> {
-    for (const key of this.thinkingRows.keys()) this.flushCommentary(key);
+    this.flushTextProgress("finalize");
     await this.queue;
+  }
+
+  referencedGeneratedPaths(answer: string): string[] {
+    if (!this.projectCwd) return [];
+    return [...this.generatedPaths].filter((path) => {
+      const projectRelative = relative(this.projectCwd!, path);
+      return answer.includes(path)
+        || (projectRelative && answer.includes(projectRelative));
+    });
   }
 
   private handleAssistantUpdate(value: unknown): void {
     if (!isRecord(value) || typeof value.type !== "string") return;
     if (value.type === "text_delta" && typeof value.delta === "string") {
       this.currentText += value.delta;
+      this.scheduleTextProgress();
       return;
     }
     if (value.type === "text_end" && typeof value.content === "string") {
       this.currentText = value.content;
+      this.flushTextProgress("finalize");
+    }
+    // Deliberately ignore thinking_* events. Hidden model reasoning must never
+    // leave the bridge, whether through durable rows or ephemeral progress.
+  }
+
+  private scheduleTextProgress(): void {
+    if (!this.transport.progress || !this.currentText.trim()) return;
+    const id = `assistant-${this.assistantSequence}`;
+    if (!this.textProgress || this.textProgress.id !== id) {
+      this.textProgress = { id, text: this.currentText, sent: false, finalized: false };
+    } else {
+      this.textProgress.text = this.currentText;
+    }
+    if (this.progressMs === 0) {
+      this.flushTextProgress("update");
       return;
     }
-    if (value.type === "thinking_delta" && typeof value.delta === "string") {
-      this.updateThinking(numberField(value, "contentIndex") ?? 0, value.delta, false);
-      return;
-    }
-    if (value.type === "thinking_end" && typeof value.content === "string") {
-      this.updateThinking(numberField(value, "contentIndex") ?? 0, value.content, true);
+    if (!this.textProgress.timer) {
+      this.textProgress.timer = setTimeout(() => this.flushTextProgress("update"), this.progressMs);
     }
   }
 
-  private updateThinking(contentIndex: number, value: string, complete: boolean): void {
-    const key = `${this.assistantSequence}:${contentIndex}`;
-    let row = this.thinkingRows.get(key);
-    if (!row) {
-      row = { body: "", dirty: false };
-      this.thinkingRows.set(key, row);
-    }
-    const text = complete ? value : `${thinkingText(row.body)}${value}`;
-    const body = `**Thinking**\n\n${text.trim()}`.slice(0, maximumCommentaryLength);
-    if (!text.trim() || body === row.body) return;
-    row.body = body;
-    row.dirty = true;
-    if (complete || this.flushMs === 0) {
-      this.flushCommentary(key);
-      return;
-    }
-    if (!row.timer) row.timer = setTimeout(() => this.flushCommentary(key), this.flushMs);
+  private flushTextProgress(op: "update" | "finalize"): void {
+    const row = this.textProgress;
+    if (!row || !row.text.trim() || !this.transport.progress || (op === "finalize" && row.finalized)) return;
+    if (row.timer) clearTimeout(row.timer);
+    delete row.timer;
+    const first = !row.sent;
+    row.sent = true;
+    if (op === "finalize") row.finalized = true;
+    this.publishProgress(first && op === "update" ? "append" : op, {
+      id: row.id,
+      kind: "commentary",
+      text: row.text.trim().slice(-maximumProgressLength),
+      ...(op === "finalize" ? { status: "done" } : {}),
+    });
   }
 
   private flushPreambleText(): void {
+    this.flushTextProgress("finalize");
     const body = this.currentText.trim().slice(0, maximumCommentaryLength);
     this.currentText = "";
     if (!body) return;
     this.enqueue(async () => {
       await this.transport.create("agent_commentary", body, this.turnId);
-    });
-  }
-
-  private flushCommentary(key: string): void {
-    const row = this.thinkingRows.get(key);
-    if (!row) return;
-    if (row.timer) clearTimeout(row.timer);
-    delete row.timer;
-    if (!row.dirty || !row.body.trim()) return;
-    row.dirty = false;
-    this.enqueue(async () => {
-      if (row.messageId) {
-        if (row.sentBody !== row.body) {
-          await this.transport.update(row.messageId, row.body);
-          row.sentBody = row.body;
-        }
-        return;
-      }
-      const posted = await this.transport.create("agent_commentary", row.body, this.turnId);
-      row.messageId = posted.id;
-      row.sentBody = row.body;
     });
   }
 
@@ -197,8 +223,16 @@ export class TurnActivity {
       gitOperations: this.projectCwd
         ? classifyGitOperations(name, args, this.projectCwd)
         : [],
+      ...generatedPath(name, args, this.projectCwd),
     };
     this.toolRows.set(id, row);
+    this.publishProgress("append", {
+      id: `tool-${id}`,
+      kind: "tool",
+      tool_name: name,
+      title: toolDetail(args, this.projectCwd) || name,
+      status: "running",
+    });
     this.enqueue(async () => {
       const posted = await this.transport.create("agent_tool", row.body, this.turnId);
       row.messageId = posted.id;
@@ -209,6 +243,7 @@ export class TurnActivity {
   private finishTool(id: string, isError: boolean): void {
     const row = this.toolRows.get(id);
     if (!row) return;
+    if (!isError && row.generatedPath) this.generatedPaths.add(row.generatedPath);
     if (isError) {
       row.body = `${row.body}\n\nfailed`;
       this.enqueue(async () => {
@@ -218,6 +253,11 @@ export class TurnActivity {
         }
       });
     }
+    this.publishProgress("finalize", {
+      id: `tool-${id}`,
+      kind: "tool",
+      status: isError ? "failed" : "succeeded",
+    });
     this.publishGitActivity(id, row.gitOperations, isError);
   }
 
@@ -248,9 +288,40 @@ export class TurnActivity {
     }
   }
 
+  private publishProgress(
+    op: "append" | "update" | "finalize",
+    line: Extract<AgentProgressPayload, { op: "append" | "update" | "finalize" }>["line"],
+  ): void {
+    if (!this.transport.progress) return;
+    const progress = this.transport.progress;
+    const payload: AgentProgressPayload = {
+      turn_id: this.turnId,
+      seq: ++this.progressSequence,
+      op,
+      line,
+    };
+    this.enqueue(async () => { await progress(payload); });
+  }
+
   private enqueue(work: () => Promise<void>): void {
     this.queue = this.queue.then(work).catch((error: unknown) => this.onError(error));
   }
+}
+
+function generatedPath(
+  name: string,
+  args: unknown,
+  projectCwd?: string,
+): { generatedPath?: string } {
+  if (name !== "write" || !projectCwd || !isRecord(args)) return {};
+  const raw = typeof args.path === "string"
+    ? args.path
+    : typeof args.file_path === "string" ? args.file_path : undefined;
+  if (!raw?.trim()) return {};
+  const candidate = resolve(projectCwd, raw);
+  const projectRelative = relative(projectCwd, candidate);
+  if (!projectRelative || projectRelative.startsWith("..") || isAbsolute(projectRelative)) return {};
+  return { generatedPath: candidate };
 }
 
 function toolBody(name: string, args: unknown, projectCwd?: string): string {
@@ -298,10 +369,6 @@ function stripPinnedCwdPrefix(command: string, projectCwd: string): string {
   return command;
 }
 
-function thinkingText(body: string): string {
-  return body.replace(/^\*\*Thinking\*\*\n\n/u, "");
-}
-
 function assistantText(value: unknown): string {
   if (!isAssistantMessage(value)) return "";
   if (typeof value.content === "string") return value.content.trim();
@@ -326,9 +393,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringField(value: Record<string, unknown>, key: string): string | undefined {
   const field = value[key];
   return typeof field === "string" && field ? field : undefined;
-}
-
-function numberField(value: Record<string, unknown>, key: string): number | undefined {
-  const field = value[key];
-  return typeof field === "number" ? field : undefined;
 }

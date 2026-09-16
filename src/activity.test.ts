@@ -7,6 +7,7 @@ import type { GitActivityRecord } from "./git-activity.js";
 function fixture() {
   const created: Array<{ kind: string; body: string; turnId: string }> = [];
   const updated: Array<{ messageId: string; body: string }> = [];
+  const progress: Array<{ op: string; line?: { id: string; kind: string; text?: string; status?: string; tool_name?: string } }> = [];
   const transport: ActivityTransport = {
     async create(kind, body, turnId) {
       created.push({ kind, body, turnId });
@@ -15,6 +16,9 @@ function fixture() {
     async update(messageId, body) {
       updated.push({ messageId, body });
     },
+    async progress(payload) {
+      progress.push(payload as (typeof progress)[number]);
+    },
   };
   const activity = new TurnActivity({
     turnId: "turn_1",
@@ -22,7 +26,7 @@ function fixture() {
     transport,
     flushMs: 0,
   });
-  return { activity, created, updated };
+  return { activity, created, updated, progress };
 }
 
 test("publishes pre-tool prose and tools as durable ClickClack activity", async () => {
@@ -74,27 +78,64 @@ test("keeps the final assistant answer out of the activity preamble", async () =
   assert.deepEqual(created, []);
 });
 
-test("coalesces thinking snapshots into one durable commentary row", async () => {
-  const { activity, created, updated } = fixture();
+test("never publishes hidden thinking through durable or ephemeral activity", async () => {
+  const { activity, created, updated, progress } = fixture();
 
   activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
   activity.handle({
     type: "message_update",
-    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Checking " },
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "private reasoning" },
   });
-  await activity.finalize();
   activity.handle({
     type: "message_update",
-    assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Checking the runtime" },
+    assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "private reasoning complete" },
   });
   await activity.finalize();
 
-  assert.deepEqual(created, [
-    { kind: "agent_commentary", body: "**Thinking**\n\nChecking", turnId: "turn_1" },
+  assert.deepEqual(created, []);
+  assert.deepEqual(updated, []);
+  assert.deepEqual(progress, []);
+});
+
+test("streams throttled text and tool lifecycle as targeted progress", async () => {
+  const { activity, progress } = fixture();
+
+  activity.handle({ type: "agent_start" });
+  activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
+  activity.handle({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Inspecting" } });
+  activity.handle({ type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: { path: "src/a.ts" } });
+  activity.handle({ type: "tool_execution_end", toolCallId: "call_1", isError: false });
+  activity.handle({ type: "agent_end" });
+  await activity.finalize();
+
+  assert.deepEqual(progress.map(({ op, line }) => ({ op, id: line?.id, kind: line?.kind, status: line?.status })), [
+    { op: "append", id: "lifecycle", kind: "lifecycle", status: "running" },
+    { op: "append", id: "assistant-1", kind: "commentary", status: undefined },
+    { op: "finalize", id: "assistant-1", kind: "commentary", status: "done" },
+    { op: "append", id: "tool-call_1", kind: "tool", status: "running" },
+    { op: "finalize", id: "tool-call_1", kind: "tool", status: "succeeded" },
+    { op: "finalize", id: "lifecycle", kind: "lifecycle", status: "done" },
   ]);
-  assert.deepEqual(updated, [
-    { messageId: "msg_1", body: "**Thinking**\n\nChecking the runtime" },
-  ]);
+});
+
+test("returns successful write outputs only when the final answer references them", async () => {
+  const activity = new TurnActivity({
+    turnId: "turn_1",
+    source: { channel_id: "chn_1" },
+    projectCwd: "/repo",
+    transport: {
+      async create() { return { id: "msg_1" }; },
+      async update() {},
+    },
+  });
+  activity.handle({ type: "tool_execution_start", toolCallId: "write_1", toolName: "write", args: { path: "artifacts/report.pdf" } });
+  activity.handle({ type: "tool_execution_end", toolCallId: "write_1", isError: false });
+  activity.handle({ type: "tool_execution_start", toolCallId: "write_2", toolName: "write", args: { path: "artifacts/failed.csv" } });
+  activity.handle({ type: "tool_execution_end", toolCallId: "write_2", isError: true });
+  await activity.finalize();
+
+  assert.deepEqual(activity.referencedGeneratedPaths("Download `artifacts/report.pdf`."), ["/repo/artifacts/report.pdf"]);
+  assert.deepEqual(activity.referencedGeneratedPaths("Done."), []);
 });
 
 test("marks failed tool rows without duplicating them", async () => {
