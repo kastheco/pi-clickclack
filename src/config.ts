@@ -35,6 +35,7 @@ export type BridgeConfig = {
     workspaceId: string;
     botToken: string;
     ownerIds: readonly string[];
+    gitActivityChannelId?: string;
   };
   projects: ReadonlyMap<ProjectAlias, ProjectConfig>;
   invocationBindings: readonly InvocationBindingConfig[];
@@ -84,6 +85,7 @@ export function loadConfig(environment: Environment = process.env): BridgeConfig
 
   const baseUrl = parseBaseUrl(rawUrl, issues);
   const ownerIds = parseOwnerIds(required("CLICKCLACK_OWNER_IDS"), issues);
+  const gitActivityChannelId = environment.CLICKCLACK_GIT_ACTIVITY_CHANNEL_ID?.trim() || undefined;
   const projects = parseProjects(required("CLICKCLACK_PI_PROJECTS"), issues);
   const invocationBindings = parseInvocationBindings(
     environment.CLICKCLACK_PI_INVOCATIONS?.trim() || "[]",
@@ -122,6 +124,7 @@ export function loadConfig(environment: Environment = process.env): BridgeConfig
       workspaceId,
       botToken,
       ownerIds,
+      ...(gitActivityChannelId ? { gitActivityChannelId } : {}),
     },
     projects,
     invocationBindings,

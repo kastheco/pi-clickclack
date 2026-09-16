@@ -1,6 +1,16 @@
 import type { Message } from "@clickclack/sdk-ts";
 
-import { classifyGitCommand, formatGitActivity } from "./git-activity.js";
+import {
+  classifyGitCommand,
+  classifyGitOperations,
+  collectGitActivity,
+  formatGitActivity,
+  gitActivityNonce,
+  renderGitActivity,
+  type GitActivityContext,
+  type GitActivityRecord,
+  type GitOperation,
+} from "./git-activity.js";
 
 export type ActivitySource = Pick<Message, "channel_id" | "direct_conversation_id">;
 
@@ -9,15 +19,19 @@ export type ActivityMessage = { id: string };
 export type ActivityTransport = {
   create(kind: "agent_commentary" | "agent_tool", body: string, turnId: string): Promise<ActivityMessage>;
   update(messageId: string, body: string): Promise<unknown>;
+  publishGit?(body: string, nonce: string): Promise<unknown>;
 };
 
 export type TurnActivityOptions = {
   turnId: string;
   source: ActivitySource;
   projectCwd?: string;
+  projectAlias?: string;
+  sessionId?: string;
   transport: ActivityTransport;
   onError?: (error: unknown) => void;
   flushMs?: number;
+  collectGitActivity?: (context: GitActivityContext) => Promise<GitActivityRecord>;
 };
 
 type CommentaryRow = {
@@ -30,6 +44,7 @@ type CommentaryRow = {
 
 type ToolRow = {
   body: string;
+  gitOperations: GitOperation[];
   messageId?: string;
   sentBody?: string;
 };
@@ -45,9 +60,12 @@ const maximumToolDetailLength = 800;
 export class TurnActivity {
   private readonly turnId: string;
   private readonly projectCwd: string | undefined;
+  private readonly projectAlias: string | undefined;
+  private readonly sessionId: string | undefined;
   private readonly transport: ActivityTransport;
   private readonly onError: (error: unknown) => void;
   private readonly flushMs: number;
+  private readonly collectGit: (context: GitActivityContext) => Promise<GitActivityRecord>;
   private queue: Promise<void> = Promise.resolve();
   private assistantSequence = 0;
   private currentText = "";
@@ -57,9 +75,12 @@ export class TurnActivity {
   constructor(options: TurnActivityOptions) {
     this.turnId = options.turnId;
     this.projectCwd = options.projectCwd;
+    this.projectAlias = options.projectAlias;
+    this.sessionId = options.sessionId;
     this.transport = options.transport;
     this.onError = options.onError ?? (() => {});
     this.flushMs = options.flushMs ?? 700;
+    this.collectGit = options.collectGitActivity ?? collectGitActivity;
     if (!options.source.channel_id && !options.source.direct_conversation_id) {
       throw new Error("activity source has no conversation target");
     }
@@ -171,7 +192,12 @@ export class TurnActivity {
   }
 
   private startTool(id: string, name: string, args: unknown): void {
-    const row: ToolRow = { body: toolBody(name, args, this.projectCwd) };
+    const row: ToolRow = {
+      body: toolBody(name, args, this.projectCwd),
+      gitOperations: this.projectCwd
+        ? classifyGitOperations(name, args, this.projectCwd)
+        : [],
+    };
     this.toolRows.set(id, row);
     this.enqueue(async () => {
       const posted = await this.transport.create("agent_tool", row.body, this.turnId);
@@ -182,14 +208,44 @@ export class TurnActivity {
 
   private finishTool(id: string, isError: boolean): void {
     const row = this.toolRows.get(id);
-    if (!row || !isError) return;
-    row.body = `${row.body}\n\nfailed`;
-    this.enqueue(async () => {
-      if (row.messageId && row.sentBody !== row.body) {
-        await this.transport.update(row.messageId, row.body);
-        row.sentBody = row.body;
-      }
-    });
+    if (!row) return;
+    if (isError) {
+      row.body = `${row.body}\n\nfailed`;
+      this.enqueue(async () => {
+        if (row.messageId && row.sentBody !== row.body) {
+          await this.transport.update(row.messageId, row.body);
+          row.sentBody = row.body;
+        }
+      });
+    }
+    this.publishGitActivity(id, row.gitOperations, isError);
+  }
+
+  private publishGitActivity(toolCallId: string, operations: GitOperation[], isError: boolean): void {
+    if (
+      operations.length === 0 ||
+      !this.transport.publishGit ||
+      !this.projectAlias ||
+      !this.projectCwd ||
+      !this.sessionId
+    ) return;
+    const publishGit = this.transport.publishGit;
+    for (const [actionIndex, operation] of operations.entries()) {
+      this.enqueue(async () => {
+        const record = await this.collectGit({
+          operation,
+          outcome: isError ? "failed" : "succeeded",
+          projectAlias: this.projectAlias!,
+          projectCwd: this.projectCwd!,
+          sessionId: this.sessionId!,
+          turnId: this.turnId as GitActivityContext["turnId"],
+        });
+        await publishGit(
+          renderGitActivity(record),
+          gitActivityNonce(this.sessionId!, toolCallId, actionIndex),
+        );
+      });
+    }
   }
 
   private enqueue(work: () => Promise<void>): void {

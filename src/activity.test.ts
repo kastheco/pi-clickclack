@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { TurnActivity, type ActivityTransport } from "./activity.js";
+import type { GitActivityRecord } from "./git-activity.js";
 
 function fixture() {
   const created: Array<{ kind: string; body: string; turnId: string }> = [];
@@ -225,6 +226,53 @@ test("classifies git after the pinned cd prefix is stripped", async () => {
   await activity.finalize();
 
   assert.deepEqual(created, [{ body: "**git status**\n\n--short" }]);
+});
+
+test("publishes commit and push outcomes to the configured git activity sink", async () => {
+  const published: Array<{ body: string; nonce: string }> = [];
+  const activity = new TurnActivity({
+    turnId: "turn_1",
+    source: { channel_id: "chn_source" },
+    projectCwd: "/repo",
+    projectAlias: "clickclack",
+    sessionId: "session_1",
+    transport: {
+      async create() { return { id: "msg_tool" }; },
+      async update() {},
+      async publishGit(body, nonce) { published.push({ body, nonce }); },
+    },
+    async collectGitActivity(context): Promise<GitActivityRecord> {
+      return {
+        v: 1,
+        action: context.operation.action,
+        outcome: context.outcome,
+        repository: { name: "clickclack", url: "https://github.com/example/clickclack" },
+        branch: "kas/main",
+        commit: {
+          sha: "0123456789abcdef",
+          subject: "ship activity cards",
+          url: "https://github.com/example/clickclack/commit/0123456789abcdef",
+        },
+        project: context.projectAlias,
+        session: { id: context.sessionId, turnId: context.turnId },
+        occurredAt: "2026-03-20T12:00:00.000Z",
+      };
+    },
+  });
+
+  activity.handle({
+    type: "tool_execution_start",
+    toolCallId: "tool_1",
+    toolName: "bash",
+    args: { command: "git commit -m ship && git push origin kas/main" },
+  });
+  activity.handle({ type: "tool_execution_end", toolCallId: "tool_1", isError: false });
+  await activity.finalize();
+
+  assert.equal(published.length, 2);
+  assert.match(published[0]?.body ?? "", /\*\*git commit succeeded\*\*/u);
+  assert.match(published[1]?.body ?? "", /\*\*git push succeeded\*\*/u);
+  assert.notEqual(published[0]?.nonce, published[1]?.nonce);
 });
 
 test("a failed git command still reports its failure", async () => {

@@ -19,6 +19,7 @@ function fixture(): { root: string; environment: Record<string, string> } {
       CLICKCLACK_WORKSPACE_ID: "wsp_test",
       CLICKCLACK_BOT_TOKEN: "ccb_super_secret_value",
       CLICKCLACK_OWNER_IDS: "usr_owner",
+      CLICKCLACK_GIT_ACTIVITY_CHANNEL_ID: "chn_git_activity",
       CLICKCLACK_PI_PROJECTS: JSON.stringify([{ alias: "main", cwd: project }]),
       CLICKCLACK_PI_INVOCATIONS: JSON.stringify([
         { conversationType: "channel", conversationId: "chn_one", mode: "mention" },
@@ -38,6 +39,7 @@ test("loads a typed bridge configuration", () => {
     const config = loadConfig(environment);
     assert.equal(config.clickClack.baseUrl, "https://clickclack.example.test");
     assert.deepEqual(config.clickClack.ownerIds, ["usr_owner"]);
+    assert.equal(config.clickClack.gitActivityChannelId, "chn_git_activity");
     assert.equal(config.projects.get("main" as never)?.cwd, join(root, "project"));
     assert.equal(config.invocationBindings.length, 2);
     assert.equal(config.pi.thinkingLevel, "high");

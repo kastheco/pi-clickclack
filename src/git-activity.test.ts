@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { classifyGitCommand, formatGitActivity } from "./git-activity.js";
+import {
+  classifyGitCommand,
+  classifyGitOperations,
+  formatGitActivity,
+  gitActivityNonce,
+  renderGitActivity,
+  type GitActivityRecord,
+} from "./git-activity.js";
+import { toTurnId } from "./types.js";
 
 test("classifies a plain git invocation", () => {
   const activity = classifyGitCommand("git status --short");
@@ -21,9 +29,7 @@ test("marks writing subcommands as mutating", () => {
 });
 
 test("treats an unfamiliar subcommand as inspection rather than a write", () => {
-  const activity = classifyGitCommand("git some-custom-alias");
-  assert.equal(activity?.subcommand, "some-custom-alias");
-  assert.equal(activity?.mutating, false);
+  assert.equal(classifyGitCommand("git some-custom-alias")?.mutating, false);
 });
 
 test("extracts the repository from -C in either form", () => {
@@ -44,18 +50,21 @@ test("finds git when it is not the first command in the line", () => {
 });
 
 test("prefers the mutating command when a line chains several", () => {
-  const activity = classifyGitCommand("git status --short && git commit -m x && git log -1");
-  assert.equal(activity?.subcommand, "commit");
+  assert.equal(
+    classifyGitCommand("git status --short && git commit -m x && git log -1")?.subcommand,
+    "commit",
+  );
 });
 
 test("keeps a quoted commit message intact", () => {
-  const activity = classifyGitCommand('git commit -m "fix: keep the message together"');
-  assert.equal(activity?.rest, "-m fix: keep the message together");
+  assert.equal(
+    classifyGitCommand('git commit -m "fix: keep the message together"')?.rest,
+    "-m fix: keep the message together",
+  );
 });
 
 test("ignores an environment assignment prefix", () => {
-  const activity = classifyGitCommand("GIT_AUTHOR_NAME=kas git commit -m x");
-  assert.equal(activity?.subcommand, "commit");
+  assert.equal(classifyGitCommand("GIT_AUTHOR_NAME=kas git commit -m x")?.subcommand, "commit");
 });
 
 test("returns nothing for commands that are not git", () => {
@@ -82,4 +91,89 @@ test("formats the subcommand into the heading so it reads while collapsed", () =
     formatGitActivity({ subcommand: "push", rest: "origin main", repository: "/repo/vault", mutating: true }),
     "**git push** · /repo/vault\n\norigin main",
   );
+});
+
+test("classifies commit, push, and merge operations in command order", () => {
+  assert.deepEqual(
+    classifyGitOperations(
+      "bash",
+      { command: "git commit -m 'ship it' && git push origin kas/main; git merge origin/main" },
+      "/repo",
+    ),
+    [
+      { action: "commit", cwd: "/repo" },
+      { action: "push", cwd: "/repo" },
+      { action: "merge", cwd: "/repo" },
+    ],
+  );
+});
+
+test("tracks cd and git -C repository context", () => {
+  assert.deepEqual(
+    classifyGitOperations(
+      "exec",
+      { command: "cd packages/app && git -C ../api commit -m api" },
+      "/repo",
+    ),
+    [{ action: "commit", cwd: "/repo/packages/api" }],
+  );
+});
+
+test("finds git actions inside a bash -lc wrapper", () => {
+  assert.deepEqual(
+    classifyGitOperations(
+      "shell",
+      { command: "bash -lc \"cd /srv/app && git push origin main\"" },
+      "/repo",
+    ),
+    [{ action: "push", cwd: "/srv/app" }],
+  );
+});
+
+test("ignores read-only commands, dry runs, and merge aborts", () => {
+  for (const command of [
+    "git status",
+    "git log -1",
+    "git push --dry-run origin main",
+    "git merge --abort",
+  ]) {
+    assert.deepEqual(classifyGitOperations("bash", { command }, "/repo"), [], command);
+  }
+});
+
+test("does not mistake quoted git text for a command", () => {
+  assert.deepEqual(
+    classifyGitOperations("bash", { command: "printf '%s\\n' 'git commit -m nope'" }, "/repo"),
+    [],
+  );
+});
+
+test("renders a fallback and versioned machine block", () => {
+  const record: GitActivityRecord = {
+    v: 1,
+    action: "commit",
+    outcome: "succeeded",
+    repository: { name: "clickclack", url: "https://github.com/example/clickclack" },
+    branch: "kas/main",
+    commit: {
+      sha: "0123456789abcdef",
+      subject: "add git activity cards",
+      url: "https://github.com/example/clickclack/commit/0123456789abcdef",
+    },
+    project: "clickclack",
+    session: { id: "session_0123456789abcdef", turnId: toTurnId("turn_1") },
+    occurredAt: "2026-03-20T12:00:00.000Z",
+  };
+  const body = renderGitActivity(record);
+  assert.match(body, /\*\*git commit succeeded\*\*/u);
+  assert.match(body, /\[clickclack\]\(https:\/\/github\.com\/example\/clickclack\)/u);
+  assert.match(body, /```clickclack-git-activity\n\{"v":1/u);
+  assert.match(body, /add git activity cards/u);
+});
+
+test("git activity nonces are stable per action and distinct across actions", () => {
+  const first = gitActivityNonce("session_1", "tool_1", 0);
+  assert.equal(first, gitActivityNonce("session_1", "tool_1", 0));
+  assert.notEqual(first, gitActivityNonce("session_1", "tool_1", 1));
+  assert.equal(first.length, 32);
 });

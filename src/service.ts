@@ -936,6 +936,8 @@ export class BridgeService {
         turnId,
         source,
         projectCwd: this.piRuntime.project(binding.projectAlias).cwd,
+        projectAlias: binding.projectAlias,
+        sessionId: runtime.session.sessionId,
         transport: this.activityTransport(source),
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
       });
@@ -1489,6 +1491,7 @@ export class BridgeService {
   }
 
   private activityTransport(source: Message): ActivityTransport {
+    const gitActivityChannelId = this.config.clickClack.gitActivityChannelId;
     return {
       create: async (kind, body, turnId) => {
         if (source.channel_id) {
@@ -1508,6 +1511,10 @@ export class BridgeService {
         throw new Error("source message has no activity conversation");
       },
       update: (messageId, body) => this.clickClack.messages.update(messageId, { body }),
+      ...(gitActivityChannelId ? {
+        publishGit: (body: string, nonce: string) =>
+          this.clickClack.channels.sendMessage(gitActivityChannelId, { body, nonce }),
+      } : {}),
     };
   }
 
