@@ -474,3 +474,59 @@ test("a watcher with no run observer works unchanged", async () => {
   assert.deepEqual(presented, ["request-1"]);
   await watcher.stop();
 });
+
+// Observe the actual commands, without exporting the watcher's private key helpers.
+async function commandKeys(requestId: string, revision: number, clientId: string, answer: DecisionAnswer) {
+  let claimKey: string | undefined;
+  let answerKey: string | undefined;
+  let answered!: () => void;
+  const completed = new Promise<void>((resolve) => { answered = resolve; });
+  const transport = client({
+    clientId,
+    request: async (options) => {
+      claimKey = options.idempotencyKey;
+      assert.equal(options.requestId, claimKey);
+      return { outcome: "accepted", revision: revision + 1 };
+    },
+    requestDurable: async (options) => {
+      answerKey = options.idempotencyKey;
+      answered();
+      return { outcome: "accepted" };
+    },
+  });
+  const watcher = new WorkflowDecisionWatcher({ client: transport, sessionId: "session-1", present: async () => answer });
+  try {
+    await watcher.start();
+    transport.emit(sessionEvent([{ ...decisionRequest(), requestId, revision }]));
+    await completed;
+  } finally {
+    await watcher.stop();
+  }
+  assert.equal(typeof claimKey, "string");
+  assert.equal(typeof answerKey, "string");
+  return { claimKey: claimKey!, answerKey: answerKey! };
+}
+
+test("answer commands separate delimiter-bearing identity tuples", async () => {
+  const first = await commandKeys("a", 1, "client", { choice: "2:b" });
+  const second = await commandKeys("a:1", 2, "client", { choice: "b" });
+  assert.notEqual(first.answerKey, second.answerKey);
+});
+
+test("claim commands separate delimiter-bearing identity tuples", async () => {
+  const first = await commandKeys("a", 1, "2-b", { choice: "approve" });
+  const second = await commandKeys("a-1", 2, "b", { choice: "approve" });
+  assert.notEqual(first.claimKey, second.claimKey);
+});
+
+test("command identities remain bounded and stable across watcher restarts", async () => {
+  const requestId = "x".repeat(256);
+  const clientId = "y".repeat(256);
+  const answer = { choice: "replan", input: { instructions: "🦀".repeat(4096) } };
+  const first = await commandKeys(requestId, 1, clientId, answer);
+  const retry = await commandKeys(requestId, 1, clientId, structuredClone(answer));
+  assert.deepEqual(first, retry);
+  for (const key of Object.values(first)) assert.ok(Buffer.byteLength(key) > 0 && Buffer.byteLength(key) <= 256);
+  const reclaimed = await commandKeys(requestId, 2, clientId, answer);
+  assert.notEqual(first.claimKey, reclaimed.claimKey);
+});

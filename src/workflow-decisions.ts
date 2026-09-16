@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Surfaces Pi Workflows human decisions in ClickClack.
  *
@@ -105,13 +107,17 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
  *
  * Includes the collected input, so correcting a replan instruction is a new
  * attempt rather than a repeat of the previous one under the same key.
+ * JSON frames delimiter-bearing fields; SHA-256 keeps protocol IDs below 256
+ * bytes even with collected input. Preserve input serialization across retries.
  */
 function answerKey(
   interaction: WorkflowInteractiveRequest,
   answer: DecisionAnswer,
 ): string {
   const input = answer.input === undefined ? "" : JSON.stringify(answer.input);
-  return `${interaction.requestId}:${interaction.revision}:${answer.choice}:${input}`;
+  return `answer-${createHash("sha256")
+    .update(JSON.stringify([interaction.requestId, interaction.revision, answer.choice, input]))
+    .digest("hex")}`;
 }
 
 /** True when another presenter holds an unexpired claim on this decision. */
@@ -319,8 +325,10 @@ export class WorkflowDecisionWatcher {
 
   /** Claims one decision. Resolves false when another presenter won the race. */
   private async claim(interaction: WorkflowInteractiveRequest): Promise<number | undefined> {
-    const key =
-      `claim-presentation-${interaction.requestId}-${interaction.revision}-${this.options.client.clientId}`;
+    // Frame before hashing; successful host claims advance revision for reclaim.
+    const key = `claim-presentation-${createHash("sha256")
+      .update(JSON.stringify([interaction.requestId, interaction.revision, this.options.client.clientId]))
+      .digest("hex")}`;
     const response = await this.options.client.request({
       operation: "interaction.update",
       requestId: key,
