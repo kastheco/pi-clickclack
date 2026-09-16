@@ -382,13 +382,77 @@ test("a watcher with no run observer works unchanged", async () => {
   await watcher.stop();
 });
 
+test("a decision omitted by a bounded page can reappear at the same revision", async () => {
+  const transport = client();
+  let presentations = 0;
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "s",
+    present: async (_decision, signal) => {
+      presentations += 1;
+      if (presentations === 1) {
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      return undefined;
+    },
+  });
+  await watcher.start();
+  transport.emit(sessionEvent([decisionRequest()]));
+  await settle();
+  transport.emit(sessionEvent([]));
+  await settle();
+  transport.emit(sessionEvent([decisionRequest()]));
+  await settle();
+  assert.equal(presentations, 2);
+  assert.deepEqual(transport.recorded, []);
+  await watcher.stop();
+});
 
-test("a decision omitted by a bounded page can reappear at the same revision", async()=>{
- const transport=client();let presentations=0;
- const watcher=new WorkflowDecisionWatcher({client:transport,sessionId:"s",present:async(_decision,signal)=>{
- presentations++;if(presentations===1) await new Promise<void>(resolve=>signal.addEventListener("abort",()=>resolve(),{once:true}));return undefined;
- }});
- await watcher.start();transport.emit(sessionEvent([decisionRequest()]));await settle();
- transport.emit(sessionEvent([]));await settle();transport.emit(sessionEvent([decisionRequest()]));await settle();
- assert.equal(presentations,2);assert.deepEqual(transport.recorded,[]);await watcher.stop();
+// Observe the actual durable command without exporting the private key helper.
+async function answerCommandKey(
+  requestId: string,
+  revision: number,
+  answer: DecisionAnswer,
+): Promise<string> {
+  let key: string | undefined;
+  let answered!: () => void;
+  const completed = new Promise<void>((resolve) => { answered = resolve; });
+  const transport = client({
+    requestDurable: async (options) => {
+      key = options.idempotencyKey;
+      answered();
+      return { outcome: "accepted" };
+    },
+  });
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "session-1",
+    present: async () => answer,
+  });
+  try {
+    await watcher.start();
+    transport.emit(sessionEvent([{ ...decisionRequest(), requestId, revision }]));
+    await completed;
+  } finally {
+    await watcher.stop();
+  }
+  if (key === undefined) throw new Error("decision answer was not submitted");
+  return key;
+}
+
+test("answer commands separate delimiter-bearing identity tuples", async () => {
+  const first = await answerCommandKey("a", 1, { choice: "2:b" });
+  const second = await answerCommandKey("a:1", 2, { choice: "b" });
+  assert.notEqual(first, second);
+});
+
+test("answer identities remain bounded and stable across watcher restarts", async () => {
+  const requestId = "x".repeat(256);
+  const answer = { choice: "replan", input: { instructions: "🦀".repeat(4096) } };
+  const first = await answerCommandKey(requestId, 1, answer);
+  const retry = await answerCommandKey(requestId, 1, structuredClone(answer));
+  assert.equal(first, retry);
+  assert.ok(Buffer.byteLength(first) > 0 && Buffer.byteLength(first) <= 256);
+  const revised = await answerCommandKey(requestId, 2, answer);
+  assert.notEqual(first, revised);
 });

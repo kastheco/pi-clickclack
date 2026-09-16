@@ -1,6 +1,10 @@
-/** Host-side external decision watching for the latest Pi Workflows protocol.
- * The subscription advertises external presentation without taking agent coordination.
- * Message publication is nonce-deduplicated by ClickClack; answers remain revision-fenced.
+import { createHash } from "node:crypto";
+
+/**
+ * Host-side external decision watching for the latest Pi Workflows protocol.
+ * The subscription advertises external presentation without taking agent
+ * coordination. Message publication is nonce-deduplicated by ClickClack;
+ * answers remain revision-fenced.
  */
 export type WorkflowInteractiveRequest = {
   requestId: string;
@@ -86,13 +90,17 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
  *
  * Includes the collected input, so correcting a replan instruction is a new
  * attempt rather than a repeat of the previous one under the same key.
+ * JSON frames delimiter-bearing fields; SHA-256 keeps protocol IDs below 256
+ * bytes even with collected input. Preserve input serialization across retries.
  */
 function answerKey(
   interaction: WorkflowInteractiveRequest,
   answer: DecisionAnswer,
 ): string {
   const input = answer.input === undefined ? "" : JSON.stringify(answer.input);
-  return `${interaction.requestId}:${interaction.revision}:${answer.choice}:${input}`;
+  return `answer-${createHash("sha256")
+    .update(JSON.stringify([interaction.requestId, interaction.revision, answer.choice, input]))
+    .digest("hex")}`;
 }
 
 /** Extracts the view carried by one real or test session subscription event. */
