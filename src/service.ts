@@ -40,6 +40,7 @@ import { sessionRun, type RunView } from "./workflow-run-view.js";
 import { DurableWorkflowPublisher } from "./workflow-durable-publisher.js";
 import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
+import { latestTodoTasks, todoNotepadCard, todoTasksFromEvent, type TodoTask } from "./notepad.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { steerWithReceipt } from "./pi-steering.js";
 import {
@@ -175,6 +176,9 @@ export class BridgeService {
   private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
+  private readonly notepadRevisions = new Map<number, number>();
+  private readonly notepadTasks = new Map<number, TodoTask[]>();
+  private readonly notepadPublications = new Map<number, Promise<void>>();
   private stopTask: Promise<void> = Promise.resolve();
 
   constructor(
@@ -228,6 +232,10 @@ export class BridgeService {
     }
     await this.publishCommandMenu();
     if (this.stopped) return;
+    for (const binding of this.state.listBindings()) {
+      this.queueNotepadPublication(binding, []);
+    }
+    await this.drainNotepadPublications();
     const interrupted = this.state.listActiveTurns();
     const interruptedTurns = this.state.recoverInterruptedTurns();
     if (interruptedTurns > 0) {
@@ -333,6 +341,7 @@ export class BridgeService {
     while (this.conversationQueues.size > 0) {
       await Promise.all([...this.conversationQueues.values()]);
     }
+    await this.drainNotepadPublications();
 
     const workflowBindings = new Set([
       ...this.decisionWatchers.keys(),
@@ -444,6 +453,10 @@ export class BridgeService {
         this.scheduleReconnect();
       },
     });
+    for (const [bindingId, tasks] of this.notepadTasks) {
+      const binding = this.state.getBindingById(bindingId);
+      if (binding) this.queueNotepadPublication(binding, tasks);
+    }
   }
 
   private async catchUp(afterCursor: string): Promise<string> {
@@ -1110,7 +1123,7 @@ export class BridgeService {
         unsubscribe: undefined,
       };
       this.activeSessionTurns.set(binding.id, activeSessionTurn);
-      this.bindActiveTurnSession(binding.id, runtime.session);
+      this.bindActiveTurnSession(binding, runtime.session);
       this.state.transitionActiveTurn(turnId, "starting", "running");
       status = "running";
       const extensionErrors: Error[] = [];
@@ -1594,6 +1607,7 @@ export class BridgeService {
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
     const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
+      this.queueNotepadPublication(binding, latestTodoTasks(session.messages));
       if (typeof session.bindExtensions !== "function") return;
       const baseUI = session.extensionRunner.getUIContext?.() ?? ({} as ExtensionUIContext);
       const uiContext: ExtensionUIContext = {
@@ -1657,7 +1671,7 @@ export class BridgeService {
           this.activeExtensionErrors.get(binding.id)?.push(error);
         },
       });
-      this.bindActiveTurnSession(binding.id, session);
+      this.bindActiveTurnSession(binding, session);
       await this.watchWorkflowDecisions(binding, session.sessionId);
     };
 
@@ -1667,8 +1681,8 @@ export class BridgeService {
     await bindSession(runtime.session);
   }
 
-  private bindActiveTurnSession(bindingId: number, session: AgentSessionRuntime["session"]): void {
-    const activeTurn = this.activeSessionTurns.get(bindingId);
+  private bindActiveTurnSession(binding: ConversationBinding, session: AgentSessionRuntime["session"]): void {
+    const activeTurn = this.activeSessionTurns.get(binding.id);
     if (!activeTurn) return;
     activeTurn.unsubscribe?.();
     activeTurn.session = session;
@@ -1682,8 +1696,41 @@ export class BridgeService {
           this.steeringMessages.delete(event.message);
         }
       }
+      const tasks = todoTasksFromEvent(event);
+      if (tasks) this.queueNotepadPublication(binding, tasks);
       activeTurn.activity.handle(event);
     });
+  }
+
+  private queueNotepadPublication(binding: ConversationBinding, tasks: readonly TodoTask[]): void {
+    if (!this.clickClack.notepads?.publish) return;
+    this.notepadTasks.set(binding.id, tasks.map((task) => ({ ...task })));
+    const revision = (this.notepadRevisions.get(binding.id) ?? 0) + 1;
+    this.notepadRevisions.set(binding.id, revision);
+    const previous = this.notepadPublications.get(binding.id) ?? Promise.resolve();
+    const publication = previous.then(async () => {
+      try {
+        await this.clickClack.notepads!.publish(
+          binding.conversationType === "channel" ? "channels" : "dms",
+          binding.conversationId,
+          { card: todoNotepadCard(tasks, revision) },
+        );
+      } catch (error) {
+        this.logger.warn("Pi todo notepad publication failed", { bindingId: binding.id, error });
+      }
+    });
+    this.notepadPublications.set(binding.id, publication);
+    void publication.finally(() => {
+      if (this.notepadPublications.get(binding.id) === publication) {
+        this.notepadPublications.delete(binding.id);
+      }
+    });
+  }
+
+  private async drainNotepadPublications(): Promise<void> {
+    while (this.notepadPublications.size > 0) {
+      await Promise.all([...this.notepadPublications.values()]);
+    }
   }
 
   private async replaceRuntimeSession(

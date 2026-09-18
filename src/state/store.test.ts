@@ -47,6 +47,7 @@ test("bindings upsert and keep one active Pi session", () => {
     assert.equal(updated.projectAlias, "secondary");
     assert.equal(updated.invocationMode, "always");
     assert.deepEqual(store.getBindingById(binding.id), updated);
+    assert.deepEqual(store.listBindings(), [updated]);
     assert.equal(store.getBindingById(binding.id + 1), undefined);
 
     const first = store.setActivePiSession({

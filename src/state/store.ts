@@ -266,6 +266,16 @@ export class StateStore {
     return row ? conversationBinding(row) : undefined;
   }
 
+  listBindings(): ConversationBinding[] {
+    const rows = this.database
+      .prepare(`
+        SELECT id, conversation_type, conversation_id, project_alias, invocation_mode, created_at, updated_at
+        FROM conversation_bindings ORDER BY id
+      `)
+      .all() as Row[];
+    return rows.map(conversationBinding);
+  }
+
   setActivePiSession(input: {
     bindingId: number;
     sessionId: string;

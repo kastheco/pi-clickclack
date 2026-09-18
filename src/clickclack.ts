@@ -5,7 +5,7 @@ import type { BridgeConfig } from "./config.js";
 export type ClickClackBoundary = Pick<
   ClickClackClient,
   "me" | "workspaces" | "bots" | "messages" | "uploads" | "channels" | "dms" | "events"
-> & Partial<Pick<ClickClackClient, "workflowRuns">>;
+> & Partial<Pick<ClickClackClient, "notepads" | "workflowRuns">>;
 
 export function createClickClackClient(config: BridgeConfig): ClickClackClient {
   return new ClickClackClient({

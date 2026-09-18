@@ -507,6 +507,13 @@ test("shutdown drains an in-flight realtime catch-up before closing state", asyn
 
 test("an owner mention auto-binds the only project, runs Pi, and replies", async () => {
   const setup = fixture();
+  const notepadPublications: unknown[] = [];
+  setup.clickClack.notepads = {
+    publish: async (_kind, _id, input) => {
+      notepadPublications.push(input);
+      return { state: "ready", card: input.card };
+    },
+  } as NonNullable<ClickClackBoundary["notepads"]>;
   const sessionMessages: unknown[] = [];
   let receivedPrompt = "";
   let sessionListener: ((event: unknown) => void) | undefined;
@@ -527,6 +534,14 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
         sessionListener?.({ type: "message_end", message: preamble });
         sessionListener?.({ type: "tool_execution_start", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" } });
         sessionListener?.({ type: "tool_execution_end", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" }, result: {}, isError: false });
+        sessionListener?.({
+          type: "tool_execution_end",
+          toolCallId: "todo_1",
+          toolName: "todo",
+          args: { action: "create" },
+          result: { details: { tasks: [{ id: 1, subject: "Inspect project", activeForm: "inspecting project", status: "in_progress" }] } },
+          isError: false,
+        });
         sessionMessages.push(preamble);
         const assistant = { role: "assistant", content: [{ type: "text", text: "hello from pi" }], stopReason: "stop" };
         sessionListener?.({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -603,6 +618,16 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   assert.ok(setup.ephemeral.some((frame) => frame.type === "agent.progress" && frame.channelId === "chn_1"));
   assert.equal(service.state.getBinding("channel", "chn_1" as never)?.projectAlias, "main");
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-1");
+  const latestNotepad = notepadPublications.at(-1) as { card: { revision: number; updatedAt: number } };
+  assert.ok(notepadPublications.length >= 3, "realtime reconnect republishes the current notepad snapshot");
+  assert.deepEqual(latestNotepad, {
+    card: {
+      revision: latestNotepad.card.revision,
+      updatedAt: latestNotepad.card.updatedAt,
+      markdown: "**0 of 1 tasks complete.**\n\nCurrent: inspecting project",
+      steps: [{ step: "inspecting project", status: "in_progress" }],
+    },
+  });
   assert.equal(workflowClientCreated, 1);
   assert.deepEqual(watchedSessions, ["session-1"]);
   await application.stop();
