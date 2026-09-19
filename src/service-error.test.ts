@@ -43,7 +43,7 @@ test(`publishes the current Pi ${failure} error without reusing an earlier answe
     workspaces: { get: async () => ({ id: "wsp_test", route_id: "W1", name: "Test", slug: "test", icon_url: "", created_at: "" }) },
     bots: { setCommands: async () => [] },
     messages: { findByNonce: async () => undefined, get: async () => source },
-    channels: { sendMessage: async () => ({ id: "msg_channel" }) },
+    channels: { list: async () => [], sendMessage: async () => ({ id: "msg_channel" }) },
     dms: { sendMessage: async (_id: string, input: { body: string }) => { sent.push(input.body); return { id: `msg_sent_${sent.length}` }; } },
     events: {
       list: async () => ({ events: [], tailCursor: "cur_100" }),
@@ -145,7 +145,7 @@ test("quarantines an empty Pi session so the next message gets a fresh runtime",
     workspaces: { get: async () => ({ id: "wsp_test", route_id: "W1", name: "Test", slug: "test", icon_url: "", created_at: "" }) },
     bots: { setCommands: async () => [] },
     messages: { findByNonce: async () => undefined, get: async (id: string) => sources.get(id) },
-    channels: { sendMessage: async () => ({ id: "msg_channel" }) },
+    channels: { list: async () => [], sendMessage: async () => ({ id: "msg_channel" }) },
     dms: { sendMessage: async (_id: string, input: { body: string }) => { sent.push(input.body); return { id: `msg_sent_${sent.length}` }; } },
     events: {
       list: async () => ({ events: [], tailCursor: "cur_100" }),

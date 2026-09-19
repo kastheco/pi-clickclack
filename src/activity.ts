@@ -19,6 +19,11 @@ export type ActivitySource = Pick<Message, "channel_id" | "direct_conversation_i
 
 export type ActivityMessage = { id: string };
 
+/** Whether Pi's intermediate prose is streamed into ClickClack (`stream`) or dropped (`off`). */
+export type ReasoningVisibility = "stream" | "off";
+export const reasoningVisibilities: readonly ReasoningVisibility[] = ["stream", "off"];
+export const defaultReasoningVisibility: ReasoningVisibility = "stream";
+
 export type ActivityTransport = {
   create(
     kind: "agent_commentary" | "agent_tool",
@@ -37,6 +42,7 @@ export type TurnActivityOptions = {
   projectCwd?: string;
   projectAlias?: string;
   sessionId?: string;
+  reasoning?: ReasoningVisibility;
   transport: ActivityTransport;
   onError?: (error: unknown) => void;
   flushMs?: number;
@@ -78,6 +84,7 @@ export class TurnActivity {
   private readonly onError: (error: unknown) => void;
   private readonly progressMs: number;
   private readonly collectGit: (context: GitActivityContext) => Promise<GitActivityRecord>;
+  private readonly reasoning: ReasoningVisibility;
   private queue: Promise<void> = Promise.resolve();
   private assistantSequence = 0;
   private progressSequence = 0;
@@ -96,6 +103,7 @@ export class TurnActivity {
     this.onError = options.onError ?? (() => {});
     this.progressMs = options.progressMs ?? options.flushMs ?? 150;
     this.collectGit = options.collectGitActivity ?? collectGitActivity;
+    this.reasoning = options.reasoning ?? defaultReasoningVisibility;
     if (!options.source.channel_id && !options.source.direct_conversation_id) {
       throw new Error("activity source has no conversation target");
     }
@@ -179,12 +187,13 @@ export class TurnActivity {
       this.currentText = value.content;
       this.flushTextProgress("finalize");
     }
-    // Deliberately ignore thinking_* events. Hidden model reasoning must never
-    // leave the bridge, whether through durable rows or ephemeral progress.
+    // Provider thinking blocks are terse reasoning summaries, not the
+    // intermediate prose Pi shows under its `Thinking…` label. They stay
+    // private. ClickClack streams the ordinary text parts emitted before tools.
   }
 
   private scheduleTextProgress(): void {
-    if (!this.transport.progress || !this.currentText.trim()) return;
+    if (this.reasoning !== "stream" || !this.transport.progress || !this.currentText.trim()) return;
     const id = `assistant-${this.assistantSequence}`;
     if (!this.textProgress || this.textProgress.id !== id) {
       this.textProgress = { id, text: this.currentText, sent: false, finalized: false };
@@ -220,7 +229,7 @@ export class TurnActivity {
     this.flushTextProgress("finalize");
     const body = this.currentText.trim().slice(0, maximumCommentaryLength);
     this.currentText = "";
-    if (!body) return;
+    if (this.reasoning !== "stream" || !body) return;
     this.enqueue(async () => {
       await this.transport.create(
         "agent_commentary",

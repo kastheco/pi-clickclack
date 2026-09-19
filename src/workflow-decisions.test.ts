@@ -5,6 +5,7 @@ import {
   decisionForOperator,
   sessionInteractions,
   WorkflowDecisionWatcher,
+  type ClaimedWorkflowDecision,
   type DecisionAnswer,
   type WorkflowDecisionClient,
   type WorkflowInteractiveRequest,
@@ -105,6 +106,45 @@ test("the operator view carries the authored presentation and never the subject"
     { key: "replan", label: "Replan", expectsInput: true },
   ]);
   assert.doesNotMatch(JSON.stringify(decision), /secret canonical detail/u);
+});
+
+test("externalized decision contracts are hydrated before presentation", async () => {
+  const transport = client();
+  const interaction = {
+    ...decisionRequest(),
+    contract: {
+      $artifact: {
+        path: "interactions/decision-1/contract.json",
+        mediaType: "application/json",
+        bytes: 123,
+        sha256: "a".repeat(64),
+      },
+    },
+  };
+  const hydrated: Array<{ runId: string; value: unknown }> = [];
+  Object.assign(transport, {
+    hydrateContent: async (runId: string, value: unknown) => {
+      hydrated.push({ runId, value });
+      return decisionRequest().contract;
+    },
+  });
+  const presented: ClaimedWorkflowDecision[] = [];
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport,
+    sessionId: "session-1",
+    present: async (decision) => {
+      presented.push(decision);
+      return undefined;
+    },
+  });
+
+  await watcher.start();
+  transport.emit(sessionEvent([interaction]));
+  await settle();
+
+  assert.deepEqual(hydrated, [{ runId: "run-1", value: interaction.contract }]);
+  assert.equal(presented[0]?.title, "Approve the implementation plan");
+  await watcher.stop();
 });
 
 test("agent and assistant interactions are not treated as decisions", () => {

@@ -10,6 +10,7 @@ import {
   createAgentSessionFromServices,
   createAgentSessionRuntime,
   createAgentSessionServices,
+  initTheme,
   resolveCliModel,
 } from "@earendil-works/pi-coding-agent";
 
@@ -30,6 +31,8 @@ export type EmbeddedPiRuntimeBoundary = {
 export const bridgeAppendSystemPrompt = [
   "Shell tools already execute in the pinned project's current working directory.",
   "Do not prepend `cd <project cwd> &&` to shell commands unless the command genuinely needs a different directory.",
+  "Before each tool batch, tell the user what you found and what you are doing next in one or two short prose paragraphs.",
+  "Write these progress updates as natural commentary, like a direct Pi session. Do not use terse status headings or narrate every individual tool call.",
   "When you create a user-facing artifact with the write tool, mention its project-relative path in the final answer so ClickClack can attach it.",
 ].join(" ");
 
@@ -62,6 +65,11 @@ export function loadBridgeSystemPrompts(
  * by a later routing issue.
  */
 export function createEmbeddedPiRuntime(config: BridgeConfig): EmbeddedPiRuntimeBoundary {
+  // The CLI initializes this global before loading extensions. Embedded SDK hosts
+  // must do it themselves, including in headless mode, or connector UIs throw
+  // "Theme not initialized" before exposing their tools.
+  initTheme(undefined, false);
+
   let modelRuntimePromise: Promise<ModelRuntime> | undefined;
   const sessionDirectory = join(config.pi.agentDir, "sessions");
 

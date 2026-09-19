@@ -17,6 +17,7 @@ export const botCommandMenu: readonly BotCommandInput[] = [
   { command: "session", description: "Show Pi session usage and context stats" },
   { command: "model", description: "Show or select the Pi model", args_hint: "[provider/model]" },
   { command: "thinking", description: "Show or set the Pi thinking level", args_hint: "[level]" },
+  { command: "reasoning", description: "Show or set whether Pi's working commentary streams", args_hint: "[stream|off]" },
   { command: "reload", description: "Reload Pi extensions, skills, prompts, and context" },
   { command: "copy", description: "Send the last Pi answer as a new message" },
 ];

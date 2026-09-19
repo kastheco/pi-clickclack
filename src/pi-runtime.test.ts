@@ -3,13 +3,36 @@ import test from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SettingsManager, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 
-import { bridgeAppendSystemPrompt, loadBridgeSystemPrompts } from "./pi-runtime.js";
+import { bridgeAppendSystemPrompt, createEmbeddedPiRuntime, loadBridgeSystemPrompts } from "./pi-runtime.js";
 
-test("bridge tells Pi that shell tools already use the pinned project cwd", () => {
+test("bridge tells Pi how to work and narrate through ClickClack", () => {
   assert.match(bridgeAppendSystemPrompt, /already execute in the pinned project's current working directory/u);
   assert.match(bridgeAppendSystemPrompt, /Do not prepend `cd <project cwd> &&`/u);
+  assert.match(bridgeAppendSystemPrompt, /Before each tool batch.*one or two short prose paragraphs/u);
+  assert.match(bridgeAppendSystemPrompt, /Do not use terse status headings/u);
+});
+
+test("embedded Pi initializes a headless theme for connector extensions", () => {
+  createEmbeddedPiRuntime({
+    clickClack: {
+      baseUrl: "http://localhost",
+      workspaceId: "workspace",
+      botToken: "token",
+      ownerIds: [],
+    },
+    projects: new Map(),
+    invocationBindings: [],
+    pi: {
+      model: "provider/model",
+      thinkingLevel: "off",
+      agentDir: "/tmp/pi-clickclack-test-agent",
+    },
+    statePath: "/tmp/pi-clickclack-test-state.sqlite",
+  });
+
+  assert.doesNotThrow(() => getSelectListTheme().selectedPrefix(">"));
 });
 
 test("loads the exact voice profile alongside bridge instructions without a model tool call", async () => {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Pi ClickClack bridge
+Description=@DESCRIPTION@
 After=network-online.target clickclack.service
 Wants=network-online.target
 

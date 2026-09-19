@@ -69,7 +69,29 @@ CLICKCLACK_PI_INVOCATIONS=[{"conversationType":"channel","conversationId":"chn_r
 
 Channels support `mention` or `always`. Direct conversations use `auto`.
 
-Install, enable, and start the user service:
+### One coding persona per project
+
+Run the interactive helper:
+
+```sh
+pnpm persona:add
+```
+
+It asks for the project alias, display name, handle, and directory, then creates the user-owned ClickClack bot, writes its isolated `0600` environment file, builds the bridge, installs a named systemd service, starts it, and verifies that it is active. Existing `~/.config/pi-clickclack/env` values are used as defaults for the ClickClack URL, workspace, owner, Pi model, thinking level, and agent directory.
+
+For example, `utmco`, `утмсо`, `utmco`, and `/home/user/dev/utmco` create `@utmco` backed by `pi-clickclack-utmco.service` and locked to that directory.
+
+Preview without creating anything:
+
+```sh
+pnpm persona:add -- --dry-run
+```
+
+Every prompt also has a flag for automation. Run `pnpm persona:add -- --help` for the complete list. Each channel or DM with the bot receives its own persistent Pi session, while every session is pinned to the persona's single project directory.
+
+The lower-level `service:install -- --persona <alias>` command remains available for existing external environment files. It rejects multi-project configuration and implicit shared state paths. Legacy single-service mode remains available for one bridge that can switch between approved projects.
+
+Install, enable, and start the legacy user service:
 
 ```sh
 pnpm service:install -- --repo "$PWD" --env "$HOME/.config/pi-clickclack/env" --start
@@ -96,6 +118,7 @@ The bridge publishes its supported commands to ClickClack:
 - `/session` shows session and context statistics.
 - `/model [provider/model]` shows or changes the session model.
 - `/thinking [level]` shows or changes the thinking level.
+- `/reasoning [stream|off]` shows or changes whether Pi's intermediate working commentary streams before tool batches. Streaming is the default; `off` drops that commentary for this conversation until the bridge restarts. Provider reasoning summaries stay hidden.
 - `/reload` reloads Pi extensions, skills, prompts, and context files.
 - `/copy` posts the latest assistant answer as a new ClickClack message.
 
@@ -138,11 +161,22 @@ See [`docs/smoke-suite.md`](docs/smoke-suite.md) for the opt-in installed-inject
 
 ## Operate
 
+Legacy service:
+
 ```sh
 systemctl --user status pi-clickclack.service
 journalctl --user -u pi-clickclack.service -f
 systemctl --user restart pi-clickclack.service
 systemctl --user stop pi-clickclack.service
+```
+
+Project persona service:
+
+```sh
+systemctl --user status pi-clickclack-clickclack.service
+journalctl --user -u pi-clickclack-clickclack.service -f
+systemctl --user restart pi-clickclack-clickclack.service
+systemctl --user stop pi-clickclack-clickclack.service
 ```
 
 A healthy start logs `bridge service started` with the bot, workspace, configured aliases, command count, and runtime kind. Structured logs redact configured tokens and provider credentials.

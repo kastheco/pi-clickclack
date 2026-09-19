@@ -29,6 +29,7 @@ type Fixture = {
   activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }>;
   commandMenu: BotCommandInput[];
   ephemeral: Array<{ type: string; channelId?: string; directConversationId?: string; payload: unknown }>;
+  assignedChannels: Set<string>;
   emit(event: RealtimeEvent): void;
   closeRealtime(): void;
   subscriptionCount(): number;
@@ -61,6 +62,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
   const activity: Array<{ target: "channel" | "direct"; id: string; body: string; kind: string; turnId?: string }> = [];
   const commandMenu: BotCommandInput[] = [];
   const ephemeral: Fixture["ephemeral"] = [];
+  const assignedChannels = new Set<string>();
   let onEvent: EventHandler | undefined;
   let onClose: (() => void) | undefined;
   let subscriptions = 0;
@@ -103,6 +105,18 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
       },
     },
     channels: {
+      list: async () => [...assignedChannels].map((channelId) => ({
+        id: channelId,
+        workspace_id: "wsp_test",
+        name: channelId,
+        kind: "public",
+        created_at: "2026-01-01T00:00:00Z",
+        external_managed: false,
+        last_seq: 0,
+        last_read_seq: 0,
+        unread_count: 0,
+        bot_assignments: [{ channel_id: channelId, bot_user_id: "usr_bot" }],
+      })),
       sendMessage: async (channelId: string, input: MessageInput) => {
         if (input.kind === "agent_commentary" || input.kind === "agent_tool") {
           const id = `activity_${activity.length + 1}`;
@@ -159,6 +173,7 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     activity,
     commandMenu,
     ephemeral,
+    assignedChannels,
     emit(event) {
       if (!onEvent) throw new Error("fake realtime subscription has not started");
       onEvent(event);
@@ -262,7 +277,7 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   assert.equal(setup.subscriptionCount(), 1);
   assert.deepEqual(
     setup.commandMenu.map((command) => command.command),
-    ["project", "invoke", "continue", "compact", "new", "name", "session", "model", "thinking", "reload", "copy"],
+    ["project", "invoke", "continue", "compact", "new", "name", "session", "model", "thinking", "reasoning", "reload", "copy"],
   );
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
   await service.waitForStop();
@@ -363,6 +378,68 @@ test("a lost durable create response reconciles by nonce without retrying", asyn
   assert.equal(service.state.getOutbound("pi-test-durable")?.status, "reconciled");
   assert.deepEqual(await sendReply(source, "durable answer", "pi-test-durable"), { id: "msg_committed" });
   assert.equal(creates, 1);
+  await service.waitForStop();
+});
+
+test("workflow decisions are republished after the active conversation reply", async () => {
+  const setup = fixture();
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    workflowClient: () => ({ ...workflowClientRecorder().factory(), hostIdentity: "test-host" }),
+    logger: createLogger({ sink() {} }),
+  });
+  const binding = service.state.upsertBinding({
+    conversationType: "direct",
+    conversationId: "dm_decision_order" as never,
+    projectAlias: toProjectAlias("main"),
+    invocationMode: "auto",
+  });
+  const source = message({
+    id: "msg_decision_order",
+    body: "/continue",
+    directConversationId: "dm_decision_order",
+  });
+  const internals = service as unknown as {
+    conversationSources: Map<number, Message>;
+    conversationQueues: Map<number, Promise<void>>;
+    presentDecision(
+      binding: ConversationBinding,
+      decision: ClaimedWorkflowDecision,
+      signal: AbortSignal,
+    ): Promise<DecisionAnswer | undefined>;
+  };
+  internals.conversationSources.set(binding.id, source);
+  let finishTurn!: () => void;
+  const turn = new Promise<void>((resolve) => { finishTurn = resolve; });
+  const order: string[] = [];
+  const sendMessage = setup.clickClack.dms.sendMessage.bind(setup.clickClack.dms);
+  setup.clickClack.dms.sendMessage = async (...args) => {
+    order.push(args[1].kind === "agent_commentary" ? "decision" : "reply");
+    return await sendMessage(...args);
+  };
+
+  await service.start();
+  internals.conversationQueues.set(binding.id, turn);
+  const abort = new AbortController();
+  const presenting = internals.presentDecision(binding, {
+    requestId: "request-order",
+    runId: "run-order",
+    revision: 1,
+    title: "Approve the implementation plan",
+    summary: "Review it before implementation starts.",
+    choices: [{ key: "continue", label: "Yes, continue", expectsInput: false }],
+  }, abort.signal);
+  await nextEventLoop();
+  assert.deepEqual(order, ["decision"], "a blocking mid-turn decision must remain answerable");
+
+  await setup.clickClack.dms.sendMessage("dm_decision_order", { body: "the workflow needs your approval" });
+  finishTurn();
+  internals.conversationQueues.delete(binding.id);
+  await nextEventLoop();
+  assert.deepEqual(order, ["decision", "reply", "decision"], "the still-pending decision must become newest again");
+
+  abort.abort();
+  assert.equal(await presenting, undefined);
   await service.waitForStop();
 });
 
@@ -1427,6 +1504,46 @@ test("a missing active session file is archived and replaced automatically", asy
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a channel assigned to the bot persona invokes its project without a mention", async () => {
+  const setup = fixture(["utmco"]);
+  setup.assignedChannels.add("chn_radar");
+  const prompts: string[] = [];
+  const runtime = {
+    session: {
+      sessionId: "session-utmco",
+      sessionFile: "/tmp/session-utmco.jsonl",
+      messages: [] as unknown[],
+      subscribe() { return () => {}; },
+      async prompt(text: string) {
+        prompts.push(text);
+        this.messages.push({ role: "assistant", content: [{ type: "text", text: "utmco answer" }], stopReason: "stop" });
+      },
+    },
+    async dispose() {},
+  };
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime: {
+      kind: "embedded-pi-sdk",
+      project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      createSessionRuntime: async () => runtime,
+    } as unknown as EmbeddedPiRuntimeBoundary,
+    logger: createLogger({ sink() {} }),
+  });
+  const source = message({ id: "msg_radar", body: "review the plan", channelId: "chn_radar" });
+  setup.messages.set(source.id, source);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200", channelId: "chn_radar" }));
+  await service.waitForIdle();
+
+  assert.deepEqual(prompts, ["review the plan"]);
+  assert.equal(service.state.getBinding("channel", "chn_radar" as never)?.projectAlias, "utmco");
+  assert.equal(service.state.getBinding("channel", "chn_radar" as never)?.invocationMode, "always");
+  assert.ok(setup.sent.some((item) => item.id === "chn_radar" && item.body === "utmco answer"));
+  service.stop();
 });
 
 test("project command switches projects, archives the old session, and unmentioned channel text stays ignored", async () => {

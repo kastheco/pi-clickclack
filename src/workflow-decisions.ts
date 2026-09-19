@@ -32,6 +32,8 @@ export type WorkflowDecisionClient = {
   clientId: string;
   hostIdentity?: string;
   ensureAvailable(): Promise<unknown>;
+  /** Resolves host-managed artifact references embedded in interaction contracts. */
+  hydrateContent?(runId: string, value: unknown): Promise<unknown>;
   watchSession(
     sessionId: string,
     listener: (event: unknown) => void,
@@ -177,6 +179,8 @@ export class WorkflowDecisionWatcher {
   private activeRequestId: string | undefined;
   private activeConsume: Promise<void> | undefined;
   private pendingInteractions: readonly WorkflowInteractiveRequest[] | undefined;
+  /** Decision revisions still pending in the newest session view. */
+  private pendingDecisionKeys = new Set<string>();
   private activePresentation: { key: string; abort: AbortController } | undefined;
   private readonly presented = new Set<string>();
   private generation = 0;
@@ -208,6 +212,7 @@ export class WorkflowDecisionWatcher {
     this.generation += 1;
     this.activePresentation?.abort.abort("stopped");
     this.pendingInteractions = undefined;
+    this.pendingDecisionKeys.clear();
     const activeConsume = this.activeConsume;
     if (activeConsume !== undefined) await activeConsume;
     this.activeRequestId = undefined;
@@ -220,9 +225,15 @@ export class WorkflowDecisionWatcher {
     interactions: readonly WorkflowInteractiveRequest[],
     generation: number,
   ): void {
+    const pendingDecisionKeys = new Set(interactions.flatMap((interaction) =>
+      interaction.kind === "decision" && interaction.status === "pending"
+        ? [`${interaction.requestId}:${interaction.revision}`]
+        : []
+    ));
     const active = this.activePresentation;
-    if (active && !interactions.some(interaction => interaction.kind === "decision" && interaction.status === "pending" && `${interaction.requestId}:${interaction.revision}` === active.key)) active.abort.abort("stale");
+    if (active && !pendingDecisionKeys.has(active.key)) active.abort.abort("stale");
     if (generation !== this.generation) return;
+    this.pendingDecisionKeys = pendingDecisionKeys;
     this.pendingInteractions = interactions;
     this.startConsumeLoop();
   }
@@ -254,7 +265,18 @@ export class WorkflowDecisionWatcher {
       if (interaction.status !== "pending") continue;
       const key = `${interaction.requestId}:${interaction.revision}`;
       if (this.presented.has(key)) continue;
-      const decision = decisionForOperator(interaction);
+
+      let contract = interaction.contract;
+      try {
+        contract = await this.options.client.hydrateContent?.(interaction.runId, contract) ?? contract;
+      } catch (error) {
+        this.options.onError?.(error);
+        continue;
+      }
+      // Hydration can cross an event boundary. Never present a revision that
+      // disappeared from the newest session view while its artifact was read.
+      if (generation !== this.generation || !this.pendingDecisionKeys.has(key)) continue;
+      const decision = decisionForOperator({ ...interaction, contract });
       if (decision === undefined) continue;
 
       this.activeRequestId = interaction.requestId;

@@ -3,8 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "pi-clickclack-persona": "./scripts/add-persona.mjs"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "persona:add": "node scripts/add-persona.mjs",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "service:install": "node scripts/install-user-service.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",

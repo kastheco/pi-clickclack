@@ -31,6 +31,7 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 
 - Each bound ClickClack channel or direct conversation owns one persistent Pi session.
 - Each conversation binds to one configured project alias.
+- A project-persona deployment runs one bot token, one project alias, and one SQLite state file per service instance. Multiple persona services may share the ClickClack workspace but never their bot identity or bridge state.
 - Each project alias resolves to an approved absolute working directory.
 - Pi resource discovery starts from that working directory, including project context, skills, extensions, prompts, and settings.
 - New turns are serialized within a conversation. Different conversations may run concurrently.
@@ -56,7 +57,7 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 - Tool activity persists as `agent_tool` messages.
 - Durable activity for one response shares a ClickClack `turn_id` and renders as one collapsible preamble.
 - The final answer is a normal durable ClickClack message with a deterministic nonce.
-- Hidden model thinking is never sent to ClickClack.
+- Pi's intermediate prose streams as commentary before tool batches by default; `/reasoning off` drops it per conversation. Terse provider reasoning summaries stay hidden.
 
 ## Interactive requests
 
@@ -77,6 +78,7 @@ The bridge publishes its complete supported command menu through ClickClack's bo
 - `/session` shows session, usage, and context statistics.
 - `/model [provider/model]` shows or selects the session model.
 - `/thinking [level]` shows or selects the thinking level.
+- `/reasoning [stream|off]` shows or selects whether Pi's intermediate working commentary streams into the conversation.
 - `/reload` reloads Pi extensions, skills, prompts, and context files.
 - `/copy` sends the latest assistant answer as a new ClickClack message.
 
@@ -126,7 +128,7 @@ Startup archives interrupted Pi session references, removes pending interactive 
 - Thread-specific routing.
 - Public packaging, release automation, or compatibility guarantees.
 - Full Pi command parity.
-- Raw model-thinking exposure.
+- Provider reasoning summaries or hidden chain-of-thought. The bridge streams Pi's ordinary intermediate commentary instead.
 - Token-by-token growth inside a durable timeline message bubble.
 - Process-per-session isolation or an RPC transport backend.
 - Cross-machine or hosted deployment.

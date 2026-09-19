@@ -4,7 +4,7 @@ import test from "node:test";
 import { TurnActivity, type ActivityTransport } from "./activity.js";
 import type { GitActivityRecord } from "./git-activity.js";
 
-function fixture() {
+function fixture(options: { reasoning?: "stream" | "off" } = {}) {
   const created: Array<{ kind: string; body: string; turnId: string }> = [];
   const nonces: string[] = [];
   const updated: Array<{ messageId: string; body: string }> = [];
@@ -27,6 +27,7 @@ function fixture() {
     source: { channel_id: "chn_1" },
     transport,
     flushMs: 0,
+    ...(options.reasoning ? { reasoning: options.reasoning } : {}),
   });
   return { activity, created, nonces, updated, progress };
 }
@@ -82,7 +83,44 @@ test("keeps the final assistant answer out of the activity preamble", async () =
   assert.deepEqual(created, []);
 });
 
-test("never publishes hidden thinking through durable or ephemeral activity", async () => {
+test("streams intermediate prose instead of provider reasoning summaries", async () => {
+  const { activity, created, updated, progress } = fixture();
+
+  activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
+  activity.handle({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "**Planning terse status**" },
+  });
+  activity.handle({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "**Planning terse status**" },
+  });
+  activity.handle({
+    type: "message_update",
+    assistantMessageEvent: {
+      type: "text_delta",
+      delta: "i found the boundary. i’m checking the caller before changing it.",
+    },
+  });
+  activity.handle({ type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: { path: "src/a.ts" } });
+  await activity.finalize();
+
+  assert.deepEqual(created.map((row) => [row.kind, row.body]), [
+    ["agent_commentary", "i found the boundary. i’m checking the caller before changing it."],
+    ["agent_tool", created[1]?.body],
+  ]);
+  assert.deepEqual(updated, []);
+  assert.deepEqual(
+    progress.filter((entry) => entry.line?.kind === "commentary").map((entry) => [entry.op, entry.line?.text, entry.line?.status]),
+    [
+      ["append", "i found the boundary. i’m checking the caller before changing it.", undefined],
+      ["finalize", "i found the boundary. i’m checking the caller before changing it.", "done"],
+    ],
+  );
+  assert.equal(progress.some((entry) => entry.line?.kind === "thinking"), false);
+});
+
+test("never publishes provider thinking summaries", async () => {
   const { activity, created, updated, progress } = fixture();
 
   activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -99,6 +137,21 @@ test("never publishes hidden thinking through durable or ephemeral activity", as
   assert.deepEqual(created, []);
   assert.deepEqual(updated, []);
   assert.deepEqual(progress, []);
+});
+
+test("reasoning off suppresses intermediate prose", async () => {
+  const { activity, created, progress } = fixture({ reasoning: "off" });
+
+  activity.handle({ type: "message_start", message: { role: "assistant", content: [] } });
+  activity.handle({
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", delta: "i’m checking the caller before changing it." },
+  });
+  activity.handle({ type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: { path: "src/a.ts" } });
+  await activity.finalize();
+
+  assert.deepEqual(created.map((row) => row.kind), ["agent_tool"]);
+  assert.equal(progress.some((entry) => entry.line?.kind === "commentary"), false);
 });
 
 test("streams throttled text and tool lifecycle as targeted progress", async () => {

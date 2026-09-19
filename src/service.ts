@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 
-import type { AgentProgressPayload, BotCommandInput, Message, MessageInput, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
+import type { AgentProgressPayload, BotCommandInput, Channel, Message, MessageInput, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
 import {
   resolveCliModel,
   type AgentSessionRuntime,
@@ -13,7 +13,13 @@ import {
   type PromptOptions,
 } from "@earendil-works/pi-coding-agent";
 
-import { TurnActivity, type ActivityTransport } from "./activity.js";
+import {
+  TurnActivity,
+  defaultReasoningVisibility,
+  reasoningVisibilities,
+  type ActivityTransport,
+  type ReasoningVisibility,
+} from "./activity.js";
 import {
   botCommandMenu,
   isPiResourceCommand,
@@ -176,6 +182,10 @@ export class BridgeService {
   private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
+  /** Channels visually owned by this bot persona invoke it without a mention. */
+  private readonly assignedChannelIds = new Set<string>();
+  /** Per-binding `/reasoning` visibility; unset bindings stream Pi's working commentary. */
+  private readonly reasoningVisibility = new Map<number, ReasoningVisibility>();
   private readonly notepadRevisions = new Map<number, number>();
   private readonly notepadTasks = new Map<number, TodoTask[]>();
   private readonly notepadPublications = new Map<number, Promise<void>>();
@@ -218,6 +228,7 @@ export class BridgeService {
 
     this.identity = identity;
     this.workspace = workspace;
+    await this.refreshAssignedChannels();
     if (this.clickClack.workflowRuns !== undefined && this.workflowClient !== undefined) {
       const hostIdentity = this.workflowClient()?.hostIdentity;
       if (!hostIdentity?.trim()) throw new Error("Missing stable workflow host identity");
@@ -498,7 +509,9 @@ export class BridgeService {
 
   private async processEvent(event: RealtimeEvent): Promise<void> {
     if (event.workspace_id !== this.config.clickClack.workspaceId) return;
-    if (event.type === "message.created") {
+    if (event.type === "channel.bot_assignment_updated") {
+      await this.refreshAssignedChannels();
+    } else if (event.type === "message.created") {
       const messageId = textField(event.payload.message_id);
       if (messageId) {
         const message = await this.clickClack.messages.get(messageId);
@@ -837,6 +850,10 @@ export class BridgeService {
       await this.handleInvokeCommand(binding, source, invocation.args);
       return;
     }
+    if (command === "reasoning") {
+      await this.handleReasoningCommand(binding, source, invocation.args);
+      return;
+    }
     try {
       const runtime = await this.runtimeFor(binding);
       switch (command) {
@@ -1111,6 +1128,7 @@ export class BridgeService {
         projectCwd: this.piRuntime.project(binding.projectAlias).cwd,
         projectAlias: binding.projectAlias,
         sessionId: runtime.session.sessionId,
+        reasoning: this.reasoningVisibility.get(binding.id) ?? defaultReasoningVisibility,
         transport: this.activityTransport(source),
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
       });
@@ -1458,8 +1476,15 @@ export class BridgeService {
     decision: ClaimedWorkflowDecision,
     signal: AbortSignal,
   ): Promise<DecisionAnswer | undefined> {
+    // A workflow can park while the Pi turn that launched it is still writing
+    // its final reply. The first publication keeps genuinely blocking mid-turn
+    // decisions answerable. If conversation work was active, a second
+    // nonce-deduplicated publication after that work settles makes the still-
+    // pending decision newest again instead of leaving disabled controls above
+    // the turn's final reply.
+    const activeConversationWork = this.conversationQueues.get(binding.id);
     const source = this.conversationSources.get(binding.id);
-    if (source === undefined) return undefined;
+    if (source === undefined || signal.aborted) return undefined;
 
     let resolveAnswer!: (answer: DecisionAnswer | undefined) => void;
     const answer = new Promise<DecisionAnswer | undefined>((resolve) => {
@@ -1481,18 +1506,26 @@ export class BridgeService {
       const hostIdentity = this.workflowClient?.()?.hostIdentity;
       if (!hostIdentity || !this.identity?.id) throw new Error("Decision publication requires stable host and producer identity");
       const turnId = decisionTurnId(decision.requestId, decision.revision);
+      const target = { type: binding.conversationType, id: binding.conversationId } as const;
+      const publicationNonce = decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision });
       const message = {
         kind: "agent_commentary" as const,
         body: renderDecisionPrompt(decision),
         turn_id: turnId,
-        nonce: decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision }),
+        nonce: publicationNonce,
       };
-      await this.sendDurableMessage(
-        { type: binding.conversationType, id: binding.conversationId },
-        message,
-        "agent_commentary",
-        toTurnId(turnId),
-      );
+      await this.sendDurableMessage(target, message, "agent_commentary", toTurnId(turnId));
+
+      if (activeConversationWork !== undefined) {
+        void this.refreshDecisionAfterConversationWork(
+          binding,
+          presentation,
+          activeConversationWork,
+          target,
+          { ...message, nonce: `${publicationNonce}-after-turn` },
+          signal,
+        );
+      }
     } catch (error) {
       signal.removeEventListener("abort", cancel);
       if (this.presentedDecisions.get(binding.id) === presentation) {
@@ -1503,6 +1536,34 @@ export class BridgeService {
     }
 
     try { return await answer; } finally { signal.removeEventListener("abort", cancel); }
+  }
+
+  private async refreshDecisionAfterConversationWork(
+    binding: ConversationBinding,
+    presentation: PresentedDecision,
+    initialWork: Promise<void>,
+    target: ConversationTarget,
+    message: MessageInput & { nonce: string },
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      let work = initialWork;
+      for (;;) {
+        await work;
+        if (signal.aborted || this.presentedDecisions.get(binding.id) !== presentation) return;
+        const newerWork = this.conversationQueues.get(binding.id);
+        if (newerWork === undefined || newerWork === work) break;
+        work = newerWork;
+      }
+      await this.sendDurableMessage(
+        target,
+        message,
+        "agent_commentary",
+        toTurnId(message.turn_id ?? ""),
+      );
+    } catch (error) {
+      this.logger.warn("workflow decision refresh failed", { bindingId: binding.id, error });
+    }
   }
 
   private async presentInteraction(
@@ -1804,7 +1865,7 @@ export class BridgeService {
     binding: ConversationBinding | undefined,
   ): boolean {
     if (target.type === "direct") return true;
-    if (binding?.invocationMode === "always") return true;
+    if (binding?.invocationMode === "always" || (!binding && this.assignedChannelIds.has(target.id))) return true;
     return Boolean(this.identity && event.mentioned_user_ids?.includes(this.identity.id));
   }
 
@@ -1847,11 +1908,58 @@ export class BridgeService {
     await this.sendReply(source, `invocation set to \`${updated.invocationMode}\`; ${describe(updated.invocationMode)}.`, nonce);
   }
 
+  private async handleReasoningCommand(binding: ConversationBinding, source: Message, args: string): Promise<void> {
+    const nonce = `pi-command-${source.id}`;
+    const requested = args.trim().toLowerCase();
+    const describe = (mode: ReasoningVisibility) =>
+      mode === "stream" ? "Pi's working commentary streams before tools" : "Pi's working commentary stays hidden";
+    if (!requested) {
+      const current = this.reasoningVisibility.get(binding.id) ?? defaultReasoningVisibility;
+      await this.sendReply(source, `reasoning: \`${current}\`; ${describe(current)}.`, nonce);
+      return;
+    }
+    if (!reasoningVisibilities.includes(requested as ReasoningVisibility)) {
+      await this.sendReply(source, "usage: `/reasoning [stream|off]`", nonce);
+      return;
+    }
+    const mode = requested as ReasoningVisibility;
+    this.reasoningVisibility.set(binding.id, mode);
+    await this.sendReply(source, `reasoning set to \`${mode}\`; ${describe(mode)}.`, nonce);
+  }
+
   private invocationMode(target: ConversationTarget): InvocationMode {
     if (target.type === "direct") return "auto";
+    if (this.assignedChannelIds.has(target.id)) return "always";
     return this.config.invocationBindings.find(
       (candidate) => candidate.conversationType === target.type && candidate.conversationId === target.id,
     )?.mode ?? "mention";
+  }
+
+  private async refreshAssignedChannels(): Promise<void> {
+    if (!this.identity) return;
+    const channels = await this.clickClack.channels.list(this.config.clickClack.workspaceId);
+    const assigned = channels
+      .filter((channel: Channel) => channel.bot_assignments?.some(
+        (assignment) => assignment.bot_user_id === this.identity!.id,
+      ))
+      .map((channel: Channel) => channel.id);
+    const previous = new Set(this.assignedChannelIds);
+    this.assignedChannelIds.clear();
+    assigned.forEach((channelId) => this.assignedChannelIds.add(channelId));
+
+    for (const channelId of new Set([...previous, ...this.assignedChannelIds])) {
+      const wasAssigned = previous.has(channelId);
+      const isAssigned = this.assignedChannelIds.has(channelId);
+      if (wasAssigned === isAssigned) continue;
+      const binding = this.state.getBinding("channel", toConversationId(channelId));
+      if (!binding) continue;
+      this.state.upsertBinding({
+        conversationType: "channel",
+        conversationId: toConversationId(channelId),
+        projectAlias: binding.projectAlias,
+        invocationMode: isAssigned ? "always" : this.invocationMode({ type: "channel", id: channelId }),
+      });
+    }
   }
 
   private async uploadGeneratedFiles(
