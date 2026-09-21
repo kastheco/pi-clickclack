@@ -94,7 +94,8 @@ test(`publishes the current Pi ${failure} error without reusing an earlier answe
 });
 }
 
-test("quarantines an empty Pi session so the next message gets a fresh runtime", async () => {
+for (const scenario of ["empty", "compact-before-answer", "compact-after-answer", "compact-error", "compact-empty"] as const) {
+test(`turn recovery handles ${scenario} without losing current work`, async () => {
   const alias = toProjectAlias("main");
   const config: BridgeConfig = {
     clickClack: {
@@ -159,20 +160,42 @@ test("quarantines an empty Pi session so the next message gets a fresh runtime",
     project: () => ({ alias, cwd: "/tmp" }),
     createSessionRuntime: async () => {
       created += 1;
-      const messages: unknown[] = [];
+      const messages: unknown[] = scenario === "empty" ? [] : Array.from({ length: 20 }, () => ({
+        role: "assistant", content: [{ type: "text", text: "stale work" }], stopReason: "stop",
+      }));
       const empty = created === 1;
+      let calls = 0;
+      let listener: ((event: unknown) => void) | undefined;
       return {
         session: {
           sessionId: empty ? "session-empty" : "session-fresh",
           sessionFile: empty ? "/tmp/session-empty.jsonl" : "/tmp/session-fresh.jsonl",
           messages,
-          subscribe() { return () => {}; },
+          subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
           async prompt() {
-            messages.push(
-              empty
-                ? { role: "assistant", content: [], stopReason: "stop", usage: { totalTokens: 0 } }
-                : { role: "assistant", content: [{ type: "text", text: "fresh answer" }], stopReason: "stop" },
-            );
+            calls += 1;
+            if (scenario !== "empty" && empty && calls === 1) {
+              const compact = () => messages.splice(0, messages.length, {
+                role: "compactionSummary", summary: "current work, not stale work",
+              });
+              if (scenario !== "compact-after-answer") compact();
+              const answer = {
+                role: "assistant",
+                content: scenario === "compact-empty" || scenario === "compact-error"
+                  ? [] : [{ type: "text", text: "current answer" }],
+                stopReason: scenario === "compact-error" ? "error" : "stop",
+                ...(scenario === "compact-error" ? { errorMessage: "provider failed after compaction" } : {}),
+              };
+              messages.push(answer);
+              listener?.({ type: "message_end", message: answer });
+              if (scenario === "compact-after-answer") compact();
+              return;
+            }
+            const answer = empty && scenario === "empty"
+              ? { role: "assistant", content: [], stopReason: "stop", usage: { totalTokens: 0 } }
+              : { role: "assistant", content: [{ type: "text", text: "fresh answer" }], stopReason: "stop" };
+            messages.push(answer);
+            listener?.({ type: "message_end", message: answer });
           },
         },
         async dispose() { disposed += 1; },
@@ -191,14 +214,22 @@ test("quarantines an empty Pi session so the next message gets a fresh runtime",
   onEvent?.(messageEvent("evt_fresh", "cur_201", "msg_fresh"));
   await service.waitForIdle();
 
-  assert.deepEqual(sent, [
-    "pi's session stopped responding, so it was reset. send that again.",
-    "fresh answer",
-  ]);
-  assert.equal(created, 2);
-  assert.equal(disposed, 1);
+  if (scenario === "empty" || scenario === "compact-empty") {
+    assert.match(sent[0] ?? "", /session stopped responding/u);
+    assert.equal(created, 2);
+    assert.equal(disposed, 1);
+  } else {
+    if (scenario === "compact-error") assert.match(sent[0] ?? "", /provider failed after compaction/u);
+    else assert.equal(sent[0], "current answer");
+    assert.equal(created, 1, "compaction must not archive the current session");
+    assert.equal(disposed, 0);
+    assert.equal(sent[1], "fresh answer");
+  }
+  assert.equal(sent.length, 2);
+  assert.doesNotMatch(sent.join("\n"), /stale work/u);
   service.stop();
 });
+}
 
 function messageEvent(id: string, cursor: string, messageId: string): RealtimeEvent {
   return {

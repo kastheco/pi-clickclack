@@ -110,7 +110,8 @@ type ActiveSessionTurn = {
   activity: TurnActivity;
   unconsumedSteering: Set<MessageId>;
   session: AgentSessionRuntime["session"];
-  messageStart: number;
+  messagesBefore: readonly unknown[];
+  latestAssistant: unknown;
   unsubscribe: (() => void) | undefined;
 };
 
@@ -1137,7 +1138,8 @@ export class BridgeService {
         activity,
         unconsumedSteering: new Set(),
         session: runtime.session,
-        messageStart: runtime.session.messages.length,
+        messagesBefore: [...runtime.session.messages],
+        latestAssistant: undefined,
         unsubscribe: undefined,
       };
       this.activeSessionTurns.set(binding.id, activeSessionTurn);
@@ -1160,8 +1162,15 @@ export class BridgeService {
         activeSessionTurn.unsubscribe?.();
         activeSessionTurn.unsubscribe = undefined;
       }
+      // Compaction rebuilds session.messages, so a pre-turn array offset can
+      // skip the answer entirely. Completed message events belong to this turn
+      // even when its reply has already been compacted out of the live history.
+      const { latestAssistant, messagesBefore, session } = activeSessionTurn;
+      const messages = session.messages;
+      const unchangedPrefix = messagesBefore.every((message, index) => messages[index] === message);
       const answer = finalAssistantText(
-        activeSessionTurn.session.messages.slice(activeSessionTurn.messageStart),
+        latestAssistant !== undefined ? [latestAssistant]
+          : unchangedPrefix ? messages.slice(messagesBefore.length) : [],
         options.allowNoAssistant,
       );
       const finalBody = answer ?? options.noAssistantReply ?? "Pi command completed.";
@@ -1747,8 +1756,12 @@ export class BridgeService {
     if (!activeTurn) return;
     activeTurn.unsubscribe?.();
     activeTurn.session = session;
-    activeTurn.messageStart = session.messages.length;
+    activeTurn.messagesBefore = [...session.messages];
+    activeTurn.latestAssistant = undefined;
     activeTurn.unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") {
+        activeTurn.latestAssistant = event.message;
+      }
       if (event.type === "message_start") {
         const sourceId = this.steeringMessages.get(event.message);
         if (sourceId) {
