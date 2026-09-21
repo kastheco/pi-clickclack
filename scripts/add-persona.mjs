@@ -99,6 +99,7 @@ export function renderPersonaEnvironment(values, token) {
     `CLICKCLACK_BOT_TOKEN=${token}`,
     `CLICKCLACK_OWNER_IDS=${values.owner}`,
     `CLICKCLACK_PI_PROJECTS=${JSON.stringify([{ alias: values.alias, cwd: values.project }])}`,
+    `PI_WORKSPACE_DIR=${values.project}`,
     "CLICKCLACK_PI_INVOCATIONS=[]",
     `CLICKCLACK_PI_MODEL=${values.model}`,
     `CLICKCLACK_PI_THINKING_LEVEL=${values.thinking}`,

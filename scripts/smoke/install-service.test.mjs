@@ -6,6 +6,7 @@ import {
   personaServiceName,
   quoteSystemd,
   renderServiceUnit,
+  serviceRuntimeConfig,
   validatePersonaEnvironment,
 } from "../install-user-service.mjs";
 
@@ -23,6 +24,16 @@ test("service installer renders absolute runtime and external secret paths", () 
     "WorkingDirectory=/srv/pi\\x20clickclack",
     'ExecStart="/opt/node/bin/node" "--env-file=/home/user/.config/pi-clickclack/env" "/srv/pi clickclack/dist/index.js"',
   ].join("\n"));
+});
+
+test("persona services pin process-level extensions to the configured project", () => {
+  assert.deepEqual(serviceRuntimeConfig(
+    "/srv/pi-clickclack",
+    { alias: "clickclack", cwd: "/home/user/dev/clickclack" },
+  ), { workingDirectory: "/home/user/dev/clickclack" });
+  assert.deepEqual(serviceRuntimeConfig("/srv/pi-clickclack"), {
+    workingDirectory: "/srv/pi-clickclack",
+  });
 });
 
 test("service installer rejects control characters and unresolved fields", () => {
@@ -56,4 +67,9 @@ test("persona installs require one project and an explicit isolated state path",
     'CLICKCLACK_PI_PROJECTS=[{"alias":"clickclack","cwd":"/home/user/dev/clickclack"}]',
     "CLICKCLACK_PI_STATE_PATH=/tmp/persona.sqlite",
   ].join("\n"), "other"), /persona other must configure project alias other/u);
+  assert.throws(() => validatePersonaEnvironment([
+    'CLICKCLACK_PI_PROJECTS=[{"alias":"clickclack","cwd":"/home/user/dev/clickclack"}]',
+    "CLICKCLACK_PI_STATE_PATH=/tmp/persona.sqlite",
+    "PI_WORKSPACE_DIR=/home/user/dev/pi-clickclack",
+  ].join("\n"), "clickclack"), /PI_WORKSPACE_DIR must match/u);
 });

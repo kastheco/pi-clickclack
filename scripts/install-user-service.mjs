@@ -44,7 +44,15 @@ export function validatePersonaEnvironment(contents, expectedAlias) {
   const statePath = environment.get("CLICKCLACK_PI_STATE_PATH");
   if (!statePath) throw new Error("CLICKCLACK_PI_STATE_PATH is required for a persona service");
   if (!isAbsolute(statePath)) throw new Error("CLICKCLACK_PI_STATE_PATH must be absolute for a persona service");
+  const workspaceDir = environment.get("PI_WORKSPACE_DIR");
+  if (workspaceDir && workspaceDir !== project.cwd) {
+    throw new Error("PI_WORKSPACE_DIR must match the persona project cwd");
+  }
   return { alias: project.alias, cwd: project.cwd };
+}
+
+export function serviceRuntimeConfig(repo, personaProject) {
+  return { workingDirectory: personaProject?.cwd ?? repo };
 }
 
 export function renderServiceUnit(template, values) {
@@ -94,13 +102,16 @@ async function main() {
   if (pathInside(repo, envPath)) throw new Error("the service environment file must live outside the repository");
   const envStat = await stat(envPath).catch(() => undefined);
   if (!envStat?.isFile()) throw new Error(`service environment file is missing: ${envPath}`);
-  if (options.persona) validatePersonaEnvironment(await readFile(envPath, "utf8"), options.persona);
+  const personaProject = options.persona
+    ? validatePersonaEnvironment(await readFile(envPath, "utf8"), options.persona)
+    : undefined;
+  const runtimeConfig = serviceRuntimeConfig(repo, personaProject);
 
   const templatePath = new URL("../systemd/pi-clickclack.service.in", import.meta.url);
   const template = await readFile(templatePath, "utf8");
   const unit = renderServiceUnit(template, {
     DESCRIPTION: options.persona ? `Pi ClickClack project persona: ${options.persona}` : "Pi ClickClack bridge",
-    WORKING_DIRECTORY: repo,
+    WORKING_DIRECTORY: runtimeConfig.workingDirectory,
     ENV_ARGUMENT: `--env-file=${envPath}`,
     NODE_EXECUTABLE: process.execPath,
     ENTRYPOINT: entrypoint,

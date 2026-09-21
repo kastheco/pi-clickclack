@@ -75,6 +75,7 @@ test("persona CLI writes one isolated project without exposing extra identities"
   const environment = renderPersonaEnvironment(persona, "ccb_secret");
   assert.match(environment, /CLICKCLACK_BOT_TOKEN=ccb_secret/u);
   assert.ok(environment.includes('CLICKCLACK_PI_PROJECTS=[{"alias":"utmco","cwd":"/home/kas/dev/utmco"}]'));
+  assert.ok(environment.includes("PI_WORKSPACE_DIR=/home/kas/dev/utmco"));
   assert.ok(environment.includes("CLICKCLACK_PI_STATE_PATH=/home/kas/.local/state/pi-clickclack/utmco.sqlite"));
   assert.doesNotMatch(environment, /утмсо/u);
   assert.throws(() => renderPersonaEnvironment(persona, "not-a-token"), /valid bot token/u);
