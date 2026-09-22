@@ -1062,7 +1062,14 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
     data: Buffer.from("PNGDATA").toString("base64"),
     mimeType: "image/png",
   }]);
-  assert.deepEqual(setup.sent, [{ target: "direct", id: "dm_1", body: "seen" }]);
+  assert.deepEqual(setup.sent, [
+    {
+      target: "direct",
+      id: "dm_1",
+      body: "pi resumed work after an external event and is still running. your message is queued and will start when it finishes.",
+    },
+    { target: "direct", id: "dm_1", body: "seen" },
+  ]);
   service.stop();
 });
 
@@ -1706,12 +1713,13 @@ test("Pi host commands compact, name, and replace the bound session without reac
   assert.deepEqual(workflow.stopped, ["session-1", "session-2"]);
 });
 
-test("extension slash commands wait for autonomous session work before opening their turn", async () => {
+test("extension slash commands report UI notifications after waiting for autonomous work", async () => {
   const setup = fixture();
   const receivedPrompts: string[] = [];
   const lifecycle: string[] = [];
   let idle = false;
   let listener: ((event: unknown) => void) | undefined;
+  let notify: ((message: string) => void) | undefined;
   const session = {
     sessionId: "session-1",
     sessionFile: "/tmp/session-1.jsonl",
@@ -1720,8 +1728,12 @@ test("extension slash commands wait for autonomous session work before opening t
     promptTemplates: [] as Array<{ name: string }>,
     resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
     extensionRunner: {
-      getCommand: (name: string) => name === "review" ? {} : undefined,
-      getRegisteredCommands: () => [{ invocationName: "review", description: "Review project changes" }],
+      getCommand: (name: string) => name === "fast" ? {} : undefined,
+      getRegisteredCommands: () => [{ invocationName: "fast", description: "Toggle OpenAI fast mode" }],
+      getUIContext: () => ({}),
+    },
+    async bindExtensions(bindings: { uiContext?: { notify(message: string): void } }) {
+      notify = bindings.uiContext?.notify;
     },
     subscribe(next: (event: unknown) => void) {
       listener = next;
@@ -1748,6 +1760,7 @@ test("extension slash commands wait for autonomous session work before opening t
       assert.equal(idle, true);
       lifecycle.push("prompt");
       receivedPrompts.push(text);
+      notify?.("OpenAI fast mode: on.");
     },
   };
   const runtime = { session, async dispose() {} };
@@ -1767,24 +1780,121 @@ test("extension slash commands wait for autonomous session work before opening t
     projectAlias: toProjectAlias("main"),
     invocationMode: "auto",
   });
-  const review = message({ id: "msg_review", body: "/review src/service.ts", directConversationId: "dcn_1" });
+  const fast = message({ id: "msg_fast", body: "/fast", directConversationId: "dcn_1" });
   const unknown = message({ id: "msg_unknown", body: "/not-a-command", directConversationId: "dcn_1" });
-  setup.messages.set(review.id, review);
+  setup.messages.set(fast.id, fast);
   setup.messages.set(unknown.id, unknown);
 
   await service.start();
-  setup.emit(createdEvent({ messageId: review.id, cursor: "cur_200" }));
+  setup.emit(createdEvent({ messageId: fast.id, cursor: "cur_200" }));
   setup.emit(createdEvent({ messageId: unknown.id, cursor: "cur_300" }));
   await service.waitForIdle();
 
-  assert.deepEqual(receivedPrompts, ["/review src/service.ts"]);
+  assert.deepEqual(receivedPrompts, ["/fast"]);
   assert.deepEqual(lifecycle, ["wait", "prompt", "wait"]);
   assert.deepEqual(setup.activity, []);
-  assert.ok(setup.commandMenu.some((command) => command.command === "review"));
+  assert.ok(setup.commandMenu.some((command) => command.command === "fast"));
   assert.deepEqual(setup.sent.map((row) => row.body), [
-    "Pi command `/review` completed.",
+    "pi resumed work after an external event and is still running. your message is queued and will start when it finishes.",
+    "OpenAI fast mode: on.",
     "unknown Pi command `/not-a-command`.",
   ]);
+  service.stop();
+});
+
+test("adopts a background completion run that starts after the visible turn closes", async () => {
+  const setup = fixture();
+  const listeners = new Set<(event: AgentSessionEvent) => void>();
+  const messages: unknown[] = [];
+  let idle = true;
+  let releaseBackground!: () => void;
+  let backgroundGate = Promise.resolve();
+  const steered: string[] = [];
+  const emit = (event: AgentSessionEvent) => {
+    for (const listener of listeners) listener(event);
+  };
+  const assistant = (text: string) => ({
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    stopReason: "stop" as const,
+  });
+  const runtime = {
+    session: {
+      sessionId: "session-background",
+      sessionFile: "/tmp/session-background.jsonl",
+      messages,
+      get isIdle() { return idle; },
+      get isStreaming() { return !idle; },
+      promptTemplates: [] as Array<{ name: string }>,
+      resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
+      extensionRunner: { getRegisteredCommands: () => [] },
+      subscribe(listener: (event: AgentSessionEvent) => void) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      agent: {
+        steer(message: object) {
+          queueMicrotask(() => emit({ type: "message_start", message } as AgentSessionEvent));
+        },
+      },
+      async steer(text: string) {
+        steered.push(text);
+        this.agent.steer({ role: "user", content: [{ type: "text", text }] });
+      },
+      getSteeringMessages() { return []; },
+      async waitForIdle() {
+        if (!idle) await backgroundGate;
+      },
+      async prompt() {
+        const reply = assistant("initial answer");
+        emit({ type: "agent_start" } as AgentSessionEvent);
+        emit({ type: "message_end", message: reply } as AgentSessionEvent);
+        messages.push(reply);
+        emit({ type: "agent_end" } as AgentSessionEvent);
+      },
+    },
+    async dispose() {},
+  };
+  const piRuntime = {
+    kind: "embedded-pi-sdk" as const,
+    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    createSessionRuntime: async () => runtime,
+  } as unknown as EmbeddedPiRuntimeBoundary;
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack,
+    piRuntime,
+    logger: createLogger({ sink() {} }),
+  });
+  const source = message({ id: "msg_background", body: "run the tests", directConversationId: "dm_background" });
+  setup.messages.set(source.id, source);
+
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
+  await service.waitForIdle();
+  assert.deepEqual(setup.sent.map((row) => row.body), ["initial answer"]);
+
+  idle = false;
+  backgroundGate = new Promise<void>((resolve) => { releaseBackground = resolve; });
+  const completed = assistant("background tests passed");
+  emit({ type: "agent_start" } as AgentSessionEvent);
+
+  const correction = message({ id: "msg_background_correction", body: "include the integration tests", directConversationId: "dm_background" });
+  setup.messages.set(correction.id, correction);
+  setup.emit(createdEvent({ messageId: correction.id, cursor: "cur_201" }));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(steered, ["include the integration tests"]);
+
+  emit({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as AgentSessionEvent);
+  emit({ type: "message_update", message: completed, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "background tests passed" } } as AgentSessionEvent);
+  emit({ type: "message_end", message: completed } as AgentSessionEvent);
+  messages.push(completed);
+  idle = true;
+  emit({ type: "agent_end" } as AgentSessionEvent);
+  releaseBackground();
+  await service.waitForIdle();
+
+  assert.deepEqual(setup.sent.map((row) => row.body), ["initial answer", "background tests passed"]);
+  assert.equal(service.state.listActiveTurns().length, 0);
   service.stop();
 });
 

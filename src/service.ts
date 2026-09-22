@@ -7,6 +7,7 @@ import { basename, extname, isAbsolute, join, relative, resolve } from "node:pat
 import type { AgentProgressPayload, BotCommandInput, Channel, Message, MessageInput, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
 import {
   resolveCliModel,
+  type AgentSessionEvent,
   type AgentSessionRuntime,
   type ExtensionUIDialogOptions,
   type ExtensionUIContext,
@@ -106,12 +107,14 @@ const shareableGeneratedExtensions = new Set([
 ]);
 
 type ActiveSessionTurn = {
+  kind: "managed" | "autonomous";
   turnId: TurnId;
   activity: TurnActivity;
   unconsumedSteering: Set<MessageId>;
   session: AgentSessionRuntime["session"];
   messagesBefore: readonly unknown[];
   latestAssistant: unknown;
+  notifications: string[];
   unsubscribe: (() => void) | undefined;
 };
 
@@ -169,6 +172,10 @@ export class BridgeService {
   private steeringNotices: Promise<void> = Promise.resolve();
   private readonly runtimes = new Map<number, AgentSessionRuntime>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
+  private readonly sessionObservers = new Map<number, {
+    session: AgentSessionRuntime["session"];
+    unsubscribe: () => void;
+  }>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
   private readonly workflowSessionIds = new Map<number, string>();
   /** Timed-out watcher detaches that shutdown must still account for. */
@@ -362,8 +369,10 @@ export class BridgeService {
     ]);
     const cleanup = [
       ...[...workflowBindings].map(async (bindingId) => await this.stopWorkflowObservation(bindingId)),
+      ...[...this.sessionObservers.values()].map(async ({ unsubscribe }) => unsubscribe()),
       ...[...this.runtimes.values()].map(async (runtime) => await runtime.dispose()),
     ];
+    this.sessionObservers.clear();
     this.workflowSessionIds.clear();
     this.conversationSources.clear();
     this.runtimes.clear();
@@ -798,6 +807,7 @@ export class BridgeService {
     if (previous && previous.projectAlias !== alias) {
       await this.stopWorkflowObservation(previous.id);
       const runtime = this.runtimes.get(previous.id);
+      this.unbindSessionObserver(previous.id);
       if (runtime) await runtime.dispose();
       this.runtimes.delete(previous.id);
       this.state.archiveActivePiSession(previous.id);
@@ -828,6 +838,7 @@ export class BridgeService {
 
     await this.stopWorkflowObservation(binding.id);
     const cached = this.runtimes.get(binding.id);
+    this.unbindSessionObserver(binding.id);
     if (cached) await cached.dispose();
     this.runtimes.delete(binding.id);
     if (reference.archivedAt) this.state.restorePiSession(binding.id, reference.id);
@@ -1117,7 +1128,14 @@ export class BridgeService {
       // idle barrier so autonomous extension work that starts meanwhile stays
       // outside this ClickClack turn's activity and error boundary.
       const prepared = await this.preparePromptInput(binding, source, prompt);
-      if (runtime.session.isIdle === false) await runtime.session.waitForIdle();
+      if (runtime.session.isIdle === false) {
+        await this.sendReply(
+          source,
+          "pi resumed work after an external event and is still running. your message is queued and will start when it finishes.",
+          `pi-queued-${source.id}`,
+        );
+        await runtime.session.waitForIdle();
+      }
       this.state.startActiveTurn({
         turnId,
         bindingId: binding.id,
@@ -1134,12 +1152,14 @@ export class BridgeService {
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
       });
       activeSessionTurn = {
+        kind: "managed",
         turnId,
         activity,
         unconsumedSteering: new Set(),
         session: runtime.session,
         messagesBefore: [...runtime.session.messages],
         latestAssistant: undefined,
+        notifications: [],
         unsubscribe: undefined,
       };
       this.activeSessionTurns.set(binding.id, activeSessionTurn);
@@ -1173,7 +1193,10 @@ export class BridgeService {
           : unchangedPrefix ? messages.slice(messagesBefore.length) : [],
         options.allowNoAssistant,
       );
-      const finalBody = answer ?? options.noAssistantReply ?? "Pi command completed.";
+      const notificationBody = activeSessionTurn.notifications.length > 0
+        ? activeSessionTurn.notifications.join("\n\n")
+        : undefined;
+      const finalBody = answer ?? notificationBody ?? options.noAssistantReply ?? "Pi command completed.";
       await activity.finalize();
       const uploads = await this.uploadGeneratedFiles(
         activity,
@@ -1262,6 +1285,7 @@ export class BridgeService {
       });
     }
 
+    this.unbindSessionObserver(binding.id);
     if (runtime) {
       try {
         await runtime.dispose();
@@ -1317,6 +1341,7 @@ export class BridgeService {
       await this.bindRuntimeExtensions(binding, runtime);
     } catch (error) {
       this.runtimes.delete(binding.id);
+      this.unbindSessionObserver(binding.id);
       await runtime.dispose();
       throw error;
     }
@@ -1678,6 +1703,7 @@ export class BridgeService {
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
     const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
       this.queueNotepadPublication(binding, latestTodoTasks(session.messages));
+      this.bindSessionObserver(binding, session);
       if (typeof session.bindExtensions !== "function") return;
       const baseUI = session.extensionRunner.getUIContext?.() ?? ({} as ExtensionUIContext);
       const uiContext: ExtensionUIContext = {
@@ -1701,6 +1727,10 @@ export class BridgeService {
           binding,
           { kind: "editor", title, ...(prefill ? { prefill } : {}) },
         ) as Promise<string | undefined>,
+        notify: (message) => {
+          const activeTurn = this.activeSessionTurns.get(binding.id);
+          if (activeTurn) activeTurn.notifications.push(message);
+        },
       };
       await session.bindExtensions({
         uiContext,
@@ -1759,21 +1789,181 @@ export class BridgeService {
     activeTurn.messagesBefore = [...session.messages];
     activeTurn.latestAssistant = undefined;
     activeTurn.unsubscribe = session.subscribe((event) => {
-      if (event.type === "message_end" && event.message.role === "assistant") {
-        activeTurn.latestAssistant = event.message;
+      this.handleActiveTurnEvent(binding, activeTurn, event);
+    });
+  }
+
+  private unbindSessionObserver(bindingId: number): void {
+    const observer = this.sessionObservers.get(bindingId);
+    if (!observer) return;
+    this.sessionObservers.delete(bindingId);
+    observer.unsubscribe();
+  }
+
+  private bindSessionObserver(
+    binding: ConversationBinding,
+    session: AgentSessionRuntime["session"],
+  ): void {
+    const previous = this.sessionObservers.get(binding.id);
+    if (previous?.session === session) return;
+    previous?.unsubscribe();
+    const unsubscribe = session.subscribe((event) => {
+      const active = this.activeSessionTurns.get(binding.id);
+      if (active?.session === session) {
+        if (active.kind === "autonomous") this.handleActiveTurnEvent(binding, active, event);
+        return;
       }
-      if (event.type === "message_start") {
-        const sourceId = this.steeringMessages.get(event.message);
-        if (sourceId) {
-          activeTurn.unconsumedSteering.delete(sourceId);
-          this.state.consumeSteering(sourceId);
-          this.steeringMessages.delete(event.message);
+      if (event.type !== "agent_start") return;
+      this.adoptAutonomousTurn(binding, session, event);
+    });
+    this.sessionObservers.set(binding.id, { session, unsubscribe });
+  }
+
+  private handleActiveTurnEvent(
+    binding: ConversationBinding,
+    activeTurn: ActiveSessionTurn,
+    event: AgentSessionEvent,
+  ): void {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      activeTurn.latestAssistant = event.message;
+    }
+    if (event.type === "message_start") {
+      const sourceId = this.steeringMessages.get(event.message);
+      if (sourceId) {
+        activeTurn.unconsumedSteering.delete(sourceId);
+        this.state.consumeSteering(sourceId);
+        this.steeringMessages.delete(event.message);
+      }
+    }
+    const tasks = todoTasksFromEvent(event);
+    if (tasks) this.queueNotepadPublication(binding, tasks);
+    activeTurn.activity.handle(event);
+  }
+
+  private adoptAutonomousTurn(
+    binding: ConversationBinding,
+    session: AgentSessionRuntime["session"],
+    firstEvent: AgentSessionEvent,
+  ): void {
+    const source = this.conversationSources.get(binding.id);
+    if (!source || this.stopped) {
+      this.logger.warn("could not adopt autonomous Pi turn without a conversation source", {
+        bindingId: binding.id,
+        projectAlias: binding.projectAlias,
+      });
+      return;
+    }
+    const turnId = toTurnId(`turn_${randomUUID()}`);
+    const activity = new TurnActivity({
+      turnId,
+      source,
+      projectCwd: this.piRuntime.project(binding.projectAlias).cwd,
+      projectAlias: binding.projectAlias,
+      sessionId: session.sessionId,
+      reasoning: this.reasoningVisibility.get(binding.id) ?? defaultReasoningVisibility,
+      transport: this.activityTransport(source),
+      onError: (error) => this.logger.warn("autonomous agent activity publish failed", { turnId, error }),
+    });
+    const activeTurn: ActiveSessionTurn = {
+      kind: "autonomous",
+      turnId,
+      activity,
+      unconsumedSteering: new Set(),
+      session,
+      messagesBefore: [...session.messages],
+      latestAssistant: undefined,
+      notifications: [],
+      unsubscribe: undefined,
+    };
+    this.activeSessionTurns.set(binding.id, activeTurn);
+    this.handleActiveTurnEvent(binding, activeTurn, firstEvent);
+    this.enqueueConversationWork(binding.id, async () => {
+      await this.finishAutonomousTurn(binding, source, activeTurn);
+    });
+  }
+
+  private async finishAutonomousTurn(
+    binding: ConversationBinding,
+    source: Message,
+    activeTurn: ActiveSessionTurn,
+  ): Promise<void> {
+    const { turnId, session, activity } = activeTurn;
+    try {
+      // This work is queued behind the managed turn whose completion event may
+      // have triggered the autonomous run. Claim durable turn ownership only
+      // after that predecessor has removed its active-turn row.
+      this.state.startActiveTurn({
+        turnId,
+        bindingId: binding.id,
+        sourceMessageId: toMessageId(source.id),
+      });
+      this.state.transitionActiveTurn(turnId, "starting", "running");
+      await session.waitForIdle();
+      if (this.activeSessionTurns.get(binding.id) !== activeTurn) return;
+      this.activeSessionTurns.delete(binding.id);
+      const messages = session.messages;
+      const unchangedPrefix = activeTurn.messagesBefore.every((message, index) => messages[index] === message);
+      const answer = finalAssistantText(
+        activeTurn.latestAssistant !== undefined ? [activeTurn.latestAssistant]
+          : unchangedPrefix ? messages.slice(activeTurn.messagesBefore.length) : [],
+      );
+      const finalBody = answer ?? "Pi background work completed.";
+      await activity.finalize();
+      const uploads = await this.uploadGeneratedFiles(
+        activity,
+        finalBody,
+        turnId,
+        this.piRuntime.project(binding.projectAlias).cwd,
+      );
+      const finalMessage = await this.sendReply(source, finalBody, `pi-autonomous-${turnId}`, turnId);
+      for (const upload of uploads) {
+        try {
+          await this.clickClack.uploads.attach(finalMessage.id, upload.id);
+        } catch (error) {
+          this.logger.warn("autonomous generated file attachment failed", {
+            turnId,
+            messageId: finalMessage.id,
+            uploadId: upload.id,
+            error,
+          });
         }
       }
-      const tasks = todoTasksFromEvent(event);
-      if (tasks) this.queueNotepadPublication(binding, tasks);
-      activeTurn.activity.handle(event);
-    });
+      this.state.finishActiveTurn(turnId, "running");
+      this.logger.info("autonomous Pi turn completed", {
+        turnId,
+        sourceMessageId: source.id,
+        projectAlias: binding.projectAlias,
+      });
+    } catch (error) {
+      this.activeSessionTurns.delete(binding.id);
+      await activity.finalize();
+      const current = this.state.getActiveTurn(turnId);
+      if (current?.status === "starting") this.state.transitionActiveTurn(turnId, "starting", "stopping");
+      if (current?.status === "running") this.state.transitionActiveTurn(turnId, "running", "stopping");
+      if (this.state.getActiveTurn(turnId)?.status === "stopping") this.state.finishActiveTurn(turnId, "stopping");
+      this.logger.error("autonomous Pi turn failed", {
+        turnId,
+        sourceMessageId: source.id,
+        projectAlias: binding.projectAlias,
+        error,
+      });
+      await this.sendReply(
+        source,
+        errorReply("pi couldn't publish that background result.", error, turnId, [this.config.clickClack.botToken]),
+        `pi-autonomous-error-${turnId}`,
+        turnId,
+      );
+    } finally {
+      this.state.markSteeringUncertain(turnId);
+      if (activeTurn.unconsumedSteering.size
+        && this.state.hasUnconsumedSteering(turnId, session.sessionId)
+        && session.getSteeringMessages?.().length > 0
+        && this.runtimes.get(binding.id)?.session === session) {
+        await this.quarantineUnresponsiveSession(binding);
+        this.state.markSteeringRuntimeRetired(turnId);
+      }
+      await this.notifyUncertainSteering();
+    }
   }
 
   private queueNotepadPublication(binding: ConversationBinding, tasks: readonly TodoTask[]): void {
