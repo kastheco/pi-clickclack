@@ -1720,10 +1720,14 @@ test("extension slash commands report UI notifications after waiting for autonom
   let idle = false;
   let listener: ((event: unknown) => void) | undefined;
   let notify: ((message: string) => void) | undefined;
+  let setStatus: ((key: string, text: string | undefined) => void) | undefined;
+  const runtimeStatuses: Array<{ kind: string; id: string; input: unknown }> = [];
   const session = {
     sessionId: "session-1",
     sessionFile: "/tmp/session-1.jsonl",
     messages: [] as unknown[],
+    model: { provider: "openai-codex", id: "gpt-5.6" },
+    thinkingLevel: "high",
     get isIdle() { return idle; },
     promptTemplates: [] as Array<{ name: string }>,
     resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
@@ -1732,8 +1736,9 @@ test("extension slash commands report UI notifications after waiting for autonom
       getRegisteredCommands: () => [{ invocationName: "fast", description: "Toggle OpenAI fast mode" }],
       getUIContext: () => ({}),
     },
-    async bindExtensions(bindings: { uiContext?: { notify(message: string): void } }) {
+    async bindExtensions(bindings: { uiContext?: { notify(message: string): void; setStatus(key: string, text: string | undefined): void } }) {
       notify = bindings.uiContext?.notify;
+      setStatus = bindings.uiContext?.setStatus;
     },
     subscribe(next: (event: unknown) => void) {
       listener = next;
@@ -1760,6 +1765,7 @@ test("extension slash commands report UI notifications after waiting for autonom
       assert.equal(idle, true);
       lifecycle.push("prompt");
       receivedPrompts.push(text);
+      setStatus?.("better-openai", "gpt-5.6 fast · 5h 42%");
       notify?.("OpenAI fast mode: on.");
     },
   };
@@ -1770,7 +1776,16 @@ test("extension slash commands report UI notifications after waiting for autonom
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
   const service = new BridgeService(setup.config, {
-    clickClack: setup.clickClack,
+    clickClack: {
+      ...setup.clickClack,
+      botRuntimeStatus: {
+        async list() { return { statuses: [] }; },
+        async publish(kind: string, id: string, input: unknown) {
+          runtimeStatuses.push({ kind, id, input });
+          return { status: {} } as never;
+        },
+      },
+    },
     piRuntime,
     logger: createLogger({ sink() {} }),
   });
@@ -1799,7 +1814,22 @@ test("extension slash commands report UI notifications after waiting for autonom
     "OpenAI fast mode: on.",
     "unknown Pi command `/not-a-command`.",
   ]);
-  service.stop();
+  await service.waitForStop();
+  assert.ok(runtimeStatuses.length >= 2);
+  assert.deepEqual(runtimeStatuses.at(-1), {
+    kind: "dms",
+    id: "dcn_1",
+    input: {
+      workspace_id: "wsp_test",
+      status: {
+        runtime: "pi",
+        model_provider: "openai-codex",
+        model_id: "gpt-5.6",
+        reasoning: "high",
+        fast_mode: true,
+      },
+    },
+  });
 });
 
 test("adopts a background completion run that starts after the visible turn closes", async () => {
