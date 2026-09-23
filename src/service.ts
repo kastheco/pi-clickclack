@@ -1766,6 +1766,7 @@ export class BridgeService {
 
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
     const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
+      this.runtimeFastMode.delete(binding.id);
       this.queueNotepadPublication(binding, latestTodoTasks(session.messages));
       this.bindSessionObserver(binding, session);
       if (typeof session.bindExtensions !== "function") return;
