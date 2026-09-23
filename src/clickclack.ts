@@ -5,7 +5,7 @@ import type { BridgeConfig } from "./config.js";
 export type ClickClackBoundary = Pick<
   ClickClackClient,
   "me" | "workspaces" | "bots" | "messages" | "uploads" | "channels" | "dms" | "events"
-> & Partial<Pick<ClickClackClient, "notepads" | "workflowRuns">>;
+> & Partial<Pick<ClickClackClient, "notepads" | "workflowRuns" | "botRuntimeStatus">>;
 
 export function createClickClackClient(config: BridgeConfig): ClickClackClient {
   return new ClickClackClient({
@@ -15,7 +15,10 @@ export function createClickClackClient(config: BridgeConfig): ClickClackClient {
     // Leave all existing chat/decision transport behavior unchanged.
     fetch: (input, init) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-      if (url.pathname !== "/api/workflow-runs") return fetch(input, init);
+      if (
+        url.pathname !== "/api/workflow-runs"
+        && !url.pathname.endsWith("/bot-runtime-status")
+      ) return fetch(input, init);
       const timeout = AbortSignal.timeout(15_000);
       const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
       return fetch(input, { ...init, signal });

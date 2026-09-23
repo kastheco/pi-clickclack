@@ -29,6 +29,7 @@ import {
   type SlashInvocation,
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
+import { betterOpenAIStatusKey, fastModeFromBetterOpenAIStatus } from "./bot-runtime-status.js";
 import { errorReply } from "./error-reply.js";
 import type { BridgeConfig } from "./config.js";
 import {
@@ -92,6 +93,7 @@ type ConversationTarget = {
 };
 
 const defaultReconnectDelayMs = 1_000;
+const runtimeStatusHeartbeatMs = 60_000;
 const attachmentHydrationDelayMs = 80;
 const attachmentHydrationAttempts = 25;
 const maxPiImageBytes = 5 * 1024 * 1024;
@@ -197,6 +199,9 @@ export class BridgeService {
   private readonly notepadRevisions = new Map<number, number>();
   private readonly notepadTasks = new Map<number, TodoTask[]>();
   private readonly notepadPublications = new Map<number, Promise<void>>();
+  private readonly runtimeFastMode = new Map<number, boolean | null>();
+  private readonly runtimeStatusHeartbeats = new Map<number, NodeJS.Timeout>();
+  private readonly runtimeStatusPublications = new Map<number, Promise<void>>();
   private stopTask: Promise<void> = Promise.resolve();
 
   constructor(
@@ -338,6 +343,8 @@ export class BridgeService {
       this.settleInteraction(bindingId, "cancelled");
     }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    for (const timer of this.runtimeStatusHeartbeats.values()) clearInterval(timer);
+    this.runtimeStatusHeartbeats.clear();
     this.socket?.close();
     this.socket = undefined;
     this.stopTask = this.finishCleanup();
@@ -361,6 +368,7 @@ export class BridgeService {
       await Promise.all([...this.conversationQueues.values()]);
     }
     await this.drainNotepadPublications();
+    await Promise.allSettled([...this.runtimeStatusPublications.values()]);
 
     const workflowBindings = new Set([
       ...this.decisionWatchers.keys(),
@@ -1700,8 +1708,65 @@ export class BridgeService {
       : presented.request.kind === "confirmation" ? false : undefined);
   }
 
+  private startRuntimeStatusHeartbeat(
+    binding: ConversationBinding,
+    session: AgentSessionRuntime["session"],
+  ): void {
+    const previous = this.runtimeStatusHeartbeats.get(binding.id);
+    if (previous) clearInterval(previous);
+    const timer = setInterval(
+      () => this.queueRuntimeStatusPublication(binding, session),
+      runtimeStatusHeartbeatMs,
+    );
+    timer.unref();
+    this.runtimeStatusHeartbeats.set(binding.id, timer);
+  }
+
+  private queueRuntimeStatusPublication(
+    binding: ConversationBinding,
+    session: AgentSessionRuntime["session"],
+  ): void {
+    if (this.stopped || this.clickClack.botRuntimeStatus === undefined) return;
+    const previous = this.runtimeStatusPublications.get(binding.id) ?? Promise.resolve();
+    const publication = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.stopped || this.runtimes.get(binding.id)?.session !== session) return;
+        const model = session.model;
+        if (!model) return;
+        await this.clickClack.botRuntimeStatus!.publish(
+          binding.conversationType === "channel" ? "channels" : "dms",
+          binding.conversationId,
+          {
+            workspace_id: this.config.clickClack.workspaceId,
+            status: {
+              runtime: "pi",
+              model_provider: model.provider,
+              model_id: model.id,
+              reasoning: session.thinkingLevel,
+              fast_mode: this.runtimeFastMode.get(binding.id) ?? null,
+            },
+          },
+        );
+      })
+      .catch((error: unknown) => {
+        this.logger.warn("bot runtime status publication failed", {
+          bindingId: binding.id,
+          projectAlias: binding.projectAlias,
+          error,
+        });
+      });
+    this.runtimeStatusPublications.set(binding.id, publication);
+    void publication.finally(() => {
+      if (this.runtimeStatusPublications.get(binding.id) === publication) {
+        this.runtimeStatusPublications.delete(binding.id);
+      }
+    });
+  }
+
   private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
     const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
+      this.runtimeFastMode.delete(binding.id);
       this.queueNotepadPublication(binding, latestTodoTasks(session.messages));
       this.bindSessionObserver(binding, session);
       if (typeof session.bindExtensions !== "function") return;
@@ -1730,6 +1795,15 @@ export class BridgeService {
         notify: (message) => {
           const activeTurn = this.activeSessionTurns.get(binding.id);
           if (activeTurn) activeTurn.notifications.push(message);
+        },
+        setStatus: (key, text) => {
+          baseUI.setStatus?.(key, text);
+          if (key !== betterOpenAIStatusKey) return;
+          this.runtimeFastMode.set(
+            binding.id,
+            fastModeFromBetterOpenAIStatus(text),
+          );
+          this.queueRuntimeStatusPublication(binding, session);
         },
       };
       await session.bindExtensions({
@@ -1772,6 +1846,8 @@ export class BridgeService {
         },
       });
       this.bindActiveTurnSession(binding, session);
+      this.startRuntimeStatusHeartbeat(binding, session);
+      this.queueRuntimeStatusPublication(binding, session);
       await this.watchWorkflowDecisions(binding, session.sessionId);
     };
 
@@ -1794,6 +1870,10 @@ export class BridgeService {
   }
 
   private unbindSessionObserver(bindingId: number): void {
+    const timer = this.runtimeStatusHeartbeats.get(bindingId);
+    if (timer) clearInterval(timer);
+    this.runtimeStatusHeartbeats.delete(bindingId);
+    this.runtimeFastMode.delete(bindingId);
     const observer = this.sessionObservers.get(bindingId);
     if (!observer) return;
     this.sessionObservers.delete(bindingId);
@@ -1813,6 +1893,10 @@ export class BridgeService {
         if (active.kind === "autonomous") this.handleActiveTurnEvent(binding, active, event);
         return;
       }
+      if (
+        event.type === "thinking_level_changed"
+        || (event.type === "entry_appended" && event.entry.type === "model_change")
+      ) this.queueRuntimeStatusPublication(binding, session);
       if (event.type !== "agent_start") return;
       this.adoptAutonomousTurn(binding, session, event);
     });
