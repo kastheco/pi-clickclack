@@ -693,6 +693,8 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   assert.equal(setup.activity[0]?.turnId, setup.activity[1]?.turnId);
   assert.equal(setup.sentInputs.at(-1)?.turn_id, setup.activity[0]?.turnId);
   assert.ok(setup.ephemeral.some((frame) => frame.type === "agent.progress" && frame.channelId === "chn_1"));
+  assert.ok(setup.ephemeral.filter((frame) => frame.type === "agent.progress")
+    .every((frame) => (frame.payload as { source_message_id?: string }).source_message_id === source.id));
   assert.equal(service.state.getBinding("channel", "chn_1" as never)?.projectAlias, "main");
   assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-1");
   const latestNotepad = notepadPublications.at(-1) as { card: { revision: number; updatedAt: number } };

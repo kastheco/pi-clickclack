@@ -2372,7 +2372,7 @@ export class BridgeService {
           ? { channelId: target.id }
           : { directConversationId: target.id }),
         type: "agent.progress",
-        payload,
+        payload: { ...payload, source_message_id: source.id },
       }),
       ...(gitActivityChannelId ? {
         publishGit: (body: string, nonce: string) => this.sendDurableMessage(
