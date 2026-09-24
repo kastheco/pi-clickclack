@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import {
   type AgentSessionRuntime,
   type CreateAgentSessionRuntimeFactory,
+  type FileEntry,
   ModelRuntime,
   SessionManager,
   createAgentSessionFromServices,
@@ -20,6 +21,12 @@ import { toProjectAlias } from "./types.js";
 export type PiRuntimeRequest = {
   projectAlias: string;
   sessionFile?: string;
+  /**
+   * Seed an in-memory session with these entries instead of opening a file.
+   * Tangents use this to fork a binding's history without writing a session
+   * file or showing up in /resume.
+   */
+  forkEntries?: FileEntry[];
 };
 
 export type EmbeddedPiRuntimeBoundary = {
@@ -105,9 +112,11 @@ export function createEmbeddedPiRuntime(config: BridgeConfig): EmbeddedPiRuntime
       }
       const model = resolved.model;
 
-      const initialSessionManager = request.sessionFile
-        ? SessionManager.open(request.sessionFile, sessionDirectory)
-        : SessionManager.create(selectedProject.cwd, sessionDirectory);
+      const initialSessionManager = request.forkEntries
+        ? SessionManager.inMemory(selectedProject.cwd, undefined, request.forkEntries)
+        : request.sessionFile
+          ? SessionManager.open(request.sessionFile, sessionDirectory)
+          : SessionManager.create(selectedProject.cwd, sessionDirectory);
       if (request.sessionFile && initialSessionManager.getCwd() !== selectedProject.cwd) {
         throw new Error(`Pi session cwd does not match project alias ${request.projectAlias}`);
       }

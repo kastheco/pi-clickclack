@@ -51,6 +51,7 @@ import { createLogger, environmentSecretValues, type Logger } from "./logger.js"
 import { latestTodoTasks, todoNotepadCard, todoTasksFromEvent, type TodoTask } from "./notepad.js";
 import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { steerWithReceipt } from "./pi-steering.js";
+import { TangentHost, createTangentTransport, type TangentTransport } from "./tangents.js";
 import {
   StateStore,
   type ActiveTurn,
@@ -85,6 +86,8 @@ export type BridgeServiceDependencies = {
    * service construction defaults to none, which keeps isolated tests opt-in.
    */
   workflowClient?: () => WorkflowDecisionClient | undefined;
+  /** Tangent reply transport. Defaults to the configured ClickClack API. */
+  tangentTransport?: TangentTransport;
 };
 
 type ConversationTarget = {
@@ -153,6 +156,7 @@ export class BridgeService {
   private readonly interactiveTimeoutMs: number;
   private readonly reconnectDelayMs: number;
   private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
+  private readonly tangents: TangentHost;
   private started = false;
   private stopped = false;
   private identity?: User;
@@ -219,6 +223,43 @@ export class BridgeService {
     this.interactiveTimeoutMs = dependencies.interactiveTimeoutMs ?? defaultInteractiveTimeoutMs;
     this.reconnectDelayMs = dependencies.reconnectDelayMs ?? defaultReconnectDelayMs;
     this.workflowClient = dependencies.workflowClient;
+    this.tangents = new TangentHost({
+      transport: dependencies.tangentTransport
+        ?? createTangentTransport(config.clickClack.baseUrl, config.clickClack.botToken),
+      workspaceId: config.clickClack.workspaceId,
+      ownerIds: config.clickClack.ownerIds,
+      selfId: () => this.identity?.id,
+      resolveSource: (tangent) => {
+        const target = tangent.direct_conversation_id
+          ? { type: "direct" as const, id: tangent.direct_conversation_id }
+          : tangent.channel_id ? { type: "channel" as const, id: tangent.channel_id } : undefined;
+        if (!target) return undefined;
+        const binding = this.state.getBinding(target.type, toConversationId(target.id));
+        if (!binding) return undefined;
+        const sessionFile = this.runtimes.get(binding.id)?.session.sessionFile
+          ?? this.state.getActivePiSession(binding.id)?.sessionFile;
+        return {
+          projectAlias: binding.projectAlias,
+          ...(sessionFile && existsSync(sessionFile) ? { sessionFile } : {}),
+        };
+      },
+      createRuntime: async (projectAlias, forkEntries) => {
+        const runtime = await this.piRuntime.createSessionRuntime({
+          projectAlias,
+          ...(forkEntries ? { forkEntries } : {}),
+        });
+        try {
+          // No conversation UI: a tangent can't answer extension dialogs.
+          await runtime.session.bindExtensions({ mode: "rpc" });
+        } catch (error) {
+          await runtime.dispose();
+          throw error;
+        }
+        return runtime;
+      },
+      runTurn: (runtime, prompt) => this.runTangentTurn(runtime, prompt),
+      logger: this.logger,
+    });
   }
 
   start(): Promise<void> {
@@ -369,6 +410,7 @@ export class BridgeService {
     }
     await this.drainNotepadPublications();
     await Promise.allSettled([...this.runtimeStatusPublications.values()]);
+    await this.tangents.stop();
 
     const workflowBindings = new Set([
       ...this.decisionWatchers.keys(),
@@ -527,6 +569,7 @@ export class BridgeService {
 
   private async processEvent(event: RealtimeEvent): Promise<void> {
     if (event.workspace_id !== this.config.clickClack.workspaceId) return;
+    if (await this.tangents.handle(event)) return;
     if (event.type === "channel.bot_assignment_updated") {
       await this.refreshAssignedChannels();
     } else if (event.type === "message.created") {
@@ -2128,6 +2171,27 @@ export class BridgeService {
     } finally {
       session.prompt = originalPrompt;
     }
+  }
+
+  /** Runs one tangent prompt to completion and returns its reply text. */
+  private async runTangentTurn(runtime: AgentSessionRuntime, prompt: string): Promise<string> {
+    const session = runtime.session;
+    let latestAssistant: unknown;
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") latestAssistant = event.message;
+    });
+    try {
+      await this.promptAndWaitForNestedPrompts(session, prompt);
+    } finally {
+      unsubscribe();
+    }
+    return finalAssistantText(latestAssistant === undefined ? [] : [latestAssistant], true)
+      ?? "Pi finished without a text reply.";
+  }
+
+  /** Test seam: wait for queued tangent turns. */
+  async waitForTangents(): Promise<void> {
+    await this.tangents.waitForIdle();
   }
 
   private async refreshProjectCommandMenu(projectAlias: string, runtime: AgentSessionRuntime): Promise<void> {
