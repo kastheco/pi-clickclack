@@ -50,10 +50,13 @@ test("headless reconciliation cannot change the first-to-second turn system pref
     dispose = () => session.dispose();
     await session.bindExtensions({ mode: "rpc" });
     const runner = session.extensionRunner;
-    const first = await runner.emitBeforeAgentStart("first", undefined, session.systemPrompt, { cwd: root });
-    const second = await runner.emitBeforeAgentStart("second", undefined, session.systemPrompt, { cwd: root });
-    assert.equal(first?.systemPrompt, second?.systemPrompt, "headless tool removal must not leave a stale first-turn override");
-    assert.doesNotMatch(first?.systemPrompt ?? "", /ask_user_question/u);
+    const first = await runner.emitBeforeAgentStart("first", undefined, { cwd: root, forceSystemPrompt: session.systemPrompt });
+    const second = await runner.emitBeforeAgentStart("second", undefined, { cwd: root, forceSystemPrompt: session.systemPrompt });
+    const firstPrompt = first.systemPromptOptions.forceSystemPrompt;
+    const secondPrompt = second.systemPromptOptions.forceSystemPrompt;
+    assert.equal(firstPrompt, secondPrompt, "headless tool removal must not leave a stale first-turn override");
+    assert.match(firstPrompt ?? "", /Stable LCM guidance\./u);
+    assert.doesNotMatch(firstPrompt ?? "", /ask_user_question/u);
     assert.ok(session.getActiveToolNames().includes("read"), "other tools remain enabled");
     assert.ok(!session.getActiveToolNames().includes("ask_user_question"));
     await session.reload();

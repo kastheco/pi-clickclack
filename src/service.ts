@@ -116,6 +116,7 @@ type ActiveSessionTurn = {
   turnId: TurnId;
   activity: TurnActivity;
   unconsumedSteering: Set<MessageId>;
+  pendingSteering: Set<MessageId>;
   session: AgentSessionRuntime["session"];
   messagesBefore: readonly unknown[];
   latestAssistant: unknown;
@@ -742,8 +743,8 @@ export class BridgeService {
       this.logger.warn("steering attachment preparation failed", { sourceMessageId: source.id, error });
       return true;
     }
-    // No await between this check, the durable claim/receipt, and Pi 0.85.1's
-    // synchronous enqueue. Settlement cannot route this input a second time.
+    // Claim before asynchronous SDK input hooks. Never replay a claimed input,
+    // even if its original turn settles before enqueueing.
     if (this.activeSessionTurns.get(binding.id) !== active || active.session !== session || !session.isStreaming
       || this.queuedConversationWork.has(binding.id)) return false;
     const claim = this.state.claimSourceMessage({
@@ -755,23 +756,32 @@ export class BridgeService {
       },
     });
     if (!claim.claimed) return true;
+    const sourceId = toMessageId(source.id);
+    active.pendingSteering.add(sourceId);
     let captured = false;
     try {
       await steerWithReceipt(
         active.session,
         prepared.prompt,
         prepared.images.length > 0 ? prepared.images : undefined,
-        (message) => {
-        captured = true;
-        active.unconsumedSteering.add(toMessageId(source.id));
-          this.steeringMessages.set(message, toMessageId(source.id));
+        (message, consumed) => {
+          captured = true;
+          if (consumed) {
+            this.state.consumeSteering(sourceId);
+          } else {
+            active.unconsumedSteering.add(sourceId);
+            this.steeringMessages.set(message, sourceId);
+          }
         },
+        () => this.activeSessionTurns.get(binding.id) === active && session.isStreaming,
       );
-      if (!captured) active.unconsumedSteering.add(toMessageId(source.id));
+      if (!captured) active.unconsumedSteering.add(sourceId);
     } catch (error) {
       // A rejection does not prove enqueue never happened. Never queue a fallback.
-      this.state.markSteeringMessageUncertain(toMessageId(source.id));
+      this.state.markSteeringMessageUncertain(sourceId);
       this.logger.warn("Pi steering delivery uncertain", { sourceMessageId: source.id, error });
+    } finally {
+      active.pendingSteering.delete(sourceId);
     }
     return true;
   }
@@ -1207,6 +1217,7 @@ export class BridgeService {
         turnId,
         activity,
         unconsumedSteering: new Set(),
+        pendingSteering: new Set(),
         session: runtime.session,
         messagesBefore: [...runtime.session.messages],
         latestAssistant: undefined,
@@ -1312,9 +1323,10 @@ export class BridgeService {
       const session = activeSessionTurn?.session;
       // Never clear extension-owned queues. Retire only this runtime when our
       // unconfirmed input could survive in its queue and leak into a later turn.
-      if (session && activeSessionTurn?.unconsumedSteering.size
+      if (session && activeSessionTurn
         && this.state.hasUnconsumedSteering(turnId, session.sessionId)
-        && session.getSteeringMessages?.().length > 0
+        && (activeSessionTurn.pendingSteering.size > 0
+          || (activeSessionTurn.unconsumedSteering.size > 0 && session.getSteeringMessages?.().length > 0))
         && this.runtimes.get(binding.id)?.session === session) {
         await this.quarantineUnresponsiveSession(binding);
         this.state.markSteeringRuntimeRetired(turnId);
@@ -1996,6 +2008,7 @@ export class BridgeService {
       turnId,
       activity,
       unconsumedSteering: new Set(),
+      pendingSteering: new Set(),
       session,
       messagesBefore: [...session.messages],
       latestAssistant: undefined,
@@ -2082,9 +2095,9 @@ export class BridgeService {
       );
     } finally {
       this.state.markSteeringUncertain(turnId);
-      if (activeTurn.unconsumedSteering.size
-        && this.state.hasUnconsumedSteering(turnId, session.sessionId)
-        && session.getSteeringMessages?.().length > 0
+      if (this.state.hasUnconsumedSteering(turnId, session.sessionId)
+        && (activeTurn.pendingSteering.size > 0
+          || (activeTurn.unconsumedSteering.size > 0 && session.getSteeringMessages?.().length > 0))
         && this.runtimes.get(binding.id)?.session === session) {
         await this.quarantineUnresponsiveSession(binding);
         this.state.markSteeringRuntimeRetired(turnId);

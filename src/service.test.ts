@@ -2150,8 +2150,10 @@ test("messages received before SDK streaming still run serialized turns", async 
 test("mid-turn messages steer before the original prompt settles", async () => {
   const setup = fixture();
   const delivered: string[] = [];
-  let listener: ((event: AgentSessionEvent) => void) | undefined;
-  const agent = { steer(message: object) { queueMicrotask(() => listener?.({ type: "message_start", message } as AgentSessionEvent)); } };
+  const listeners = new Set<(event: AgentSessionEvent) => void>();
+  const agent = { steer(message: object) { queueMicrotask(() => {
+    for (const listener of listeners) listener({ type: "message_start", message } as AgentSessionEvent);
+  }); } };
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   const runtime = {
@@ -2159,7 +2161,7 @@ test("mid-turn messages steer before the original prompt settles", async () => {
       sessionId: "session-steer", sessionFile: "/tmp/session-steer.jsonl",
       messages: [] as unknown[], isStreaming: false,
       agent,
-      subscribe(callback: (event: AgentSessionEvent) => void) { listener = callback; return () => { listener = undefined; }; },
+      subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
       async steer(text: string) {
         delivered.push(text);
         agent.steer({ role: "user", content: [{ type: "text", text }] });
@@ -2213,7 +2215,7 @@ function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted
   let disposed = false;
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
-  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const listeners = new Set<(event: AgentSessionEvent) => void>();
   const runtime = {
     session: {
       sessionId: "session-steering", sessionFile: "/tmp/session-steering.jsonl",
@@ -2224,10 +2226,10 @@ function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted
         pending.push(message);
         if (options.consume !== false) queueMicrotask(() => {
           pending.splice(pending.indexOf(message), 1);
-          listener?.({ type: "message_start", message } as AgentSessionEvent);
+          for (const listener of listeners) listener({ type: "message_start", message } as AgentSessionEvent);
         });
       } },
-      subscribe(callback: (event: AgentSessionEvent) => void) { listener = callback; return () => { listener = undefined; }; },
+      subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
       async steer(text: string, images: unknown) {
         steering.push({ text, images });
         if (options.reject) throw new Error("SDK rejected steering");
@@ -2384,6 +2386,28 @@ for (const options of [{ reject: true }, { consume: true, aborted: true }]) {
     } finally { f.release(); await f.service.waitForStop(); }
   });
 }
+
+test("steering input that outlives its turn retires the runtime and cannot reach the next turn", async () => {
+  const f = steeringFixture();
+  let releaseInput!: () => void;
+  const input = new Promise<void>((resolve) => { releaseInput = resolve; });
+  f.runtime.session.steer = async (text, images) => {
+    f.steering.push({ text, images });
+    await input;
+    f.runtime.session.agent.steer({ role: "user", content: [{ type: "text", text }] });
+  };
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("correction", "late correction"); await nextEventLoop();
+    f.release(); await nextEventLoop(); await nextEventLoop();
+    assert.equal(f.disposed(), true, "pending input hooks retire even an empty queue");
+    releaseInput(); await f.service.waitForIdle();
+    assert.deepEqual(f.runtime.session.getSteeringMessages(), [], "late correction never reaches agent queue");
+    assert.deepEqual(f.prompts, ["original"]);
+    assert.ok(f.setup.sent.some((item) => item.body.includes("couldn't confirm delivery")));
+  } finally { releaseInput(); f.release(); await f.service.waitForStop(); }
+});
 
 test("consumed steering plus a later pre-enqueue rejection does not retire extension-owned queued work", async () => {
   const f = steeringFixture();

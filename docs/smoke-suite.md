@@ -161,7 +161,7 @@ Never infer success solely from a model's text or a historical session transcrip
 
 ## Mid-turn steering (KAS765)
 
-The standard offline suite includes `src/pi-steering.test.ts` and the message-routing regressions in `src/service.test.ts`. The SDK fixture asserts the exact embedded version (0.85.1), injects a mock response stream without model calls, holds the original prompt open, and confirms distinct receipts for identical corrections before that prompt settles. No installed extensions or live conversations are loaded.
+the standard offline suite includes `src/pi-steering.test.ts` and the message-routing regressions in `src/service.test.ts`. the SDK fixture asserts the exact embedded version (0.87.1), loads a fixture asynchronous input hook, injects a mock response stream without model calls, and confirms distinct receipts for identical corrections before the original prompt settles. no installed extensions or live conversations are loaded.
 
 Targeted check (Node 24):
 
@@ -172,4 +172,4 @@ node --test --test-name-pattern='mid-turn|steering recovery|steering notice|expl
 node --test dist/state/*.test.js
 ```
 
-These checks cover synchronous receipt capture/restoration, unsupported identity behavior, claim atomicity, duplicate/reconnect events, images and settlement races, decision/command/auth isolation, pending-queue retirement, and restart/uncertain-notice reconciliation. They are source validation, not a deployment or live-app verification gate. See [steering recovery limits](SCOPE.md#steering-delivery-and-recovery) before changing the SDK pin.
+these checks cover asynchronous receipt capture/restoration, handled input hooks, independent and hook-owned messages, early consumption, rejection after enqueue, claim atomicity, duplicate/reconnect events, images and settlement races, decision/command/auth isolation, pending-input retirement, and restart/uncertain-notice reconciliation. They are source validation, not a deployment or live-app verification gate. See [steering recovery limits](SCOPE.md#steering-delivery-and-recovery) before changing the SDK pin.
