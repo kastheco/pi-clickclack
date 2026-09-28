@@ -27,7 +27,7 @@ build from a clean worktree so the tag names the exact source. the image contain
 ~/.local/share/omp-clickclack/<bot>/               0700. mounted read-write at /bot
   home/                   HOME and XDG directories
   home/.pi/agent/hindsight.json                    hindsight banks: the bot's own project bank plus kas-engineering as the global bank
-  agent/                  omp agent dir: sessions/, lcm/, agent.db, mcp.json, extension state
+  agent/                  omp agent dir: sessions/, lcm/, agent.db, mcp.json, config.yml, extension state
   state/bridge.sqlite     bridge state
   tmp/                    TMPDIR
   workspace-hindsight/    overlays <workspace>/.pi/hindsight
@@ -48,9 +48,13 @@ b=~/.local/share/omp-clickclack/<bot>
 mkdir -p $b/{home/.pi/agent,home/.omp,home/.ssh,agent/lcm,state,tmp,workspace-hindsight}
 jq '.banks.project.bankId="omp-clickclack-<bot>" | .banks.user={enabled: true, bankId: "kas-engineering"}' \
   ~/.pi/agent/hindsight.json > $b/home/.pi/agent/hindsight.json
-grep -vE '^(CLICKCLACK_PI_STATE_PATH|CLICKCLACK_PI_AGENT_DIR)=' \
+grep -vE '^(CLICKCLACK_PI_STATE_PATH|CLICKCLACK_PI_AGENT_DIR|CLICKCLACK_PI_MODEL)=' \
   ~/.config/pi-clickclack/personas/<bot>.env > ~/.config/omp-clickclack/<bot>.env
+echo 'CLICKCLACK_PI_MODEL=openai-codex/gpt-6-astra' >> ~/.config/omp-clickclack/<bot>.env
+printf 'tier:\n  openai: priority\n' > $b/agent/config.yml
 ```
+
+the bots default to `gpt-6-astra` on the priority tier, with thinking from `CLICKCLACK_PI_THINKING_LEVEL`. the model comes from the env file and overrides the model saved in a resumed session. the tier comes from the bot's own omp `config.yml`.
 
 ## what the container sees
 
