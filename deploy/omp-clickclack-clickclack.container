@@ -12,14 +12,15 @@ Wants=network-online.target omp-auth-broker.service
 
 [Container]
 ContainerName=omp-clickclack-clickclack
-Image=localhost/omp-clickclack:RELEASE
+Image=localhost/omp-clickclack:b00af20-omp18.3.5
 Pull=never
 UserNS=keep-id
 ReadOnly=true
 NoNewPrivileges=true
 DropCapability=ALL
-# host loopback stays closed except hindsight (8888) and the auth broker (8766).
-Network=pasta:-T,8888,-T,8766
+# host loopback stays closed except hindsight (8888), the auth broker (8766)
+# and browseros (9001).
+Network=pasta:-T,8888,-T,8766,-T,9001
 EnvironmentFile=%h/.config/omp-clickclack/clickclack.env
 Secret=omp-clickclack-gh-token,type=env,target=GH_TOKEN
 Environment=HOME=/bot/home

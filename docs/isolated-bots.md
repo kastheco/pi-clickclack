@@ -26,8 +26,8 @@ build from a clean worktree so the tag names the exact source. the image contain
 ~/.config/omp-clickclack/<bot>.env                 0600. ClickClack token and bridge settings, no storage paths
 ~/.local/share/omp-clickclack/<bot>/               0700. mounted read-write at /bot
   home/                   HOME and XDG directories
-  home/.pi/agent/hindsight.json                    per-bot hindsight bank
-  agent/                  omp agent dir: sessions/, lcm/, agent.db, extension state
+  home/.pi/agent/hindsight.json                    hindsight banks: the bot's own project bank plus kas-engineering as the global bank
+  agent/                  omp agent dir: sessions/, lcm/, agent.db, mcp.json, extension state
   state/bridge.sqlite     bridge state
   tmp/                    TMPDIR
   workspace-hindsight/    overlays <workspace>/.pi/hindsight
@@ -46,7 +46,7 @@ create a new bot tree:
 umask 077
 b=~/.local/share/omp-clickclack/<bot>
 mkdir -p $b/{home/.pi/agent,home/.omp,home/.ssh,agent/lcm,state,tmp,workspace-hindsight}
-jq '.banks.project.bankId="omp-clickclack-<bot>" | .banks.user.enabled=false' \
+jq '.banks.project.bankId="omp-clickclack-<bot>" | .banks.user={enabled: true, bankId: "kas-engineering"}' \
   ~/.pi/agent/hindsight.json > $b/home/.pi/agent/hindsight.json
 grep -vE '^(CLICKCLACK_PI_STATE_PATH|CLICKCLACK_PI_AGENT_DIR)=' \
   ~/.config/pi-clickclack/personas/<bot>.env > ~/.config/omp-clickclack/<bot>.env
@@ -70,7 +70,8 @@ every bot shares one model credential pool through `omp-auth-broker.service`, wh
 ## isolation
 
 - `UserNS=keep-id` runs the bot as the invoking uid, so workspace files keep normal ownership. all capabilities are dropped, `no-new-privileges` is set, and the root filesystem is read-only.
-- networking is pasta. host loopback is closed except port 8888 (hindsight) and 8766 (auth broker). the tailnet ClickClack URL resolves and connects normally.
+- networking is pasta. host loopback is closed except port 8888 (hindsight), 8766 (auth broker), and 9001 (browseros MCP). the tailnet ClickClack URL resolves and connects normally.
+- MCP servers come from `/bot/agent/mcp.json`. OAuth servers such as linear read their credential from the shared auth broker, so one login in the host omp (`/mcp reauth <server>` with the same server URL) covers every bot.
 - ClickClack permissions are enforced server-side by each bot's own token. the private `HOME` is a storage boundary, not the security boundary; the mount set is.
 
 ## limits
@@ -95,7 +96,7 @@ run these against the release image with the bot's real quadlet flags (`/usr/lib
 
 1. create the bot tree and env file (above), and install the quadlet with `Image=` set to the release tag.
 2. rehearse: `bun scripts/migrate-from-pi.ts ~/.local/state/pi-clickclack/<bot>.sqlite /tmp/<dir>/<bot> --rehearsal`. this reads the live database without writing it.
-3. `systemctl --user stop pi-clickclack-<bot>.service`.
+3. `systemctl --user disable --now pi-clickclack-<bot>.service`, so the old bridge doesn't come back on reboot.
 4. `bun scripts/migrate-from-pi.ts ~/.local/state/pi-clickclack/<bot>.sqlite ~/.local/share/omp-clickclack/<bot>`. it refuses to run while either service is active or when bot state already exists. it snapshots the bridge database with `VACUUM INTO`, copies every referenced session file with a sha256 check, rewrites references to `/bot/agent/sessions/`, and runs integrity and foreign key checks. archived references whose session files were never written are reported, not copied.
 5. `systemctl --user daemon-reload && systemctl --user start omp-clickclack-<bot>.service`.
 
@@ -103,7 +104,7 @@ run these against the release image with the bot's real quadlet flags (`/usr/lib
 
 the migration never modifies the old bridge database or session files. to go back:
 
-1. `systemctl --user stop omp-clickclack-<bot>.service`.
+1. `systemctl --user stop omp-clickclack-<bot>.service`, then move `~/.config/containers/systemd/omp-clickclack-<bot>.container` out of that directory and `systemctl --user daemon-reload`. quadlet units can't be disabled, and the file's `WantedBy=default.target` would start the omp bot again on reboot.
 2. copy the omp bot's realtime cursor into the old database, since the old bridge catches up from its own cursor on startup and would otherwise answer messages the omp bot already handled:
 
    ```sh
@@ -114,6 +115,6 @@ the migration never modifies the old bridge database or session files. to go bac
         on conflict(singleton) do update set cursor = excluded.cursor, updated_at = excluded.updated_at;"
    ```
 
-3. `systemctl --user start pi-clickclack-<bot>.service`.
+3. `systemctl --user enable --now pi-clickclack-<bot>.service`.
 
 turns the omp bot ran after cutover stay in the omp copies of those sessions and aren't carried back. only one of the two services may run at a time, since both answer as the same ClickClack bot.
