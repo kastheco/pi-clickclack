@@ -1,0 +1,10 @@
+.git
+.pi
+.env
+node_modules
+dist
+coverage
+deploy/extensions/node_modules
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

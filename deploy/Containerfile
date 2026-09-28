@@ -1,0 +1,67 @@
+# one immutable release shared read-only by every omp ClickClack bot.
+# build from the repo root with the clickclack sdk as a named build context:
+#   podman build -f deploy/Containerfile --build-context clickclack-sdk=../clickclack/packages/sdk-ts -t localhost/omp-clickclack:<commit>-omp<version> .
+ARG NODE_VERSION=24.21.0
+FROM docker.io/library/node:${NODE_VERSION}-bookworm-slim
+
+ARG BUN_VERSION=1.4.2
+ARG GO_VERSION=1.27.1
+ARG PNPM_VERSION=12.6.0
+ARG GH_VERSION=2.101.0
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl fd-find git jq openssh-client python3 ripgrep sqlite3 unzip \
+  && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" -o /tmp/bun.zip \
+  && unzip -q /tmp/bun.zip -d /tmp \
+  && install /tmp/bun-linux-x64/bun /usr/local/bin/bun \
+  && rm -rf /tmp/bun.zip /tmp/bun-linux-x64
+
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+
+# gh backs the git credential helper in the mounted .gitconfig.
+RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+  | tar -xz -C /tmp && install "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/bin/gh && rm -rf /tmp/gh_*
+
+# the bot runs as the image's uid 1000 user under keep-id. point its passwd home
+# at the private tree so ssh, which ignores HOME, finds the mounted keys there.
+RUN usermod -d /bot/home node
+
+# the root filesystem is read-only at runtime, so pnpm has to be prepared here.
+ENV COREPACK_HOME=/opt/corepack
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+
+# native addons (better-sqlite3) compile at install time. pin node-gyp so bun
+# doesn't fall back to an unpinned `bunx node-gyp@latest`.
+ARG NODE_GYP_VERSION=13.0.2
+RUN npm install -g "node-gyp@${NODE_GYP_VERSION}" && npm cache clean --force
+
+ENV PATH=/usr/local/go/bin:${PATH} \
+    GOTOOLCHAIN=local \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+WORKDIR /opt/omp-clickclack
+
+# package.json resolves @clickclack/sdk-ts as file:../clickclack/packages/sdk-ts.
+COPY --from=clickclack-sdk package.json /opt/clickclack/packages/sdk-ts/package.json
+COPY --from=clickclack-sdk dist /opt/clickclack/packages/sdk-ts/dist
+
+COPY package.json bun.lock ./
+COPY vendor ./vendor
+RUN bun install --frozen-lockfile --production && rm -rf /tmp/* /tmp/.[!.]* /root/.bun/install/cache
+
+COPY deploy/extensions/package.json deploy/extensions/bun.lock deploy/extensions/bunfig.toml ./extensions/
+COPY deploy/extensions/patches ./extensions/patches
+RUN cd extensions && bun install --frozen-lockfile --production && rm -rf /tmp/* /tmp/.[!.]* /root/.bun/install/cache /root/.cache
+
+COPY tsconfig.json ./
+COPY src ./src
+
+# context-mode loads through its pi adapter, which carries the MCP bridge and
+# the resume/active-memory injection that its omp adapter lacks.
+ENV CLICKCLACK_OMP_EXTENSION_PATHS='["/opt/omp-clickclack/extensions/node_modules/context-mode/build/adapters/pi/extension.js","/opt/omp-clickclack/extensions/node_modules/pi-lcm","/opt/omp-clickclack/extensions/node_modules/@luxusai/pi-hindsight"]'
+
+CMD ["bun", "/opt/omp-clickclack/src/index.ts"]

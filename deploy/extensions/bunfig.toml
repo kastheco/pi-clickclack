@@ -1,0 +1,4 @@
+[install]
+# omp provides pi-compatible modules to extensions through its legacy shim.
+# never install the upstream pi packages that extensions declare as peers.
+peer = false

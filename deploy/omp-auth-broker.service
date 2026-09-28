@@ -1,0 +1,15 @@
+# shares the host omp credential pool (~/.omp/agent/agent.db) with the bot
+# containers. bots reach it through pasta on 127.0.0.1:8766 and read the bearer
+# token from ~/.omp/auth-broker.token, mounted read-only.
+
+[Unit]
+Description=omp auth broker for ClickClack bots
+
+[Service]
+ExecStart=%h/.bun/bin/bun %h/.bun/bin/omp auth-broker serve --bind=127.0.0.1:8766
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

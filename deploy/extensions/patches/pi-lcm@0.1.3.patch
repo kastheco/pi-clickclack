@@ -1,0 +1,24 @@
+diff --git a/src/db/connection.ts b/src/db/connection.ts
+index 4d0a379c367576ca2935b33a087f9da85271212a..5cca89bc63b85313c40ac5ca443b9fd1101ecba8 100644
+--- a/src/db/connection.ts
++++ b/src/db/connection.ts
+@@ -4,7 +4,18 @@
+  * Fix 15: PASSIVE checkpoint on close, TRUNCATE after compaction.
+  */
+ 
+-import Database from "better-sqlite3";
++import { Database as BunDatabase } from "bun:sqlite";
++
++// omp runs extensions on Bun, which can't load better-sqlite3. bun:sqlite covers
++// the rest of the API pi-lcm uses, so only the pragma helper is added here.
++class Database extends BunDatabase {
++  pragma(source: string): unknown[] {
++    return this.query(`PRAGMA ${source}`).all();
++  }
++}
++declare namespace Database {
++  type Database = InstanceType<typeof Database>;
++}
+ import { mkdirSync, chmodSync } from "fs";
+ import { join } from "path";
+ import { hashCwd } from "../utils.js";

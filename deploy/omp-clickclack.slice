@@ -1,0 +1,15 @@
+# aggregate budget for every omp ClickClack bot container. per-bot limits live
+# in each bot's .container file; this caps all of them together. the io limits
+# target nvme0n1, the disk behind ~/.local/share on this host.
+
+[Unit]
+Description=omp ClickClack bots
+
+[Slice]
+CPUQuota=600%
+MemoryMax=16G
+MemorySwapMax=0
+TasksMax=4096
+IOWriteBandwidthMax=/dev/nvme0n1 120M
+IOReadBandwidthMax=/dev/nvme0n1 400M
+IOWriteIOPSMax=/dev/nvme0n1 4000
