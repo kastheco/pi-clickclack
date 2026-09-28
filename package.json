@@ -15,14 +15,11 @@
     "test": "bun test",
     "test:smoke": "bun test scripts/smoke/*.test.mjs",
     "test:injector-integration": "bun scripts/smoke/integration.mjs",
-    "test:live-smoke": "bun scripts/smoke/live.mjs",
-    "test:workflow-integration": "bun scripts/test-orkastrator-decision-integration.mjs",
-    "test:workflow-durable-integration": "bun scripts/test-workflow-durable-integration.mjs"
+    "test:live-smoke": "bun scripts/smoke/live.mjs"
   },
   "dependencies": {
     "@clickclack/sdk-ts": "file:../clickclack/packages/sdk-ts",
     "@oh-my-pi/pi-coding-agent": "18.3.5",
-    "@osolmaz/pi-workflows": "file:vendor/osolmaz-pi-workflows-0.16.5-kas.769.9-omp.tgz",
     "valibot": "^1.4.2"
   },
   "devDependencies": {

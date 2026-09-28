@@ -139,25 +139,17 @@ Pi remains the source of truth for session history. ClickClack remains the sourc
 
 ## Verify
 
-Run the deterministic local checks with Node 24:
+Run the deterministic local checks with Bun 1.4.2:
 
 ```sh
-pnpm typecheck
-pnpm build
-pnpm test
+bun run typecheck
+bun run build
+bun run test
 ```
 
 The standard suite covers duplicate events, reconnect catch-up, restart cleanup, abort and steering races, nonce reconciliation, interaction timeout/cancellation, progress throttling, generated files, and SQLite migration rollback.
 
-The Orkastrator decision integration test starts the real embedded Pi runtime, patched Pi Workflows extension, workflow host, and bridge against a disposable human-decision workflow:
-
-```sh
-pnpm test:workflow-integration
-```
-
-It packs the sibling `../orkastrator` checkout into a disposable consumer. Set `ORKASTRATOR_ROOT` when that checkout lives elsewhere.
-
-See [`docs/smoke-suite.md`](docs/smoke-suite.md) for the opt-in installed-injector and isolated live read-only probes. See [`docs/durable-workflow-publication.md`](docs/durable-workflow-publication.md) for durable workflow history verification.
+See [`docs/smoke-suite.md`](docs/smoke-suite.md) for the opt-in installed-injector and isolated live read-only probes.
 
 ## Operate
 

@@ -37,7 +37,7 @@ The bridge imports `@earendil-works/pi-coding-agent` and creates embedded `Agent
 - New turns are serialized within a conversation. Different conversations may run concurrently.
 - An invoke-eligible owner message arriving while that conversation's Pi session is streaming uses `session.steer(text, images)`. It belongs to the running ClickClack turn, not a second turn. No prose-based correction detection, separate control UI, or `followUp()` path is used.
 - Pi consumes steering at its next supported agent-loop boundary (after the current assistant response/tool calls, before the next model call), not in the middle of a token or tool execution. If no session is streaming, or previously queued work/commands must run first, the message starts a normal serialized turn instead.
-- Decision replies retain precedence. Slash commands, including extension/resource commands and `/continue`, retain their existing serialized behavior. This change does not add an `/abort` command.
+- Interactive prompt replies retain precedence. Slash commands, including extension/resource commands and `/continue`, retain their existing serialized behavior. This change does not add an `/abort` command.
 - images use the existing hydration, byte limits and download validation. routing rechecks the exact active session after attachment I/O. the claim and receipt are persisted before asynchronous input hooks, and enqueueing is rejected if the original turn has settled. a claimed input is never also queued as a normal turn.
 
 ## Invocation policy

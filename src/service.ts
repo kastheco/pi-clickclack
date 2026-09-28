@@ -1,4 +1,3 @@
-import { decisionPublicationNonce } from "./workflow-decision-publication.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
@@ -36,16 +35,6 @@ import {
   renderInteractivePrompt,
   type InteractiveRequestSpec,
 } from "./interactive.js";
-import { decisionTurnId, readDecisionReply, renderDecisionPrompt } from "./decision-prompt.js";
-import {
-  WorkflowDecisionWatcher,
-  type ClaimedWorkflowDecision,
-  type DecisionAnswer,
-  type WorkflowDecisionClient,
-} from "./workflow-decisions.js";
-import { sessionRun, type RunView } from "./workflow-run-view.js";
-import { DurableWorkflowPublisher } from "./workflow-durable-publisher.js";
-import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { latestTodoTasks, todoNotepadCard, todoTasksFromEvent, type TodoTask } from "./notepad.js";
 import { createEmbeddedPiRuntime, setSessionToolUIContext, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
@@ -75,16 +64,8 @@ export type BridgeServiceDependencies = {
   clickClack?: ClickClackBoundary;
   piRuntime?: EmbeddedPiRuntimeBoundary;
   sleep?: (milliseconds: number) => Promise<void>;
-  workflowObservationStopTimeoutMs?: number;
   interactiveTimeoutMs?: number;
   reconnectDelayMs?: number;
-  /**
-   * Supplies the Pi Workflows client used to deliver human decisions.
-   *
-   * The production application supplies a lazy process-owned client. Direct
-   * service construction defaults to none, which keeps isolated tests opt-in.
-   */
-  workflowClient?: () => WorkflowDecisionClient | undefined;
   /** Tangent reply transport. Defaults to the configured ClickClack API. */
   tangentTransport?: TangentTransport;
 };
@@ -123,17 +104,6 @@ type ActiveSessionTurn = {
   unsubscribe: (() => void) | undefined;
 };
 
-/**
- * One workflow decision presented in a conversation and awaiting a reply.
- *
- * The bridge holds the claim while this is open, so an unanswered decision is
- * released rather than left claimed when the conversation moves on.
- */
-type PresentedDecision = {
-  decision: ClaimedWorkflowDecision;
-  source: Message;
-  resolve: (answer: DecisionAnswer | undefined) => void;
-};
 
 type PresentedInteraction = {
   requestId: string;
@@ -152,10 +122,8 @@ export class BridgeService {
   readonly logger: Logger;
 
   private readonly sleep: (milliseconds: number) => Promise<void>;
-  private readonly workflowObservationStopTimeoutMs: number;
   private readonly interactiveTimeoutMs: number;
   private readonly reconnectDelayMs: number;
-  private readonly workflowClient: (() => WorkflowDecisionClient | undefined) | undefined;
   private readonly tangents: TangentHost;
   private started = false;
   private stopped = false;
@@ -182,17 +150,8 @@ export class BridgeService {
     session: AgentSession;
     unsubscribe: () => void;
   }>();
-  private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
-  private readonly workflowSessionIds = new Map<number, string>();
-  /** Timed-out watcher detaches that shutdown must still account for. */
-  private readonly pendingWorkflowCleanup = new Set<Promise<void>>();
-  /** Owns durable replay independently of any individual watcher lifetime. */
-  private durableWorkflows: DurableWorkflowPublisher | undefined;
-  /** Publishes each bound conversation's ephemeral workflow run state. */
-  private readonly runReporters = new Map<number, WorkflowRunReporter>();
-  private readonly presentedDecisions = new Map<number, PresentedDecision>();
   private readonly presentedInteractions = new Map<number, PresentedInteraction>();
-  /** Last owner message per binding, used as the conversation to post decisions into. */
+  /** Last owner message per binding, used to post interactive prompts and autonomous turns. */
   private readonly conversationSources = new Map<number, Message>();
   private readonly activeExtensionErrors = new Map<number, Error[]>();
   private readonly projectCommandMenus = new Map<string, BotCommandInput[]>();
@@ -219,10 +178,8 @@ export class BridgeService {
     this.clickClack = dependencies.clickClack ?? createClickClackClient(config);
     this.piRuntime = dependencies.piRuntime ?? createEmbeddedPiRuntime(config);
     this.sleep = dependencies.sleep ?? delay;
-    this.workflowObservationStopTimeoutMs = dependencies.workflowObservationStopTimeoutMs ?? 1_000;
     this.interactiveTimeoutMs = dependencies.interactiveTimeoutMs ?? defaultInteractiveTimeoutMs;
     this.reconnectDelayMs = dependencies.reconnectDelayMs ?? defaultReconnectDelayMs;
-    this.workflowClient = dependencies.workflowClient;
     this.tangents = new TangentHost({
       transport: dependencies.tangentTransport
         ?? createTangentTransport(config.clickClack.baseUrl, config.clickClack.botToken),
@@ -282,18 +239,6 @@ export class BridgeService {
     this.identity = identity;
     this.workspace = workspace;
     await this.refreshAssignedChannels();
-    if (this.clickClack.workflowRuns !== undefined && this.workflowClient !== undefined) {
-      const hostIdentity = this.workflowClient()?.hostIdentity;
-      if (!hostIdentity?.trim()) throw new Error("Missing stable workflow host identity");
-      this.durableWorkflows = new DurableWorkflowPublisher({
-        database: this.state.database, endpoint: this.config.clickClack.baseUrl,
-        producerId: identity.id, workspaceId: workspace.id, client: this.workflowClient,
-        hostIdentity,
-        publish: (input) => this.clickClack.workflowRuns!.publish(input),
-        onError: (metadata) => this.logger.warn("durable workflow publication deferred", metadata),
-      });
-      this.durableWorkflows.start();
-    }
     await this.publishCommandMenu();
     if (this.stopped) return;
     for (const binding of this.state.listBindings()) {
@@ -411,32 +356,19 @@ export class BridgeService {
     await Promise.allSettled([...this.runtimeStatusPublications.values()]);
     await this.tangents.stop();
 
-    const workflowBindings = new Set([
-      ...this.decisionWatchers.keys(),
-      ...this.runReporters.keys(),
-      ...this.presentedDecisions.keys(),
-    ]);
     const cleanup = [
-      ...[...workflowBindings].map(async (bindingId) => await this.stopWorkflowObservation(bindingId)),
       ...[...this.sessionObservers.values()].map(async ({ unsubscribe }) => unsubscribe()),
       ...[...this.runtimes.values()].map(async (runtime) => await runtime.dispose()),
     ];
     this.sessionObservers.clear();
-    this.workflowSessionIds.clear();
     this.conversationSources.clear();
     this.runtimes.clear();
 
     const cleanupResults = await Promise.allSettled(cleanup);
-    while (this.pendingWorkflowCleanup.size > 0) {
-      const pending = [...this.pendingWorkflowCleanup];
-      pending.forEach((task) => this.pendingWorkflowCleanup.delete(task));
-      cleanupResults.push(...await Promise.allSettled(pending));
-    }
     const cleanupFailures = cleanupResults
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((failure) => failure.reason);
     try {
-      await this.durableWorkflows?.stop();
       this.state.close();
     } catch (error) {
       cleanupFailures.push(error);
@@ -652,33 +584,6 @@ export class BridgeService {
       return;
     }
 
-    // A presented workflow decision consumes the next matching reply before it
-    // can start a Pi turn. The reply is matched before the source message is
-    // claimed, so an unmatched reply still falls through to ordinary handling
-    // and the conversation is not trapped by a pending decision.
-    const presented = this.presentedDecisions.get(binding.id);
-    if (presented !== undefined) {
-      const reply = readDecisionReply(presented.decision, cleanBody);
-      if (reply.kind !== "unmatched") {
-        const claim = this.state.claimSourceMessage({
-          messageId: toMessageId(message.id),
-          eventId: event.id,
-          eventCursor: event.cursor,
-        });
-        if (!claim.claimed) return;
-        this.presentedDecisions.delete(binding.id);
-        presented.resolve(reply.kind === "answer" ? reply.answer : undefined);
-        await this.sendReply(
-          message,
-          reply.kind === "answer"
-            ? "answer recorded, resuming the workflow."
-            : "left the decision pending.",
-          `pi-decision-ack-${message.id}`,
-        );
-        return;
-      }
-    }
-
     const hydrated = await this.hydrateExpectedAttachments(event, message);
     if (!hydrated) {
       const claim = this.state.claimSourceMessage({
@@ -864,7 +769,6 @@ export class BridgeService {
     const conversationId = toConversationId(target.id);
     const previous = this.state.getBinding(target.type, conversationId);
     if (previous && previous.projectAlias !== alias) {
-      await this.stopWorkflowObservation(previous.id);
       const runtime = this.runtimes.get(previous.id);
       this.unbindSessionObserver(previous.id);
       if (runtime) await runtime.dispose();
@@ -895,7 +799,6 @@ export class BridgeService {
       return;
     }
 
-    await this.stopWorkflowObservation(binding.id);
     const cached = this.runtimes.get(binding.id);
     this.unbindSessionObserver(binding.id);
     if (cached) await cached.dispose();
@@ -949,7 +852,6 @@ export class BridgeService {
             return;
           }
           this.recordReplacementSession(binding, runtime);
-          await this.watchWorkflowDecisions(binding, runtime.sessionId);
           await this.sendReply(source, "New Pi session started.", `pi-command-${source.id}`);
           return;
         }
@@ -1232,7 +1134,6 @@ export class BridgeService {
         );
         if (runtime.sessionId !== sessionIdBeforePrompt) {
           this.recordReplacementSession(binding, runtime);
-          await this.watchWorkflowDecisions(binding, runtime.sessionId);
         }
         if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
@@ -1337,15 +1238,6 @@ export class BridgeService {
     const runtime = this.runtimes.get(binding.id);
     this.runtimes.delete(binding.id);
 
-    try {
-      await this.stopWorkflowObservation(binding.id);
-    } catch (error) {
-      this.logger.warn("could not stop workflow observation for unresponsive Pi session", {
-        bindingId: binding.id,
-        error,
-      });
-    }
-
     this.unbindSessionObserver(binding.id);
     if (runtime) {
       try {
@@ -1371,7 +1263,6 @@ export class BridgeService {
   private async runtimeFor(binding: ConversationBinding): Promise<AgentSession> {
     const cached = this.runtimes.get(binding.id);
     if (cached) {
-      await this.watchWorkflowDecisions(binding, cached.sessionId);
       return cached;
     }
     let reference = this.state.getActivePiSession(binding.id);
@@ -1414,251 +1305,7 @@ export class BridgeService {
         error,
       });
     }
-    await this.watchWorkflowDecisions(binding, runtime.sessionId);
     return runtime;
-  }
-
-  /**
-   * Surfaces this binding's workflow human decisions in its conversation.
-   *
-   * Watching is best effort: a workflow host that is unavailable must not stop
-   * ordinary chat turns, so a failure is logged and the binding runs without
-   * decision delivery until its next runtime.
-   */
-  private async watchWorkflowDecisions(
-    binding: ConversationBinding,
-    sessionId: string,
-  ): Promise<void> {
-    if (
-      this.workflowSessionIds.get(binding.id) === sessionId
-      && this.decisionWatchers.has(binding.id)
-    ) return;
-    await this.stopWorkflowObservation(binding.id);
-
-    const client = this.workflowClient?.();
-    if (client === undefined) return;
-
-    // The session view carries the run alongside its pending interactions, so
-    // the run reporter rides this one subscription rather than opening a second.
-    const reporter = new WorkflowRunReporter({
-      publish: (run) => this.publishRunFrame(binding, run),
-      onError: (error) =>
-        this.logger.warn("workflow run publication failed", { bindingId: binding.id, error }),
-    });
-
-    const watcher = new WorkflowDecisionWatcher({
-      client,
-      sessionId,
-      present: async (decision, signal) => await this.presentDecision(binding, decision, signal),
-      onRun: (event) => {
-        try {
-          this.durableWorkflows?.observe({
-            workspace_id: this.config.clickClack.workspaceId,
-            ...(binding.conversationType === "channel" ? { channel_id: binding.conversationId }
-              : { direct_conversation_id: binding.conversationId }),
-          }, sessionId, event, JSON.stringify([binding.id, binding.projectAlias, this.config.projects.get(binding.projectAlias)?.cwd]));
-        } catch {
-          this.logger.warn("durable workflow observation deferred", { sessionId, bindingId: binding.id });
-        }
-        reporter.report(sessionRun(event));
-      },
-      onError: (error) =>
-        this.logger.warn("workflow decision delivery failed", { bindingId: binding.id, error }),
-    });
-    this.workflowSessionIds.set(binding.id, sessionId);
-    this.decisionWatchers.set(binding.id, watcher);
-    this.runReporters.set(binding.id, reporter);
-    try {
-      await watcher.start();
-    } catch (error) {
-      if (this.decisionWatchers.get(binding.id) === watcher) {
-        this.workflowSessionIds.delete(binding.id);
-        this.decisionWatchers.delete(binding.id);
-        this.runReporters.delete(binding.id);
-      }
-      await reporter.stop();
-      this.logger.warn("could not watch workflow decisions", { bindingId: binding.id, error });
-    }
-  }
-
-  private async stopWorkflowObservation(bindingId: number): Promise<void> {
-    const presented = this.presentedDecisions.get(bindingId);
-    this.presentedDecisions.delete(bindingId);
-    presented?.resolve(undefined);
-
-    const reporter = this.runReporters.get(bindingId);
-    this.runReporters.delete(bindingId);
-
-    const watcher = this.decisionWatchers.get(bindingId);
-    this.decisionWatchers.delete(bindingId);
-    this.workflowSessionIds.delete(bindingId);
-
-    // Stop the watcher synchronously before awaiting the reporter's final
-    // clear. Its generation bump and queue/timer reset prevent a released
-    // presentation from being reclaimed during that await.
-    const stopping = watcher?.stop();
-    if (stopping) void stopping.catch(() => undefined);
-
-    let reporterError: unknown;
-    try {
-      // A replacement reporter must not publish until the old reporter's clear
-      // has landed, or a delayed old clear can erase the new run frame.
-      if (reporter) await reporter.stop();
-    } catch (error) {
-      reporterError = error;
-    }
-
-    let watcherError: unknown;
-    if (stopping) {
-      try {
-        const stopped = await settlesWithin(
-          stopping,
-          this.workflowObservationStopTimeoutMs,
-        );
-        if (!stopped) {
-          // Keep the task, even after it settles, so shutdown can account for a
-          // late rejection instead of falsely reporting completed cleanup.
-          this.pendingWorkflowCleanup.add(stopping);
-          this.logger.warn("workflow observation cleanup exceeded its deadline", {
-            bindingId,
-            workflowObservationStopTimeoutMs: this.workflowObservationStopTimeoutMs,
-          });
-        }
-      } catch (error) {
-        watcherError = error;
-        this.logger.warn("could not stop workflow observation", { bindingId, error });
-      }
-    }
-
-    const errors = [reporterError, watcherError].filter((error) => error !== undefined);
-    if (errors.length > 0) throw new AggregateError(errors, "workflow observation cleanup failed");
-  }
-
-  /**
-   * Publishes one conversation's run state as an ephemeral frame.
-   *
-   * Ephemeral rather than durable: this is the live state of a run, not a record
-   * of it, and a timeline full of status frames would bury the conversation.
-   * ClickClack requires such a frame to name exactly one channel or DM, which
-   * the binding already does.
-   */
-  private async publishRunFrame(
-    binding: ConversationBinding,
-    run: RunView | null,
-  ): Promise<void> {
-    const workspaceId = this.workspace?.id;
-    if (workspaceId === undefined) return;
-    const target = binding.conversationType === "channel"
-      ? { channelId: binding.conversationId }
-      : { directConversationId: binding.conversationId };
-    await this.clickClack.events.publishEphemeral({
-      workspaceId,
-      ...target,
-      type: "workflow.run",
-      payload: { run },
-    });
-  }
-
-  /**
-   * Posts one decision into its conversation and waits for the operator.
-   *
-   * Resolution comes from processMessage when a reply matches. A decision left
-   * open when the conversation moves on stays pending for another presenter
-   * rather than being answered on the operator's behalf.
-   */
-  private async presentDecision(
-    binding: ConversationBinding,
-    decision: ClaimedWorkflowDecision,
-    signal: AbortSignal,
-  ): Promise<DecisionAnswer | undefined> {
-    // A workflow can park while the Pi turn that launched it is still writing
-    // its final reply. The first publication keeps genuinely blocking mid-turn
-    // decisions answerable. If conversation work was active, a second
-    // nonce-deduplicated publication after that work settles makes the still-
-    // pending decision newest again instead of leaving disabled controls above
-    // the turn's final reply.
-    const activeConversationWork = this.conversationQueues.get(binding.id);
-    const source = this.conversationSources.get(binding.id);
-    if (source === undefined || signal.aborted) return undefined;
-
-    let resolveAnswer!: (answer: DecisionAnswer | undefined) => void;
-    const answer = new Promise<DecisionAnswer | undefined>((resolve) => {
-      resolveAnswer = resolve;
-    });
-    if (signal.aborted) return undefined;
-    const presentation = { decision, source, resolve: resolveAnswer };
-    const cancel = () => {
-      if (this.presentedDecisions.get(binding.id) === presentation) this.presentedDecisions.delete(binding.id);
-      resolveAnswer(undefined);
-    };
-    signal.addEventListener("abort", cancel, { once: true });
-    this.presentedDecisions.set(binding.id, presentation);
-
-    try {
-      // Posted as agent_commentary carrying a decision turn_id rather than as
-      // an ordinary reply. Register first so replacement or shutdown can
-      // cancel the presentation while publication is in flight.
-      const hostIdentity = this.workflowClient?.()?.hostIdentity;
-      if (!hostIdentity || !this.identity?.id) throw new Error("Decision publication requires stable host and producer identity");
-      const turnId = decisionTurnId(decision.requestId, decision.revision);
-      const target = { type: binding.conversationType, id: binding.conversationId } as const;
-      const publicationNonce = decisionPublicationNonce({ hostIdentity, producerId: this.identity.id, workspaceId: this.config.clickClack.workspaceId, targetType: binding.conversationType, targetId: binding.conversationId, decision });
-      const message = {
-        kind: "agent_commentary" as const,
-        body: renderDecisionPrompt(decision),
-        turn_id: turnId,
-        nonce: publicationNonce,
-      };
-      await this.sendDurableMessage(target, message, "agent_commentary", toTurnId(turnId));
-
-      if (activeConversationWork !== undefined) {
-        void this.refreshDecisionAfterConversationWork(
-          binding,
-          presentation,
-          activeConversationWork,
-          target,
-          { ...message, nonce: `${publicationNonce}-after-turn` },
-          signal,
-        );
-      }
-    } catch (error) {
-      signal.removeEventListener("abort", cancel);
-      if (this.presentedDecisions.get(binding.id) === presentation) {
-        this.presentedDecisions.delete(binding.id);
-        resolveAnswer(undefined);
-      }
-      throw error;
-    }
-
-    try { return await answer; } finally { signal.removeEventListener("abort", cancel); }
-  }
-
-  private async refreshDecisionAfterConversationWork(
-    binding: ConversationBinding,
-    presentation: PresentedDecision,
-    initialWork: Promise<void>,
-    target: ConversationTarget,
-    message: MessageInput & { nonce: string },
-    signal: AbortSignal,
-  ): Promise<void> {
-    try {
-      let work = initialWork;
-      for (;;) {
-        await work;
-        if (signal.aborted || this.presentedDecisions.get(binding.id) !== presentation) return;
-        const newerWork = this.conversationQueues.get(binding.id);
-        if (newerWork === undefined || newerWork === work) break;
-        work = newerWork;
-      }
-      await this.sendDurableMessage(
-        target,
-        message,
-        "agent_commentary",
-        toTurnId(message.turn_id ?? ""),
-      );
-    } catch (error) {
-      this.logger.warn("workflow decision refresh failed", { bindingId: binding.id, error });
-    }
   }
 
   private async presentInteraction(
@@ -2529,19 +2176,6 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function settlesWithin(task: Promise<void>, timeoutMs: number): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      task.then(() => true),
-      new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 function isContinueCommand(body: string): boolean {
   return body.trim().toLowerCase() === "/continue";
