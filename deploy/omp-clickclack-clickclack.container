@@ -12,7 +12,7 @@ Wants=network-online.target omp-auth-broker.service
 
 [Container]
 ContainerName=omp-clickclack-clickclack
-Image=localhost/omp-clickclack:b00af20-omp18.3.5
+Image=localhost/omp-clickclack:3efe88e-omp18.3.5
 Pull=never
 UserNS=keep-id
 ReadOnly=true
