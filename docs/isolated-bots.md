@@ -77,6 +77,7 @@ every bot shares one model credential pool through `omp-auth-broker.service`, wh
 - networking is pasta. host loopback is closed except port 8888 (hindsight), 8766 (auth broker), and 9001 (browseros MCP). `matchfi` and `pi` also get 7434 for kasmos, which `matchfi-replit/.mcp.json` declares. the tailnet ClickClack URL resolves and connects normally.
 - MCP servers come from `/bot/agent/mcp.json` plus the project's own `.mcp.json`. OAuth servers such as linear read their credential from the shared auth broker, so one login in the host omp (`/mcp reauth <server>` with the same server URL) covers every bot.
 - omp drops a project server whose URL, headers, and auth match a server already loaded, and omp keys OAuth credentials by server URL. `utmco/.mcp.json`'s `linear-utmco` has the same URL as `linear`, so utmco's bot gets only `linear`, with the main Linear login.
+- `matchfi-replit/.mcp.json` also declares playwright. the image ships no browser, and browseros covers browser work, so the `matchfi` and `pi` bots list it in `disabledServers` in their `/bot/agent/mcp.json`. that hides it without changing the project's file.
 - ClickClack permissions are enforced server-side by each bot's own token. the private `HOME` is a storage boundary, not the security boundary; the mount set is.
 
 ## limits
