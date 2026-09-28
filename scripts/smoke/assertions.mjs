@@ -3,19 +3,18 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const packagePath = fileURLToPath(new URL('../../package.json', import.meta.url));
-export const sdkName = '@earendil-works/pi-coding-agent';
+export const sdkName = '@oh-my-pi/pi-coding-agent';
 export function pinnedSdkVersion() {
   const expected = JSON.parse(readFileSync(packagePath, 'utf8')).dependencies[sdkName];
   assert.match(expected, /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/, 'SDK dependency must be an exact pin');
-  const installed = JSON.parse(readFileSync(new URL('../../node_modules/@earendil-works/pi-coding-agent/package.json', import.meta.url), 'utf8')).version;
+  const installed = JSON.parse(readFileSync(new URL('../../node_modules/@oh-my-pi/pi-coding-agent/package.json', import.meta.url), 'utf8')).version;
   assert.equal(installed, expected, 'installed SDK must match repository metadata');
   return expected;
 }
 
-export function assertDiagnostics(diagnostics, extensionErrors, hookErrors = []) {
-  assert.ok(Array.isArray(diagnostics) && Array.isArray(extensionErrors), 'SDK diagnostics must be available');
-  assert.equal(diagnostics.filter(d => d.type === 'error').length, 0, 'runtime initialization errors');
-  assert.equal(extensionErrors.length, 0, 'extension load errors');
+export function assertLoadedExtensions(loaded, expected, hookErrors = []) {
+  assert.ok(Array.isArray(loaded) && Array.isArray(expected), 'extension paths must be available');
+  assert.deepEqual(expected.filter(path => !loaded.includes(path)), [], 'configured extension paths must load');
   assert.equal(hookErrors.length, 0, 'extension hook errors');
 }
 
@@ -33,7 +32,9 @@ export function assertContinuation(messages, expectedVersion, expectedPath) {
   assert.equal(results[0].toolCallId, calls[0].id, 'tool result must match call');
   assert.equal(results[0].isError, false, 'successful read required');
   const readText = results[0].content.filter(b => b.type === 'text').map(b => b.text).join('');
-  const readPackage = JSON.parse(readText);
+  assert.ok(readText.includes(sdkName) && readText.includes(expectedVersion), 'read output must show the pinned SDK');
+  assert.equal(results[0].details?.truncation, undefined, 'complete package read required');
+  const readPackage = JSON.parse(results[0].details?.displayContent?.text);
   assert.equal(readPackage.dependencies?.[sdkName], expectedVersion, 'read result must contain the pinned SDK dependency');
   const callMessage = assistants.find(m => m.content.includes(calls[0]));
   const final = assistants.at(-1);

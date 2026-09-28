@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DefaultResourceLoader, SettingsManager, getSelectListTheme } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@oh-my-pi/pi-coding-agent";
 
 import { bridgeAppendSystemPrompt, createEmbeddedPiRuntime, loadBridgeSystemPrompts } from "./pi-runtime.js";
 
@@ -14,25 +14,19 @@ test("bridge tells Pi how to work and narrate through ClickClack", () => {
   assert.match(bridgeAppendSystemPrompt, /Do not use terse status headings/u);
 });
 
-test("embedded Pi initializes a headless theme for connector extensions", () => {
-  createEmbeddedPiRuntime({
-    clickClack: {
-      baseUrl: "http://localhost",
-      workspaceId: "workspace",
-      botToken: "token",
-      ownerIds: [],
-    },
-    projects: new Map(),
-    invocationBindings: [],
-    pi: {
-      model: "provider/model",
-      thinkingLevel: "off",
-      agentDir: "/tmp/pi-clickclack-test-agent",
-    },
-    statePath: "/tmp/pi-clickclack-test-state.sqlite",
-  });
-
-  assert.doesNotThrow(() => getSelectListTheme().selectedPrefix(">"));
+test("embedded OMP initializes a headless session with UI requests and no model call", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-headless-"));
+  try {
+    const { session } = await createAgentSession({
+      cwd: root, agentDir: root, sessionManager: SessionManager.inMemory(root),
+      disableExtensionDiscovery: true, hasUI: false, interactivePrompts: true,
+      cacheWarming: false, bindProcessState: false,
+    });
+    try {
+      assert.ok(session.getActiveToolNames().includes("ask"), "a remote UI request remains available without a terminal");
+      assert.equal(session.messages.length, 0);
+    } finally { await session.dispose(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("loads the exact voice profile alongside bridge instructions without a model tool call", async () => {
@@ -45,17 +39,20 @@ test("loads the exact voice profile alongside bridge instructions without a mode
     assert.equal(prompts[0], bridgeAppendSystemPrompt);
     assert.ok(prompts[1]?.endsWith(content));
     assert.match(prompts[1] ?? "", /already loaded/u);
-    const loader = new DefaultResourceLoader({
-      cwd: root, agentDir: root, settingsManager: SettingsManager.inMemory(),
-      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      appendSystemPrompt: prompts,
+    const { session } = await createAgentSession({
+      cwd: root, agentDir: root, sessionManager: SessionManager.inMemory(root),
+      disableExtensionDiscovery: true, appendSystemPrompt: prompts.join("\n\n"),
+      cacheWarming: false, bindProcessState: false,
     });
-    await loader.reload();
-    assert.deepEqual(loader.getAppendSystemPrompt(), prompts);
-    writeFileSync(path, "updated profile");
-    await loader.reload();
-    assert.deepEqual(loader.getAppendSystemPrompt(), prompts, "reload does not silently change the runtime's system prefix");
-    assert.ok(loadBridgeSystemPrompts(path)[1]?.endsWith("updated profile"));
+    try {
+      const first = session.systemPrompt.join("\n");
+      assert.match(first, /lowercase chat/u);
+      writeFileSync(path, "updated profile");
+      await session.reload();
+      assert.equal(session.systemPrompt.join("\n"), first, "reload keeps the existing session's stable prompt snapshot");
+      assert.ok(loadBridgeSystemPrompts(path)[1]?.endsWith("updated profile"));
+      assert.ok(prompts[1]?.endsWith(content));
+    } finally { await session.dispose(); }
     assert.ok(prompts[1]?.endsWith(content), "an existing runtime retains its stable prompt snapshot");
   } finally {
     rmSync(root, { recursive: true, force: true });

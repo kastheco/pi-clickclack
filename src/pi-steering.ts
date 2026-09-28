@@ -1,12 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { AgentSession, PromptOptions } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, PromptOptions } from "@oh-my-pi/pi-coding-agent";
 
 const intercepting = new WeakSet<object>();
 const receiptScope = new AsyncLocalStorage<object | undefined>();
 
-/** Pi 0.87.1 runs input hooks before enqueueing and preserves message identity.
- * Keep capture scoped to this SDK call, excluding input-hook-owned messages.
- */
+/** Omp queues the same message object it emits in message_start. Capture only the
+ * object submitted by this steer call, excluding input-hook-owned messages. */
 export async function steerWithReceipt(
   session: AgentSession,
   text: string,
@@ -33,8 +32,6 @@ export async function steerWithReceipt(
     }
     return original.apply(this, args);
   };
-  // The SDK continuation resumes in our scope, but the hook and any work it
-  // starts do not. A handled input cannot acknowledge a hook-owned message.
   const input: typeof originalInput = originalInput && function (this: NonNullable<typeof runner>, ...args) {
     return receiptScope.run(undefined, () => originalInput.apply(this, args));
   };
@@ -49,8 +46,6 @@ export async function steerWithReceipt(
     if (runner && input && runner.emitInput === input) runner.emitInput = originalInput!;
     intercepting.delete(agent);
     unsubscribe?.();
-    // A rejection may happen after enqueue. Keep that identity too.
-    // queue_update listeners may reenter the SDK. Ambiguity confirms nothing.
     if (messages.length === 1) capture(messages[0]!, consumed.has(messages[0]!));
   }
 }

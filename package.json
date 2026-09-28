@@ -7,22 +7,22 @@
     "pi-clickclack-persona": "./scripts/add-persona.mjs"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "persona:add": "node scripts/add-persona.mjs",
-    "start": "node --env-file-if-exists=.env dist/index.js",
+    "build": "bun run tsc -p tsconfig.json",
+    "persona:add": "bun scripts/add-persona.mjs",
+    "start": "bun --env-file-if-exists=.env src/index.ts",
     "service:install": "node scripts/install-user-service.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --test dist/*.test.js dist/**/*.test.js scripts/smoke/*.test.mjs",
-    "test:smoke": "node --test scripts/smoke/*.test.mjs",
-    "test:injector-integration": "node --experimental-vm-modules scripts/smoke/integration.mjs",
-    "test:live-smoke": "node scripts/smoke/live.mjs",
-    "test:workflow-integration": "node scripts/test-orkastrator-decision-integration.mjs",
-    "test:workflow-durable-integration": "node scripts/test-workflow-durable-integration.mjs"
+    "typecheck": "bun run tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "test:smoke": "bun test scripts/smoke/*.test.mjs",
+    "test:injector-integration": "bun scripts/smoke/integration.mjs",
+    "test:live-smoke": "bun scripts/smoke/live.mjs",
+    "test:workflow-integration": "bun scripts/test-orkastrator-decision-integration.mjs",
+    "test:workflow-durable-integration": "bun scripts/test-workflow-durable-integration.mjs"
   },
   "dependencies": {
     "@clickclack/sdk-ts": "file:../clickclack/packages/sdk-ts",
-    "@earendil-works/pi-coding-agent": "0.87.1",
-    "@osolmaz/pi-workflows": "file:vendor/osolmaz-pi-workflows-0.16.5-kas.769.9.tgz",
+    "@oh-my-pi/pi-coding-agent": "18.3.5",
+    "@osolmaz/pi-workflows": "file:vendor/osolmaz-pi-workflows-0.16.5-kas.769.9-omp.tgz",
     "valibot": "^1.4.2"
   },
   "devDependencies": {
@@ -30,7 +30,7 @@
     "typescript": "^6.0.2"
   },
   "engines": {
-    "node": ">=24"
+    "bun": ">=1.4.2"
   },
-  "packageManager": "pnpm@11.20.0"
+  "packageManager": "bun@1.4.2"
 }

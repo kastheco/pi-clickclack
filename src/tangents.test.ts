@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import type { RealtimeEvent } from "@clickclack/sdk-ts";
-import type { AgentSessionRuntime, FileEntry } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, FileEntry } from "@oh-my-pi/pi-coding-agent";
 
 import type { Logger } from "./logger.js";
+import { createEmbeddedPiRuntime } from "./pi-runtime.js";
+import { toProjectAlias } from "./types.js";
 import {
   TangentHost,
   forkEntriesFromSessionText,
@@ -41,6 +46,30 @@ test("a fork copies the history under a new session id that points at its source
   assert.equal(entries.length, 2);
   assert.equal((entries[1] as { id: string }).id, "e1");
   assert.equal(forkEntriesFromSessionText("", "/x"), undefined);
+});
+test("OMP tangent fork opens source history in memory without writing a bound session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-tangent-fork-"));
+  const alias = toProjectAlias("fork");
+  try {
+    const source = [
+      JSON.stringify({ type: "session", version: 3, id: "bound", timestamp: "2026-01-01T00:00:00Z", cwd: root }),
+      JSON.stringify({ type: "message", id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: [{ type: "text", text: "remember the sidebar" }], timestamp: 1 } }),
+    ].join("\n");
+    const entries = forkEntriesFromSessionText(source, join(root, "bound.jsonl"));
+    assert.ok(entries);
+    const runtime = createEmbeddedPiRuntime({
+      clickClack: { baseUrl: "http://localhost", workspaceId: "offline", botToken: "fixture", ownerIds: [] },
+      projects: new Map([[alias, { alias, cwd: root }]]), invocationBindings: [],
+      pi: { model: "openai-codex/gpt-5.6-sol", thinkingLevel: "off", agentDir: join(root, "agent") },
+      statePath: join(root, "state.sqlite"),
+    });
+    const session = await runtime.createSessionRuntime({ projectAlias: "fork", forkEntries: entries });
+    try {
+      assert.equal(session.messages.length, 1);
+      assert.deepEqual(session.messages[0], { role: "user", content: [{ type: "text", text: "remember the sidebar" }], timestamp: 1 });
+      assert.equal(session.sessionFile, undefined, "tangent history must not create a resumable session");
+    } finally { await session.dispose(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 type Harness = {
@@ -96,10 +125,10 @@ function harness(options: Partial<TangentHostOptions> & { hold?: boolean; bound?
       const fake: FakeRuntime = { aborted: 0, disposed: 0, prompts: [] };
       runtimes.push(fake);
       return {
-        session: { abort: async () => void (fake.aborted += 1) },
+        abort: async () => void (fake.aborted += 1),
         dispose: async () => void (fake.disposed += 1),
         fake,
-      } as unknown as AgentSessionRuntime;
+      } as unknown as AgentSession;
     },
     runTurn: async (runtime, prompt) => {
       const fake = (runtime as unknown as { fake: FakeRuntime }).fake;

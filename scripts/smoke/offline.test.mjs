@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { assertContinuation, assertDiagnostics, packagePath, pinnedSdkVersion, timeoutMs, withTimeout } from './assertions.mjs';
+import { assertContinuation, assertLoadedExtensions, packagePath, pinnedSdkVersion, timeoutMs, withTimeout } from './assertions.mjs';
 import { exerciseLineage } from './lineage.mjs';
 
 const version = pinnedSdkVersion();
@@ -10,7 +10,7 @@ function transcript() {
   return [
     { role: 'user', content: 'probe' },
     { role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: { path: packagePath } }] },
-    { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', isError: false, content: [{ type: 'text', text: JSON.stringify({ dependencies: { '@earendil-works/pi-coding-agent': version } }) }] },
+    { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', isError: false, content: [{ type: 'text', text: '[package.json#offline]\n1:{"dependencies":{"@oh-my-pi/pi-coding-agent":"' + version + '"}}' }], details: { displayContent: { text: JSON.stringify({ dependencies: { '@oh-my-pi/pi-coding-agent': version } }) } } },
     { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: version }] },
   ];
 }
@@ -21,8 +21,9 @@ const failures = {
   'no tool continuation': messages => messages.splice(1, 2),
   'failed read': messages => { messages[2].isError = true; },
   'empty read content': messages => { messages[2].content = []; },
-  'unrelated read content': messages => { messages[2].content[0].text = '{}'; },
-  'truncated read content': messages => { messages[2].content[0].text = '{'; },
+  'unrelated read content': messages => { messages[2].details.displayContent.text = '{}'; },
+  'truncated read content': messages => { messages[2].details.truncation = { truncated: true }; },
+  'missing display content': messages => { delete messages[2].details.displayContent; },
   'missing result status': messages => { delete messages[2].isError; },
   'wrong tool': messages => { messages[1].content[0].name = 'bash'; },
   'wrong path': messages => { messages[1].content[0].arguments.path = '/other/package.json'; },
@@ -43,12 +44,11 @@ for (const [name, mutate] of Object.entries(failures)) test(`smoke rejects ${nam
   const messages = transcript(); mutate(messages);
   assert.throws(() => assertContinuation(messages, version, packagePath));
 });
-test('diagnostics fail closed for load, initialization, hook, and missing diagnostics', () => {
-  assertDiagnostics([{ type: 'warning', message: 'reported separately' }], []);
-  assert.throws(() => assertDiagnostics([{ type: 'error' }], []));
-  assert.throws(() => assertDiagnostics([], [{ path: 'pi-lcm', error: 'native ABI mismatch' }]));
-  assert.throws(() => assertDiagnostics([], [], [{ message: 'startup error' }]));
-  assert.throws(() => assertDiagnostics(undefined, []));
+test('configured extension paths and hook errors fail closed', () => {
+  assertLoadedExtensions(['/extensions/context.ts'], ['/extensions/context.ts']);
+  assert.throws(() => assertLoadedExtensions(['/extensions/other.ts'], ['/extensions/context.ts']));
+  assert.throws(() => assertLoadedExtensions([], [], [{ message: 'startup error' }]));
+  assert.throws(() => assertLoadedExtensions(undefined, []));
 });
 test('timeouts validate input and abort without false success', async () => {
   for (const value of ['0', '-1', 'NaN', '1.2', '600001', 'Infinity', '']) assert.throws(() => timeoutMs(value));

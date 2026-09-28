@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
-import { buildSessionContext } from '@earendil-works/pi-coding-agent';
+import { buildSessionContext } from '@oh-my-pi/pi-coding-agent';
 
 const transpile = source => ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
 async function loadModule(path, dependencies) {
@@ -77,7 +77,7 @@ export async function installedInjectors(contextPath, hindsightRoot) {
   failure = false;
   const hindsightHooks = {};
   const index = await loadModule(new URL('extensions/index.ts', hindsightRoot), {
-    '@earendil-works/pi-coding-agent': { buildSessionContext },
+    '@oh-my-pi/pi-coding-agent': { buildSessionContext },
     './operations/tools.js': { registerTools() {} }, './tui/commands.js': { registerCommands() {} },
     './lifecycle/memory-lifecycle.js': { createMemoryLifecycle: () => ({ deps: {}, recall: (event, runtime) => policy.recall(event, runtime) }) },
   });

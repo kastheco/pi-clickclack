@@ -25,7 +25,7 @@ try {
   const inject = await installedInjectors(resolve(values['context-extension']), pathToFileURL(resolve(values['hindsight-root']) + sep));
   const result = await exerciseLineage(inject, await loadGuard(guardPath));
   assert.equal(createHash('sha256').update(readFileSync(guardPath)).digest('hex'), guardHash);
-  console.log('INTEGRATION_PASS ' + JSON.stringify({ sdk, node: process.version, guardHash, ...result }));
+  console.log('INTEGRATION_PASS ' + JSON.stringify({ sdk, bun: Bun.version, guardHash, ...result }));
 } catch (error) {
   console.error('INTEGRATION_FAIL', error);
   process.exitCode = 1;

@@ -1,6 +1,6 @@
 # Package customizations and update checks
 
-Last updated: 2026-09-05.
+Last updated: 2026-09-27.
 
 This is the running record of local package changes made during the bridge recovery. It isn't a complete inventory of every historical customization on this machine. Update this file whenever a package is patched, rebuilt, pinned, restored, or returned to upstream. Mirror it to the [Notion package-customization ledger](https://app.notion.com/p/Package-customizations-and-update-checks-3d2b3a0a9c1981398003f31d42068ecf) under the pi-clickclack project page.
 
@@ -10,12 +10,21 @@ Don't run a blanket package update until the installed local patches below have 
 
 1. Read the affected entry and upstream changes. Confirm whether upstream contains the fix.
 2. Keep the current package and rollback artifacts. Record the proposed version separately from the installed version.
-3. Test the candidate with the bridge's exact Node and embedded Pi versions. Don't infer these from whichever `pi` is first on PATH.
+3. Test the candidate with the bridge's pinned Bun `packageManager` and embedded Omp SDK dependency. Do not infer either from a global CLI.
 4. Run the committed offline suite, installed-injector integration, and explicitly authorized live smoke in [smoke-suite.md](smoke-suite.md). A load error blocks a full-health claim even if the model answers.
 5. Coordinate any bridge restart. Never rewrite or delete existing conversation history to make a consistency check pass.
 6. Update this ledger and its Notion mirror after verification. Record the upstream release/commit before marking a patch retired.
 
-## Current ledger
+## Current Omp checkout pins and vendored workflow client
+
+- `package.json` pins `@oh-my-pi/pi-coding-agent@18.3.5` and `bun@1.4.2`. `@osolmaz/pi-workflows` resolves to `file:vendor/osolmaz-pi-workflows-0.16.5-kas.769.9-omp.tgz`. The vendored package declares version `0.16.5` (its filename retains the source's `-kas.769.9` qualifier); do not confuse its metadata with the source archive version. Keep the file and matching lock integrity together.
+- Compared by extracting both archives, the source `vendor/osolmaz-pi-workflows-0.16.5-kas.769.9.tgz` contains 603 regular files and the retained Omp client archive contains 48. There are **555 removed**, **zero added**, **36 byte-identical retained**, and **12 changed** regular files. The source is itself a `-kas.769.9` candidate, not proof of equivalence with a pristine upstream npm release.
+- Removed files: 330 under `dist/` outside `dist/client` and `dist/state`, 125 `src/`, 63 `docs/`, 14 `examples/`, 10 `schemas/`, 7 `skills/`, 2 `protocol/`, 2 `scripts/`, one `plugins/` and `herdr-plugin.toml`. Client/state JS, declarations and maps remain; `dist/state/database.js` is present in the tarball.
+- Of the changed files, `package.json` normalizes version `0.16.5-kas.769.9` to `0.16.5`, limits `files` to client/state plus metadata, exports only `./client`, and removes every `@earendil-works/pi-*` dependency, dev dependency and peer dependency. It still contains the source's `bin`, `pi` and build scripts, whose viewer/extension/source targets are **not** included; use only the exported client API, not those commands or extension paths.
+- Runtime/declaration changes beyond metadata: `dist/client/client.js` and `client.d.ts` remove the `externalPresenter` subscription option; `dist/client/index.d.ts` and `view.d.ts` remove `ChangedFiles` exports, `historyReadOnly`, `operatorArtifacts` and `externalPresenterActive`. `dist/state/schema.js` and `schema.d.ts` remove workspace-git-evidence and imported-history SQL/exports/triggers (and recompute the schema digest); `dist/state/prune.js` removes the `imported_history_runs` exclusion from run-age selection. Four corresponding `.js.map` files also differ (`client/client`, `client/view`, `state/prune`, `state/schema`). Do not use an existing host DB with this pared-down schema without a separate compatibility/migration review.
+- Source archive SHA-256 `203822a1a163deac30146e83a6db1689f0265de4d4f631d6270a4ba112ff7648`; retained Omp archive SHA-256 `bfe091051d2125709a36cd3de012a2bf30dd8777e57e88c4986e7f2a24c47fb8`. The latter was repacked with `npm pack --ignore-scripts` from its extracted contents; all 48 file payload hashes were unchanged. The old one-off `scripts/sanitize-workflow-tarball.mjs` was removed rather than offering a misleading repeatable sanitizer (it did not implement the client/state code changes above).
+
+## Historical Pi recovery ledger (2026-09-05; not current Omp install state)
 
 | Package or component | Installed state | Local change | Update risk and retirement condition |
 | --- | --- | --- | --- |
@@ -72,3 +81,10 @@ Nvm default now points to Node `24.20.0`. Existing shells don't change automatic
 - Published and re-fetched the Notion ledger under pi-clickclack. Package entries and the reused project artwork are present. This file is its version-controlled source.
 - Installed `pi-better-openai` compatibility commit `171c36d` after source-fidelity checks, a red/green actual Pi 0.85.1 loader test, and package checks. Its baseline suite required local-only provisioning of a missing dev dependency, not a tracked dependency upgrade. The previous `codex-models.ts` and installed hash are in the backup root.
 - Installed the LCM dependency fix from commit `90698eb`. Backed up live LCM databases with integrity checks, verified the installed native regression, passed the repo-owned live smoke with normal exit 0, then restarted `pi-clickclack.service` successfully. No OpenClaw restart.
+### omp canary
+
+The canary runs under Bun 1.4.2 with `@oh-my-pi/pi-coding-agent` pinned to `18.3.5`. `CLICKCLACK_OMP_EXTENSION_PATHS` is a JSON array of absolute, read-only extension paths. The bridge passes these paths to omp as additional extension paths while disabling extension/plugin discovery from the writable agent directory. The canary extension set contains only `context-mode` and `pi-lcm`; `pi-kas` is intentionally excluded because its docs-reconciliation skill requires credentials unavailable to the scoped bot.
+
+Omp path-related environment variables are `PI_CODING_AGENT_DIR` (agent/config directory), `PI_CONFIG_FILES` (optional settings-file overlays), and `PI_WORKSPACE_DIR` (workspace root). The bridge aligns `PI_CODING_AGENT_DIR` with `CLICKCLACK_PI_AGENT_DIR`; it does not allow omp to fall back to the real user's `~/.omp` or `~/.pi` directories.
+
+Hindsight is configured in `settings.json` under the agent directory. The exact keys are `memory.backend: "hindsight"`, `hindsight.apiUrl` (for example `http://127.0.0.1:8888`), `hindsight.bankId` (an isolated bot bank), `hindsight.autoRecall` (the boolean recall mode), and `hindsight.scoping` (`global`, `per-project`, or `per-project-tagged`). Keep canary banks separate from legacy `kas-engineering` and `pi-global` banks. The SDK session options that prevent writable discovery are `disableExtensionDiscovery: true` and `additionalExtensionPaths: [...]`; the latter contains `CLICKCLACK_OMP_EXTENSION_PATHS`.

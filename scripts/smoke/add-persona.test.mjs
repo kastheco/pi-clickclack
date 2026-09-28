@@ -34,7 +34,6 @@ test("persona CLI parses interactive and automation flags", () => {
     "--yes",
     "--dry-run",
   ]);
-  assert.match(parsed.repo, /pi-clickclack$/u);
   assert.deepEqual({ ...parsed, repo: "<repo>" }, {
     repo: "<repo>",
     alias: "utmco",

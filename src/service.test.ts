@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
 
 import type { BotCommandInput, Message, MessageInput, RealtimeEvent } from "@clickclack/sdk-ts";
 
@@ -12,7 +12,7 @@ import { createBridgeApplication } from "./application.js";
 import type { ClickClackBoundary } from "./clickclack.js";
 import type { BridgeConfig, ProjectConfig } from "./config.js";
 import { createLogger } from "./logger.js";
-import type { EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
+import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { BridgeService } from "./service.js";
 import { StateStore, type ConversationBinding } from "./state/store.js";
 import type { ClaimedWorkflowDecision, DecisionAnswer } from "./workflow-decisions.js";
@@ -185,6 +185,30 @@ function fixture(projectNames: readonly string[] = ["main"]): Fixture {
     subscriptionCount: () => subscriptions,
   };
 }
+async function nativeRuntimeFixture(setup: Fixture, extensionSource = "export default function() {}") {
+  const root = mkdtempSync(join(tmpdir(), "omp-service-native-"));
+  const alias = toProjectAlias("main");
+  const extensionPath = join(root, "fixture-extension.ts");
+  writeFileSync(extensionPath, extensionSource);
+  setup.config.projects = new Map([[alias, { alias, cwd: root }]]);
+  setup.config.pi = { model: "openai-codex/gpt-5.6-sol", thinkingLevel: "off", agentDir: join(root, "agent"), extensionPaths: [extensionPath] };
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const bridge = createEmbeddedPiRuntime(setup.config);
+  try {
+    const session = await bridge.createSessionRuntime({ projectAlias: "main" });
+    return { bridge: { ...bridge, createSessionRuntime: async () => session }, session, async cleanup() {
+      await session.dispose();
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(root, { recursive: true, force: true });
+    } };
+  } catch (error) {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
 
 function message(input: {
   id: string;
@@ -256,7 +280,7 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   const setup = fixture();
   let sessionsCreated = 0;
   const piRuntime: EmbeddedPiRuntimeBoundary = {
-    kind: "embedded-pi-sdk",
+    kind: "embedded-omp-sdk",
     project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => {
       sessionsCreated += 1;
@@ -324,7 +348,7 @@ test("startup clears interrupted progress, fails interactions closed, and reconc
     clickClack: setup.clickClack,
     stateStore,
     piRuntime: {
-      kind: "embedded-pi-sdk",
+      kind: "embedded-omp-sdk",
       project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => { throw new Error("startup must not reopen interrupted sessions"); },
     },
@@ -363,7 +387,7 @@ test("a lost durable create response reconciles by nonce without retrying", asyn
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
     piRuntime: {
-      kind: "embedded-pi-sdk",
+      kind: "embedded-omp-sdk",
       project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => { throw new Error("not used"); },
     },
@@ -560,7 +584,7 @@ test("shutdown drains an in-flight realtime catch-up before closing state", asyn
     };
   };
   const piRuntime: EmbeddedPiRuntimeBoundary = {
-    kind: "embedded-pi-sdk",
+    kind: "embedded-omp-sdk",
     project: (alias) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => { throw new Error("runtime must not start during shutdown"); },
   };
@@ -594,43 +618,38 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   const sessionMessages: unknown[] = [];
   let receivedPrompt = "";
   let sessionListener: ((event: unknown) => void) | undefined;
-  const runtime = {
-    session: {
-      sessionId: "session-1",
-      sessionFile: "/tmp/session-1.jsonl",
-      messages: sessionMessages,
-      subscribe(listener: (event: unknown) => void) {
-        sessionListener = listener;
-        return () => { sessionListener = undefined; };
-      },
-      async prompt(text: string) {
-        receivedPrompt = text;
-        const preamble = { role: "assistant", content: [{ type: "text", text: "I'll inspect the project." }], stopReason: "toolUse" };
-        sessionListener?.({ type: "message_start", message: { role: "assistant", content: [] } });
-        sessionListener?.({ type: "message_update", message: preamble, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "I'll inspect the project." } });
-        sessionListener?.({ type: "message_end", message: preamble });
-        sessionListener?.({ type: "tool_execution_start", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" } });
-        sessionListener?.({ type: "tool_execution_end", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" }, result: {}, isError: false });
-        sessionListener?.({
-          type: "tool_execution_end",
-          toolCallId: "todo_1",
-          toolName: "todo",
-          args: { action: "create" },
-          result: { details: { tasks: [{ id: 1, subject: "Inspect project", activeForm: "inspecting project", status: "in_progress" }] } },
-          isError: false,
-        });
-        sessionMessages.push(preamble);
-        const assistant = { role: "assistant", content: [{ type: "text", text: "hello from pi" }], stopReason: "stop" };
-        sessionListener?.({ type: "message_start", message: { role: "assistant", content: [] } });
-        sessionListener?.({ type: "message_update", message: assistant, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello from pi" } });
-        sessionListener?.({ type: "message_end", message: assistant });
-        sessionMessages.push(assistant);
-      },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-1",
+  sessionFile: "/tmp/session-1.jsonl",
+  messages: sessionMessages,
+  subscribe(listener: (event: unknown) => void) {
+    sessionListener = listener;
+    return () => { sessionListener = undefined; };
+  },
+  async prompt(text: string) {
+    receivedPrompt = text;
+    const preamble = { role: "assistant", content: [{ type: "text", text: "I'll inspect the project." }], stopReason: "toolUse" };
+    sessionListener?.({ type: "message_start", message: { role: "assistant", content: [] } });
+    sessionListener?.({ type: "message_update", message: preamble, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "I'll inspect the project." } });
+    sessionListener?.({ type: "message_end", message: preamble });
+    sessionListener?.({ type: "tool_execution_start", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" } });
+    sessionListener?.({ type: "tool_execution_end", toolCallId: "tool_1", toolName: "read", args: { path: "/tmp/main/package.json" }, result: {}, isError: false });
+    sessionListener?.({
+      type: "tool_execution_end",
+      toolCallId: "todo_1",
+      toolName: "todo",
+      args: { action: "create" },
+      result: { details: { tasks: [{ id: 1, subject: "Inspect project", activeForm: "inspecting project", status: "in_progress" }] } },
+      isError: false,
+    });
+    sessionMessages.push(preamble);
+    const assistant = { role: "assistant", content: [{ type: "text", text: "hello from pi" }], stopReason: "stop" };
+    sessionListener?.({ type: "message_start", message: { role: "assistant", content: [] } });
+    sessionListener?.({ type: "message_update", message: assistant, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello from pi" } });
+    sessionListener?.({ type: "message_end", message: assistant });
+    sessionMessages.push(assistant);
+  }, async dispose() {} };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -714,38 +733,44 @@ test("an owner mention auto-binds the only project, runs Pi, and replies", async
   assert.equal(workflowClientClosed, 1);
 });
 
-test("Pi confirmation pauses for a correlated owner reply and resumes the same turn", async () => {
+test("bridge runs a loaded OMP extension session_start before the first bound command", async (t) => {
   const setup = fixture();
-  let uiContext: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  const native = await nativeRuntimeFixture(setup, `export default function(pi) {
+    pi.on("session_start", () => pi.appendEntry("bridge-session-start", { observed: true }));
+  }`);
+  t.after(native.cleanup);
+  const service = new BridgeService(setup.config, {
+    clickClack: setup.clickClack, piRuntime: native.bridge, logger: createLogger({ sink() {} }),
+  });
+  service.state.upsertBinding({ conversationType: "direct", conversationId: "dcn_start" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
+  const source = message({ id: "msg_session_start", body: "/session", directConversationId: "dcn_start" });
+  setup.messages.set(source.id, source);
+  await service.start();
+  setup.emit(createdEvent({ messageId: source.id, cursor: "cur_session_start" }));
+  await service.waitForIdle();
+  const markers = native.session.sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === "bridge-session-start");
+  assert.equal(markers.length, 1, "startup side effects must run once when the bridge binds the native extension");
+  assert.deepEqual(markers[0]?.type === "custom" ? markers[0].data : undefined, { observed: true });
+  await service.waitForStop();
+});
+test("Pi confirmation pauses for a correlated owner reply and resumes the same turn", async (t) => {
+  const setup = fixture();
+  const native = await nativeRuntimeFixture(setup);
+  t.after(native.cleanup);
   let confirmed: boolean | undefined;
   const sessionMessages: unknown[] = [];
-  const runtime = {
-    session: {
-      sessionId: "session-confirm",
-      sessionFile: "/tmp/session-confirm.jsonl",
-      messages: sessionMessages,
-      extensionRunner: { getUIContext: () => ({}) },
-      async bindExtensions(binding: { uiContext: typeof uiContext }) { uiContext = binding.uiContext; },
-      subscribe() { return () => {}; },
-      async prompt() {
-        confirmed = await uiContext!.confirm("Deploy?", "Ship this release.");
-        sessionMessages.push({
-          role: "assistant",
-          content: [{ type: "text", text: confirmed ? "approved" : "declined" }],
-          stopReason: "stop",
-        });
-      },
-    },
-    async dispose() {},
+  const runtime = native.session;
+  Object.defineProperty(runtime, "messages", { value: sessionMessages });
+  runtime.prompt = async () => {
+    const ui = runtime.extensionRunner?.getUIContext();
+    assert.ok(ui);
+    confirmed = await ui.confirm("Deploy?", "Ship this release.");
+    sessionMessages.push({ role: "assistant", content: [{ type: "text", text: confirmed ? "approved" : "declined" }], stopReason: "stop" });
+    return true;
   };
-  const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
-    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
-    createSessionRuntime: async () => runtime,
-  } as unknown as EmbeddedPiRuntimeBoundary;
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
-    piRuntime,
+    piRuntime: native.bridge,
     logger: createLogger({ sink() {} }),
   });
   const source = message({ id: "msg_confirm", body: "deploy", directConversationId: "dm_confirm" });
@@ -753,7 +778,8 @@ test("Pi confirmation pauses for a correlated owner reply and resumes the same t
 
   await service.start();
   setup.emit(createdEvent({ messageId: source.id, cursor: "cur_200" }));
-  for (let attempt = 0; attempt < 20 && setup.activity.length === 0; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  const deadline = Date.now() + 2000;
+  while (setup.activity.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
   assert.match(setup.activity[0]?.body ?? "", /Reply `yes` or `no`/u);
   assert.equal(
     (service.state.database.prepare("SELECT status FROM pending_interactive_requests").get() as { status: string }).status,
@@ -775,33 +801,24 @@ test("Pi confirmation pauses for a correlated owner reply and resumes the same t
   await service.waitForStop();
 });
 
-test("Pi confirmation fails closed on timeout", async () => {
+test("Pi confirmation fails closed on timeout", async (t) => {
   const setup = fixture();
-  let uiContext: { confirm(title: string, message: string): Promise<boolean> } | undefined;
+  const native = await nativeRuntimeFixture(setup);
+  t.after(native.cleanup);
   let confirmed: boolean | undefined;
   const sessionMessages: unknown[] = [];
-  const runtime = {
-    session: {
-      sessionId: "session-confirm-timeout",
-      sessionFile: "/tmp/session-confirm-timeout.jsonl",
-      messages: sessionMessages,
-      extensionRunner: { getUIContext: () => ({}) },
-      async bindExtensions(binding: { uiContext: typeof uiContext }) { uiContext = binding.uiContext; },
-      subscribe() { return () => {}; },
-      async prompt() {
-        confirmed = await uiContext!.confirm("Delete?", "Remove the artifact.");
-        sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "safe" }], stopReason: "stop" });
-      },
-    },
-    async dispose() {},
+  const runtime = native.session;
+  Object.defineProperty(runtime, "messages", { value: sessionMessages });
+  runtime.prompt = async () => {
+    const ui = runtime.extensionRunner?.getUIContext();
+    assert.ok(ui);
+    confirmed = await ui.confirm("Delete?", "Remove the artifact.");
+    sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "safe" }], stopReason: "stop" });
+    return true;
   };
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
-    piRuntime: {
-      kind: "embedded-pi-sdk" as const,
-      project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
-      createSessionRuntime: async () => runtime,
-    } as unknown as EmbeddedPiRuntimeBoundary,
+    piRuntime: native.bridge,
     logger: createLogger({ sink() {} }),
     interactiveTimeoutMs: 1,
   });
@@ -821,19 +838,17 @@ test("Pi confirmation fails closed on timeout", async () => {
 test("application shutdown reports a stuck runtime and keeps the process safety deadline actionable", async () => {
   const setup = fixture();
   const runtime = {
-    session: {
-      sessionId: "session-hung-runtime",
-      sessionFile: "/tmp/session-hung-runtime.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() {
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
-      },
+    sessionId: "session-hung-runtime",
+    sessionFile: "/tmp/session-hung-runtime.jsonl",
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    async prompt() {
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
     },
     async dispose() { await new Promise<void>(() => {}); },
   };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -876,19 +891,17 @@ test("application shutdown drains runtime creation before disposal and state clo
   const creationStarted = new Promise<void>((resolve) => { markCreationStarted = resolve; });
   let disposed = 0;
   const runtime = {
-    session: {
-      sessionId: "session-late-runtime",
-      sessionFile: "/tmp/session-late-runtime.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() {
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
-      },
+    sessionId: "session-late-runtime",
+    sessionFile: "/tmp/session-late-runtime.jsonl",
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    async prompt() {
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
     },
     async dispose() { disposed += 1; },
   };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => {
       markCreationStarted();
@@ -926,19 +939,17 @@ test("application shutdown reports rejected runtime disposal", async () => {
   const setup = fixture();
   let workflowClientClosed = 0;
   const runtime = {
-    session: {
-      sessionId: "session-rejected-disposal",
-      sessionFile: "/tmp/session-rejected-disposal.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() {
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
-      },
+    sessionId: "session-rejected-disposal",
+    sessionFile: "/tmp/session-rejected-disposal.jsonl",
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    async prompt() {
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" });
     },
     async dispose() { throw new Error("dispose failed"); },
   };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1010,29 +1021,24 @@ test("an attachment is hydrated, downloaded, and passed to Pi as an image", asyn
   });
   let receivedPrompt = "";
   let receivedImages: unknown[] | undefined;
-  const runtime = {
-    session: {
-      sessionId: "session-image",
-      sessionFile: "/tmp/session-image.jsonl",
-      messages: [] as unknown[],
-      get isIdle() { return sessionIdle; },
-      subscribe() { return () => {}; },
-      async waitForIdle() {
-        lifecycle.push("wait");
-        sessionIdle = true;
-      },
-      async prompt(text: string, options?: { images?: unknown[] }) {
-        lifecycle.push("prompt");
-        assert.equal(sessionIdle, true);
-        receivedPrompt = text;
-        receivedImages = options?.images;
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "seen" }], stopReason: "stop" });
-      },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-image",
+  sessionFile: "/tmp/session-image.jsonl",
+  messages: [] as unknown[],
+  get isStreaming() { return !sessionIdle; },
+  subscribe() { return () => {}; },
+  async waitForIdle() {
+    lifecycle.push("wait");
+    sessionIdle = true;
+  },
+  async prompt(text: string, options?: { images?: unknown[] }) {
+    lifecycle.push("prompt");
+    assert.equal(sessionIdle, true);
+    receivedPrompt = text;
+    receivedImages = options?.images;
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: "seen" }], stopReason: "stop" });
+  }, async dispose() {} };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1101,23 +1107,18 @@ test("non-image attachments are materialized as safe Pi inputs", async () => {
     });
     let receivedPrompt = "";
     const sessionMessages: unknown[] = [];
-    const runtime = {
-      session: {
-        sessionId: "session-file",
-        sessionFile: join(root, "session-file.jsonl"),
-        messages: sessionMessages,
-        subscribe() { return () => {}; },
-        async prompt(text: string) {
-          receivedPrompt = text;
-          sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "read" }], stopReason: "stop" });
-        },
-      },
-      async dispose() {},
-    };
+    const runtime = { sessionId: "session-file",
+    sessionFile: join(root, "session-file.jsonl"),
+    messages: sessionMessages,
+    subscribe() { return () => {}; },
+    async prompt(text: string) {
+      receivedPrompt = text;
+      sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "read" }], stopReason: "stop" });
+    }, async dispose() {} };
     const service = new BridgeService(setup.config, {
       clickClack: setup.clickClack,
       piRuntime: {
-        kind: "embedded-pi-sdk" as const,
+        kind: "embedded-omp-sdk" as const,
         project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
         createSessionRuntime: async () => runtime,
       } as unknown as EmbeddedPiRuntimeBoundary,
@@ -1158,31 +1159,26 @@ test("successful referenced write outputs are uploaded and attached to the final
     });
     let listener: ((event: unknown) => void) | undefined;
     const sessionMessages: unknown[] = [];
-    const runtime = {
-      session: {
-        sessionId: "session-output",
-        sessionFile: join(root, "session-output.jsonl"),
-        messages: sessionMessages,
-        subscribe(callback: (event: unknown) => void) { listener = callback; return () => { listener = undefined; }; },
-        async prompt() {
-          const outputPath = join(root, "artifacts", "report.pdf");
-          mkdirSync(join(root, "artifacts"), { recursive: true });
-          writeFileSync(outputPath, "PDF", { flag: "w" });
-          listener?.({ type: "tool_execution_start", toolCallId: "write_1", toolName: "write", args: { path: "artifacts/report.pdf" } });
-          listener?.({ type: "tool_execution_end", toolCallId: "write_1", toolName: "write", isError: false });
-          sessionMessages.push({
-            role: "assistant",
-            content: [{ type: "text", text: "Created `artifacts/report.pdf`." }],
-            stopReason: "stop",
-          });
-        },
-      },
-      async dispose() {},
-    };
+    const runtime = { sessionId: "session-output",
+    sessionFile: join(root, "session-output.jsonl"),
+    messages: sessionMessages,
+    subscribe(callback: (event: unknown) => void) { listener = callback; return () => { listener = undefined; }; },
+    async prompt() {
+      const outputPath = join(root, "artifacts", "report.pdf");
+      mkdirSync(join(root, "artifacts"), { recursive: true });
+      writeFileSync(outputPath, "PDF", { flag: "w" });
+      listener?.({ type: "tool_execution_start", toolCallId: "write_1", toolName: "write", args: { path: "artifacts/report.pdf" } });
+      listener?.({ type: "tool_execution_end", toolCallId: "write_1", toolName: "write", isError: false });
+      sessionMessages.push({
+        role: "assistant",
+        content: [{ type: "text", text: "Created `artifacts/report.pdf`." }],
+        stopReason: "stop",
+      });
+    }, async dispose() {} };
     const service = new BridgeService(setup.config, {
       clickClack: setup.clickClack,
       piRuntime: {
-        kind: "embedded-pi-sdk" as const,
+        kind: "embedded-omp-sdk" as const,
         project: (projectAlias: string) => setup.config.projects.get(toProjectAlias(projectAlias))!,
         createSessionRuntime: async () => runtime,
       } as unknown as EmbeddedPiRuntimeBoundary,
@@ -1219,7 +1215,7 @@ test("an incomplete attachment set fails visibly without prompting Pi", async ()
     return source;
   };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => {
       throw new Error("Pi must not start for incomplete attachments");
@@ -1280,18 +1276,13 @@ test("oversized images are rejected before the bridge downloads them", async () 
     },
   });
   let prompts = 0;
-  const runtime = {
-    session: {
-      sessionId: "session-large-image",
-      sessionFile: "/tmp/session-large-image.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() { prompts += 1; },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-large-image",
+  sessionFile: "/tmp/session-large-image.jsonl",
+  messages: [] as unknown[],
+  subscribe() { return () => {}; },
+  async prompt() { prompts += 1; }, async dispose() {} };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1330,21 +1321,16 @@ test("continue restores the latest recoverable session and resumes its interrupt
     let openedSessionFile: string | undefined;
     let receivedPrompt = "";
     const sessionMessages: unknown[] = [];
-    const runtime = {
-      session: {
-        sessionId: "session-old",
-        sessionFile,
-        messages: sessionMessages,
-        subscribe() { return () => {}; },
-        async prompt(text: string) {
-          receivedPrompt = text;
-          sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "continued successfully" }], stopReason: "stop" });
-        },
-      },
-      async dispose() {},
-    };
+    const runtime = { sessionId: "session-old",
+    sessionFile,
+    messages: sessionMessages,
+    subscribe() { return () => {}; },
+    async prompt(text: string) {
+      receivedPrompt = text;
+      sessionMessages.push({ role: "assistant", content: [{ type: "text", text: "continued successfully" }], stopReason: "stop" });
+    }, async dispose() {} };
     const piRuntime = {
-      kind: "embedded-pi-sdk" as const,
+      kind: "embedded-omp-sdk" as const,
       project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async (request: { sessionFile?: string }) => {
         openedSessionFile = request.sessionFile;
@@ -1392,23 +1378,18 @@ test("continue replaces the workflow watcher even when the restored session keep
     const setup = fixture();
     const sessionFile = join(root, "session.jsonl");
     writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "session-live", cwd: "/tmp/main" }));
-    const runtime = (answer: string) => ({
-      session: {
-        sessionId: "session-live",
-        sessionFile,
-        sessionName: undefined as string | undefined,
-        messages: [] as unknown[],
-        subscribe() { return () => {}; },
-        setSessionName(name: string) { this.sessionName = name; },
-        async prompt() {
-          this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
-        },
-      },
-      async dispose() {},
-    });
+    const runtime = (answer: string) => ({ sessionId: "session-live",
+    sessionFile,
+    sessionName: undefined as string | undefined,
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    setSessionName(name: string) { this.sessionName = name; },
+    async prompt() {
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
+    }, async dispose() {} });
     const runtimes = [runtime("unused"), runtime("continued")];
     const piRuntime = {
-      kind: "embedded-pi-sdk" as const,
+      kind: "embedded-omp-sdk" as const,
       project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => runtimes.shift()!,
     } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1454,19 +1435,14 @@ test("a missing active session file is archived and replaced automatically", asy
     const missingSessionFile = join(root, "missing.jsonl");
     const replacementSessionFile = join(root, "replacement.jsonl");
     const createRequests: Array<{ projectAlias: string; sessionFile?: string }> = [];
-    const runtime = {
-      session: {
-        sessionId: "session-replacement",
-        sessionFile: replacementSessionFile,
-        sessionName: undefined as string | undefined,
-        messages: [] as unknown[],
-        subscribe() { return () => {}; },
-        setSessionName(name: string) { this.sessionName = name; },
-      },
-      async dispose() {},
-    };
+    const runtime = { sessionId: "session-replacement",
+    sessionFile: replacementSessionFile,
+    sessionName: undefined as string | undefined,
+    messages: [] as unknown[],
+    subscribe() { return () => {}; },
+    setSessionName(name: string) { this.sessionName = name; }, async dispose() {} };
     const piRuntime = {
-      kind: "embedded-pi-sdk" as const,
+      kind: "embedded-omp-sdk" as const,
       project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async (request: { projectAlias: string; sessionFile?: string }) => {
         createRequests.push(request);
@@ -1519,23 +1495,18 @@ test("a channel assigned to the bot persona invokes its project without a mentio
   const setup = fixture(["utmco"]);
   setup.assignedChannels.add("chn_radar");
   const prompts: string[] = [];
-  const runtime = {
-    session: {
-      sessionId: "session-utmco",
-      sessionFile: "/tmp/session-utmco.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt(text: string) {
-        prompts.push(text);
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "utmco answer" }], stopReason: "stop" });
-      },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-utmco",
+  sessionFile: "/tmp/session-utmco.jsonl",
+  messages: [] as unknown[],
+  subscribe() { return () => {}; },
+  async prompt(text: string) {
+    prompts.push(text);
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: "utmco answer" }], stopReason: "stop" });
+  }, async dispose() {} };
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
     piRuntime: {
-      kind: "embedded-pi-sdk",
+      kind: "embedded-omp-sdk",
       project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => runtime,
     } as unknown as EmbeddedPiRuntimeBoundary,
@@ -1558,7 +1529,7 @@ test("a channel assigned to the bot persona invokes its project without a mentio
 test("project command switches projects, archives the old session, and unmentioned channel text stays ignored", async () => {
   const setup = fixture(["main", "other"]);
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => { throw new Error("should not create a session"); },
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1597,21 +1568,16 @@ test("project command switches projects, archives the old session, and unmention
 
 test("project changes stop the old workflow watcher and bind the next project session", async () => {
   const setup = fixture(["main", "other"]);
-  const runtime = (sessionId: string, answer: string) => ({
-    session: {
-      sessionId,
-      sessionFile: `/tmp/${sessionId}.jsonl`,
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() {
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
-      },
-    },
-    async dispose() {},
-  });
+  const runtime = (sessionId: string, answer: string) => ({ sessionId,
+  sessionFile: `/tmp/${sessionId}.jsonl`,
+  messages: [] as unknown[],
+  subscribe() { return () => {}; },
+  async prompt() {
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" });
+  }, async dispose() {} });
   const runtimes = [runtime("session-main", "main answer"), runtime("session-other", "other answer")];
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtimes.shift()!,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1660,16 +1626,15 @@ test("Pi host commands compact, name, and replace the bound session without reac
     async compact(instructions?: string) { compactInstructions.push(instructions ?? ""); return {}; },
     setSessionName(name: string) { this.sessionName = name.trim(); },
   });
-  const runtime = {
-    session: createSession("session-1"),
+  const runtime = Object.assign(createSession("session-1"), {
     async newSession() {
-      this.session = createSession("session-2");
-      return { cancelled: false };
+      Object.assign(runtime, createSession("session-2"));
+      return true;
     },
     async dispose() {},
-  };
+  });
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1715,68 +1680,30 @@ test("Pi host commands compact, name, and replace the bound session without reac
   assert.deepEqual(workflow.stopped, ["session-1", "session-2"]);
 });
 
-test("extension slash commands report UI notifications after waiting for autonomous work", async () => {
+test("extension slash commands report UI notifications after waiting for autonomous work", async (t) => {
   const setup = fixture();
+  const native = await nativeRuntimeFixture(setup, `export default function(pi) {
+    pi.registerCommand("fast", { description: "Toggle OpenAI fast mode", handler: async (_args, ctx) => {
+      ctx.ui.setStatus("better-openai", "gpt-5.6 fast · 5h 42%");
+      ctx.ui.notify("OpenAI fast mode: on.", "info");
+    } });
+  }`);
+  t.after(native.cleanup);
+  const runtime = native.session;
   const receivedPrompts: string[] = [];
   const lifecycle: string[] = [];
   let idle = false;
-  let listener: ((event: unknown) => void) | undefined;
-  let notify: ((message: string) => void) | undefined;
-  let setStatus: ((key: string, text: string | undefined) => void) | undefined;
-  const runtimeStatuses: Array<{ kind: string; id: string; input: unknown }> = [];
-  const session = {
-    sessionId: "session-1",
-    sessionFile: "/tmp/session-1.jsonl",
-    messages: [] as unknown[],
-    model: { provider: "openai-codex", id: "gpt-5.6" },
-    thinkingLevel: "high",
-    get isIdle() { return idle; },
-    promptTemplates: [] as Array<{ name: string }>,
-    resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
-    extensionRunner: {
-      getCommand: (name: string) => name === "fast" ? {} : undefined,
-      getRegisteredCommands: () => [{ invocationName: "fast", description: "Toggle OpenAI fast mode" }],
-      getUIContext: () => ({}),
-    },
-    async bindExtensions(bindings: { uiContext?: { notify(message: string): void; setStatus(key: string, text: string | undefined): void } }) {
-      notify = bindings.uiContext?.notify;
-      setStatus = bindings.uiContext?.setStatus;
-    },
-    subscribe(next: (event: unknown) => void) {
-      listener = next;
-      return () => { listener = undefined; };
-    },
-    async waitForIdle() {
-      lifecycle.push("wait");
-      if (!idle) {
-        listener?.({
-          type: "tool_execution_start",
-          toolCallId: "prior-tool",
-          toolName: "read",
-          args: { path: "/tmp/prior" },
-        });
-        this.messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: "prior autonomous answer" }],
-          stopReason: "stop",
-        });
-        idle = true;
-      }
-    },
-    async prompt(text: string) {
-      assert.equal(idle, true);
-      lifecycle.push("prompt");
-      receivedPrompts.push(text);
-      setStatus?.("better-openai", "gpt-5.6 fast · 5h 42%");
-      notify?.("OpenAI fast mode: on.");
-    },
+  Object.defineProperty(runtime, "isStreaming", { get: () => !idle });
+  runtime.waitForIdle = async () => { lifecycle.push("wait"); idle = true; };
+  const originalPrompt = runtime.prompt.bind(runtime);
+  runtime.prompt = async (text, options) => {
+    assert.equal(idle, true);
+    lifecycle.push("prompt");
+    receivedPrompts.push(text);
+    return originalPrompt(text, options);
   };
-  const runtime = { session, async dispose() {} };
-  const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
-    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
-    createSessionRuntime: async () => runtime,
-  } as unknown as EmbeddedPiRuntimeBoundary;
+  runtime.agent.streamFn = () => { throw new Error("extension command must not call a model"); };
+  const runtimeStatuses: Array<{ kind: string; id: string; input: unknown }> = [];
   const service = new BridgeService(setup.config, {
     clickClack: {
       ...setup.clickClack,
@@ -1788,19 +1715,13 @@ test("extension slash commands report UI notifications after waiting for autonom
         },
       },
     },
-    piRuntime,
+    piRuntime: native.bridge,
     logger: createLogger({ sink() {} }),
   });
-  service.state.upsertBinding({
-    conversationType: "direct",
-    conversationId: "dcn_1" as never,
-    projectAlias: toProjectAlias("main"),
-    invocationMode: "auto",
-  });
+  service.state.upsertBinding({ conversationType: "direct", conversationId: "dcn_1" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
   const fast = message({ id: "msg_fast", body: "/fast", directConversationId: "dcn_1" });
   const unknown = message({ id: "msg_unknown", body: "/not-a-command", directConversationId: "dcn_1" });
-  setup.messages.set(fast.id, fast);
-  setup.messages.set(unknown.id, unknown);
+  setup.messages.set(fast.id, fast); setup.messages.set(unknown.id, unknown);
 
   await service.start();
   setup.emit(createdEvent({ messageId: fast.id, cursor: "cur_200" }));
@@ -1819,18 +1740,10 @@ test("extension slash commands report UI notifications after waiting for autonom
   await service.waitForStop();
   assert.ok(runtimeStatuses.length >= 2);
   assert.deepEqual(runtimeStatuses.at(-1), {
-    kind: "dms",
-    id: "dcn_1",
-    input: {
-      workspace_id: "wsp_test",
-      status: {
-        runtime: "pi",
-        model_provider: "openai-codex",
-        model_id: "gpt-5.6",
-        reasoning: "high",
-        fast_mode: true,
-      },
-    },
+    kind: "dms", id: "dcn_1", input: { workspace_id: "wsp_test", status: {
+      runtime: "pi", model_provider: runtime.model?.provider, model_id: runtime.model?.id,
+      reasoning: runtime.thinkingLevel ?? "off", fast_mode: true,
+    } },
   });
 });
 
@@ -1850,45 +1763,39 @@ test("adopts a background completion run that starts after the visible turn clos
     content: [{ type: "text" as const, text }],
     stopReason: "stop" as const,
   });
-  const runtime = {
-    session: {
-      sessionId: "session-background",
-      sessionFile: "/tmp/session-background.jsonl",
-      messages,
-      get isIdle() { return idle; },
-      get isStreaming() { return !idle; },
-      promptTemplates: [] as Array<{ name: string }>,
-      resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
-      extensionRunner: { getRegisteredCommands: () => [] },
-      subscribe(listener: (event: AgentSessionEvent) => void) {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-      },
-      agent: {
-        steer(message: object) {
-          queueMicrotask(() => emit({ type: "message_start", message } as AgentSessionEvent));
-        },
-      },
-      async steer(text: string) {
-        steered.push(text);
-        this.agent.steer({ role: "user", content: [{ type: "text", text }] });
-      },
-      getSteeringMessages() { return []; },
-      async waitForIdle() {
-        if (!idle) await backgroundGate;
-      },
-      async prompt() {
-        const reply = assistant("initial answer");
-        emit({ type: "agent_start" } as AgentSessionEvent);
-        emit({ type: "message_end", message: reply } as AgentSessionEvent);
-        messages.push(reply);
-        emit({ type: "agent_end" } as AgentSessionEvent);
-      },
+  const runtime = { sessionId: "session-background",
+  sessionFile: "/tmp/session-background.jsonl",
+  messages,
+  get isIdle() { return idle; },
+  get isStreaming() { return !idle; },
+  promptTemplates: [] as Array<{ name: string }>,
+  resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
+  subscribe(listener: (event: AgentSessionEvent) => void) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  },
+  agent: {
+    steer(message: object) {
+      queueMicrotask(() => emit({ type: "message_start", message } as AgentSessionEvent));
     },
-    async dispose() {},
-  };
+  },
+  async steer(text: string) {
+    steered.push(text);
+    this.agent.steer({ role: "user", content: [{ type: "text", text }] });
+  },
+  getSteeringMessages() { return []; },
+  async waitForIdle() {
+    if (!idle) await backgroundGate;
+  },
+  async prompt() {
+    const reply = assistant("initial answer");
+    emit({ type: "agent_start" } as AgentSessionEvent);
+    emit({ type: "message_end", message: reply } as AgentSessionEvent);
+    messages.push(reply);
+    emit({ type: "agent_end" } as AgentSessionEvent);
+  }, async dispose() {} };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -1930,81 +1837,28 @@ test("adopts a background completion run that starts after the visible turn clos
   service.stop();
 });
 
-test("extension session replacement delivers the replacement session answer", async () => {
+test("extension session replacement binds the new OMP session and preserves its setup history", async (t) => {
   const setup = fixture();
-  type ReplacementOptions = {
-    withSession?: (context: { sendUserMessage(text: string): Promise<void> }) => Promise<void>;
-  };
-  type ExtensionBinding = {
-    commandContextActions: {
-      newSession(options?: ReplacementOptions): Promise<{ cancelled: boolean }>;
-    };
-  };
-
-  const bindings = new Map<string, ExtensionBinding>();
-  let runReplacement: (() => Promise<void>) | undefined;
-  const createSession = (id: string, messages: unknown[]) => ({
-    sessionId: id,
-    sessionFile: `/tmp/${id}.jsonl`,
-    messages,
-    promptTemplates: [] as Array<{ name: string }>,
-    resourceLoader: { getSkills: () => ({ skills: [], diagnostics: [] }) },
-    extensionRunner: {
-      getCommand: (name: string) => name === "review" ? {} : undefined,
-      getRegisteredCommands: () => [{ invocationName: "review", description: "Review project changes" }],
-    },
-    async bindExtensions(binding: ExtensionBinding) { bindings.set(id, binding); },
-    subscribe() { return () => {}; },
-    async waitForIdle() {},
-    async prompt() { await runReplacement?.(); },
-  });
-  type TestSession = ReturnType<typeof createSession>;
-  let rebindSession: ((session: TestSession) => Promise<void>) | undefined;
-  const runtime = {
-    session: createSession("session-1", Array.from({ length: 4 }, () => ({
-      role: "assistant",
-      content: [{ type: "text", text: "old answer" }],
-    }))),
-    setRebindSession(callback: (session: TestSession) => Promise<void>) { rebindSession = callback; },
-    async newSession(options?: ReplacementOptions) {
-      this.session = createSession("session-2", []);
-      await rebindSession?.(this.session);
-      await options?.withSession?.({
-        sendUserMessage: async () => {
-          this.session.messages.push({
-            role: "assistant",
-            content: [{ type: "text", text: "replacement answer" }],
-          });
-        },
-      });
-      return { cancelled: false };
-    },
-    async dispose() {},
-  };
-  runReplacement = async () => {
-    await bindings.get("session-1")?.commandContextActions.newSession({
-      withSession: async (context) => context.sendUserMessage("continue in replacement"),
-    });
-  };
-  const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
-    project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
-    createSessionRuntime: async () => runtime,
-  } as unknown as EmbeddedPiRuntimeBoundary;
+  const native = await nativeRuntimeFixture(setup, `export default function(pi) {
+    pi.registerCommand("review", { description: "Review project changes", handler: async (_args, ctx) => {
+      await ctx.newSession({ setup: async (manager) => manager.appendMessage({
+        role: "assistant", content: [{ type: "text", text: "replacement answer" }],
+        api: "responses", provider: "openai-codex", model: "gpt-5.6-sol", stopReason: "stop",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now(),
+      }) });
+    } });
+  }`);
+  t.after(native.cleanup);
+  const runtime = native.session;
+  const oldSessionId = runtime.sessionId;
+  runtime.agent.streamFn = () => { throw new Error("extension replacement must not call a model"); };
   const workflow = workflowClientRecorder();
   const application = createBridgeApplication(setup.config, {
-    clickClack: setup.clickClack,
-    piRuntime,
-    logger: createLogger({ sink() {} }),
-    workflowClientFactory: workflow.factory,
+    clickClack: setup.clickClack, piRuntime: native.bridge, logger: createLogger({ sink() {} }), workflowClientFactory: workflow.factory,
   });
   const service = application.service;
-  service.state.upsertBinding({
-    conversationType: "direct",
-    conversationId: "dcn_1" as never,
-    projectAlias: toProjectAlias("main"),
-    invocationMode: "auto",
-  });
+  service.state.upsertBinding({ conversationType: "direct", conversationId: "dcn_1" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
   const review = message({ id: "msg_review_replace", body: "/review", directConversationId: "dcn_1" });
   setup.messages.set(review.id, review);
 
@@ -2012,12 +1866,14 @@ test("extension session replacement delivers the replacement session answer", as
   setup.emit(createdEvent({ messageId: review.id, cursor: "cur_200" }));
   await service.waitForIdle();
 
-  assert.deepEqual(setup.sent.map((row) => row.body), ["replacement answer"]);
-  assert.equal(service.state.getActivePiSession(1)?.sessionId, "session-2");
-  assert.deepEqual(workflow.watched, ["session-1", "session-2"]);
-  assert.deepEqual(workflow.stopped, ["session-1"]);
+  assert.deepEqual(setup.sent.map((row) => row.body), ["Pi command `/review` completed."]);
+  assert.ok(runtime.sessionManager.getEntries().some((entry) => entry.type === "message" && entry.message.role === "assistant" && entry.message.content.some((block) => block.type === "text" && block.text === "replacement answer")), "new session retains extension setup history");
+  assert.notEqual(runtime.sessionId, oldSessionId);
+  assert.equal(service.state.getActivePiSession(1)?.sessionId, runtime.sessionId);
+  assert.deepEqual(workflow.watched, [oldSessionId, runtime.sessionId]);
+  assert.deepEqual(workflow.stopped, [oldSessionId]);
   await application.stop();
-  assert.deepEqual(workflow.stopped, ["session-1", "session-2"]);
+  assert.deepEqual(workflow.stopped, [oldSessionId, runtime.sessionId]);
 });
 
 test("a slow turn in one conversation does not block a turn in another", async () => {
@@ -2026,26 +1882,21 @@ test("a slow turn in one conversation does not block a turn in another", async (
   const finished: string[] = [];
   let releaseSlow: (() => void) | undefined;
   const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
-  const runtimeFor = (label: string) => ({
-    session: {
-      sessionId: `session-${label}`,
-      sessionFile: `/tmp/session-${label}.jsonl`,
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt() {
-        started.push(label);
-        if (label === "slow") await slowGate;
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: `${label} answer` }], stopReason: "stop" });
-        finished.push(label);
-      },
-    },
-    async dispose() {},
-  });
+  const runtimeFor = (label: string) => ({ sessionId: `session-${label}`,
+  sessionFile: `/tmp/session-${label}.jsonl`,
+  messages: [] as unknown[],
+  subscribe() { return () => {}; },
+  async prompt() {
+    started.push(label);
+    if (label === "slow") await slowGate;
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: `${label} answer` }], stopReason: "stop" });
+    finished.push(label);
+  }, async dispose() {} });
   // Runtimes are created in the order the two conversations are dispatched:
   // the slow channel message first, then the fast direct message.
   const pending = [runtimeFor("slow"), runtimeFor("fast")];
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => pending.shift()!,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -2099,26 +1950,21 @@ test("messages received before SDK streaming still run serialized turns", async 
   const setup = fixture();
   const events: string[] = [];
   let active = 0;
-  const runtime = {
-    session: {
-      sessionId: "session-serial",
-      sessionFile: "/tmp/session-serial.jsonl",
-      messages: [] as unknown[],
-      subscribe() { return () => {}; },
-      async prompt(text: string) {
-        active += 1;
-        assert.equal(active, 1, "two turns overlapped in one conversation");
-        events.push(`start:${text}`);
-        await new Promise((resolve) => setImmediate(resolve));
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: `answered ${text}` }], stopReason: "stop" });
-        events.push(`end:${text}`);
-        active -= 1;
-      },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-serial",
+  sessionFile: "/tmp/session-serial.jsonl",
+  messages: [] as unknown[],
+  subscribe() { return () => {}; },
+  async prompt(text: string) {
+    active += 1;
+    assert.equal(active, 1, "two turns overlapped in one conversation");
+    events.push(`start:${text}`);
+    await new Promise((resolve) => setImmediate(resolve));
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: `answered ${text}` }], stopReason: "stop" });
+    events.push(`end:${text}`);
+    active -= 1;
+  }, async dispose() {} };
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -2156,30 +2002,25 @@ test("mid-turn messages steer before the original prompt settles", async () => {
   }); } };
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
-  const runtime = {
-    session: {
-      sessionId: "session-steer", sessionFile: "/tmp/session-steer.jsonl",
-      messages: [] as unknown[], isStreaming: false,
-      agent,
-      subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
-      async steer(text: string) {
-        delivered.push(text);
-        agent.steer({ role: "user", content: [{ type: "text", text }] });
-      },
-      async prompt(text: string) {
-        delivered.push(`prompt:${text}`);
-        this.isStreaming = true;
-        await blocked;
-        this.isStreaming = false;
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: "stop" });
-      },
-    },
-    async dispose() {},
-  };
+  const runtime = { sessionId: "session-steer", sessionFile: "/tmp/session-steer.jsonl",
+  messages: [] as unknown[], isStreaming: false,
+  agent,
+  subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
+  async steer(text: string) {
+    delivered.push(text);
+    agent.steer({ role: "user", content: [{ type: "text", text }] });
+  },
+  async prompt(text: string) {
+    delivered.push(`prompt:${text}`);
+    this.isStreaming = true;
+    await blocked;
+    this.isStreaming = false;
+    this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: "stop" });
+  }, async dispose() {} };
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
     piRuntime: {
-      kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      kind: "embedded-omp-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => runtime,
     } as unknown as EmbeddedPiRuntimeBoundary,
     logger: createLogger({ sink() {} }),
@@ -2192,7 +2033,7 @@ test("mid-turn messages steer before the original prompt settles", async () => {
   try {
     send("first", "original");
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(runtime.session.isStreaming, true);
+    assert.equal(runtime.isStreaming, true);
     send("second", "correction");
     send("second", "correction");
     send("third", "another correction");
@@ -2207,7 +2048,7 @@ test("mid-turn messages steer before the original prompt settles", async () => {
   assert.deepEqual(delivered, ["prompt:original", "correction", "another correction"]);
 });
 
-function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted?: boolean; failed?: boolean } = {}) {
+function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted?: boolean; failed?: boolean; drop?: boolean } = {}) {
   const setup = fixture();
   const prompts: string[] = [];
   const steering: Array<{ text: string; images: unknown }> = [];
@@ -2217,37 +2058,35 @@ function steeringFixture(options: { consume?: boolean; reject?: boolean; aborted
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   const listeners = new Set<(event: AgentSessionEvent) => void>();
   const runtime = {
-    session: {
-      sessionId: "session-steering", sessionFile: "/tmp/session-steering.jsonl",
-      extensionRunner: { getCommand() { return undefined; } }, promptTemplates: [],
-      messages: [] as unknown[], isStreaming: false,
-      getSteeringMessages() { return pending.map(() => "pending"); },
-      agent: { steer(message: object) {
-        pending.push(message);
-        if (options.consume !== false) queueMicrotask(() => {
-          pending.splice(pending.indexOf(message), 1);
-          for (const listener of listeners) listener({ type: "message_start", message } as AgentSessionEvent);
-        });
-      } },
-      subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
-      async steer(text: string, images: unknown) {
-        steering.push({ text, images });
-        if (options.reject) throw new Error("SDK rejected steering");
-        this.agent.steer({ role: "user", content: [{ type: "text", text }] });
-      },
-      async prompt(text: string) {
-        prompts.push(text); this.isStreaming = true;
-        await blocked;
-        this.isStreaming = false;
-        this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: options.aborted ? "aborted" : options.failed ? "error" : "stop" });
-      },
+    sessionId: "session-steering", sessionFile: "/tmp/session-steering.jsonl",
+    promptTemplates: [],
+    messages: [] as unknown[], isStreaming: false,
+    getSteeringMessages() { return pending.map(() => "pending"); },
+    agent: { steer(message: object) {
+      pending.push(message);
+      if (options.consume !== false) queueMicrotask(() => {
+        pending.splice(pending.indexOf(message), 1);
+        for (const listener of listeners) listener({ type: "message_start", message } as AgentSessionEvent);
+      });
+    } },
+    subscribe(callback: (event: AgentSessionEvent) => void) { listeners.add(callback); return () => { listeners.delete(callback); }; },
+    async steer(text: string, images: unknown) {
+      steering.push({ text, images });
+      if (options.reject) throw new Error("SDK rejected steering");
+      if (!options.drop) this.agent.steer({ role: "user", content: [{ type: "text", text }] });
+    },
+    async prompt(text: string) {
+      prompts.push(text); this.isStreaming = true;
+      await blocked;
+      this.isStreaming = false;
+      this.messages.push({ role: "assistant", content: [{ type: "text", text: "answer" }], stopReason: options.aborted ? "aborted" : options.failed ? "error" : "stop" });
     },
     async dispose() { disposed = true; },
   };
   const service = new BridgeService(setup.config, {
     clickClack: setup.clickClack,
     piRuntime: {
-      kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+      kind: "embedded-omp-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => runtime,
     } as unknown as EmbeddedPiRuntimeBoundary,
     logger: createLogger({ sink() {} }),
@@ -2320,6 +2159,19 @@ test("steering notice list failure does not reject turn settlement or poison lat
   } finally { f.release(); await f.service.waitForStop(); }
 });
 
+test("a settled OMP steer without enqueue reports uncertainty and retires before later turns", async () => {
+  const f = steeringFixture({ drop: true });
+  await f.service.start();
+  try {
+    f.send("original", "original"); await nextEventLoop();
+    f.send("boundary", "boundary correction"); await nextEventLoop();
+    assert.deepEqual(f.steering.map((item) => item.text), ["boundary correction"]);
+    f.release(); await f.service.waitForIdle();
+    assert.ok(f.setup.sent.some((item) => item.body.includes("couldn't confirm delivery")));
+    assert.equal(f.disposed(), true, "no receipt cannot authorize reuse of this session");
+    assert.deepEqual(f.prompts, ["original"]);
+  } finally { f.release(); await f.service.waitForStop(); }
+});
 for (const failure of ["rejection", "abort", "unconfirmed"] as const) {
   test(`mid-turn ${failure} reports uncertainty without queued replay`, async () => {
     const f = steeringFixture({ consume: false, reject: failure === "rejection", aborted: failure === "abort" });
@@ -2357,13 +2209,9 @@ for (const failure of ["abort", "failure", "successful-but-still-queued"] as con
       f.service.piRuntime.createSessionRuntime = async (request) => {
         assert.equal(request.sessionFile, undefined, "must not implicitly resume retired session");
         const messages: unknown[] = [];
-        return {
-          session: {
-            sessionId: "fresh-session", sessionFile: "/tmp/fresh-session.jsonl", messages,
-            subscribe() { return () => {}; },
-            async prompt(text: string) { freshPrompts.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "fresh" }], stopReason: "stop" }); },
-          }, async dispose() {},
-        } as never;
+        return { sessionId: "fresh-session", sessionFile: "/tmp/fresh-session.jsonl", messages,
+        subscribe() { return () => {}; },
+        async prompt(text: string) { freshPrompts.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "fresh" }], stopReason: "stop" }); }, async dispose() {} } as never;
       };
       f.send("next", "new turn"); await f.service.waitForIdle();
       assert.deepEqual(freshPrompts, ["new turn"]);
@@ -2391,10 +2239,10 @@ test("steering input that outlives its turn retires the runtime and cannot reach
   const f = steeringFixture();
   let releaseInput!: () => void;
   const input = new Promise<void>((resolve) => { releaseInput = resolve; });
-  f.runtime.session.steer = async (text, images) => {
+  f.runtime.steer = async (text, images) => {
     f.steering.push({ text, images });
     await input;
-    f.runtime.session.agent.steer({ role: "user", content: [{ type: "text", text }] });
+    f.runtime.agent.steer({ role: "user", content: [{ type: "text", text }] });
   };
   await f.service.start();
   try {
@@ -2403,7 +2251,7 @@ test("steering input that outlives its turn retires the runtime and cannot reach
     f.release(); await nextEventLoop(); await nextEventLoop();
     assert.equal(f.disposed(), true, "pending input hooks retire even an empty queue");
     releaseInput(); await f.service.waitForIdle();
-    assert.deepEqual(f.runtime.session.getSteeringMessages(), [], "late correction never reaches agent queue");
+    assert.deepEqual(f.runtime.getSteeringMessages(), [], "late correction never reaches agent queue");
     assert.deepEqual(f.prompts, ["original"]);
     assert.ok(f.setup.sent.some((item) => item.body.includes("couldn't confirm delivery")));
   } finally { releaseInput(); f.release(); await f.service.waitForStop(); }
@@ -2415,8 +2263,8 @@ test("consumed steering plus a later pre-enqueue rejection does not retire exten
   try {
     f.send("original", "original"); await nextEventLoop();
     f.send("consumed", "consumed correction"); await nextEventLoop();
-    f.runtime.session.steer = async () => { throw new Error("pre-enqueue rejection"); };
-    f.runtime.session.getSteeringMessages = () => ["extension-owned queued message"];
+    f.runtime.steer = async () => { throw new Error("pre-enqueue rejection"); };
+    f.runtime.getSteeringMessages = () => ["extension-owned queued message"];
     f.send("rejected", "rejected correction"); await nextEventLoop();
     f.release(); await f.service.waitForIdle();
     assert.equal(f.disposed(), false);
@@ -2426,8 +2274,8 @@ test("consumed steering plus a later pre-enqueue rejection does not retire exten
 test("mid-turn steering and retirement stay isolated across two active DMs and reconnect replay", async () => {
   const first = steeringFixture({ consume: false, aborted: true });
   const second = steeringFixture();
-  second.runtime.session.sessionId = "session-other";
-  second.runtime.session.sessionFile = "/tmp/session-other.jsonl";
+  second.runtime.sessionId = "session-other";
+  second.runtime.sessionFile = "/tmp/session-other.jsonl";
   let creations = 0;
   first.service.piRuntime.createSessionRuntime = async () => (++creations === 1 ? first.runtime : second.runtime) as never;
   await first.service.start();
@@ -2445,7 +2293,7 @@ test("mid-turn steering and retirement stay isolated across two active DMs and r
     first.release(); await nextEventLoop();
     assert.equal(first.disposed(), true);
     assert.equal(second.disposed(), false);
-    assert.equal(second.runtime.session.isStreaming, true);
+    assert.equal(second.runtime.isStreaming, true);
     first.send("another", "still working", { directConversationId: "dm_other" }); await nextEventLoop();
     assert.deepEqual(second.steering.map((m) => m.text), ["second correction", "still working"]);
   } finally {
@@ -2458,7 +2306,7 @@ test("explicit continue after steering retirement creates a fresh runtime from h
   const f = steeringFixture({ consume: false, aborted: true });
   const sessionFile = join(directory, "session.jsonl");
   writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "session-steering" }) + "\n");
-  f.runtime.session.sessionFile = sessionFile;
+  f.runtime.sessionFile = sessionFile;
   await f.service.start();
   try {
     f.send("original", "original"); await nextEventLoop();
@@ -2471,11 +2319,9 @@ test("explicit continue after steering retirement creates a fresh runtime from h
       assert.equal(request.sessionFile, sessionFile);
       recreated = true;
       const messages: unknown[] = [];
-      return { session: {
-        sessionId: "session-steering", sessionFile, messages,
-        subscribe() { return () => {}; },
-        async prompt(text: string) { resumed.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "resumed" }], stopReason: "stop" }); },
-      }, async dispose() {} } as never;
+      return { sessionId: "session-steering", sessionFile, messages,
+      subscribe() { return () => {}; },
+      async prompt(text: string) { resumed.push(text); messages.push({ role: "assistant", content: [{ type: "text", text: "resumed" }], stopReason: "stop" }); }, async dispose() {} } as never;
     };
     f.send("continue", "/continue"); await f.service.waitForIdle();
     assert.equal(recreated, true);
@@ -2590,7 +2436,7 @@ function seedSteeringRecovery(setup: Fixture, path: string) {
 function recoveryService(setup: Fixture) {
   return new BridgeService(setup.config, {
     clickClack: setup.clickClack, logger: createLogger({ sink() {} }),
-    piRuntime: { kind: "embedded-pi-sdk", createSessionRuntime: async () => { throw new Error("recovery must not prompt Pi"); } } as unknown as EmbeddedPiRuntimeBoundary,
+    piRuntime: { kind: "embedded-omp-sdk", createSessionRuntime: async () => { throw new Error("recovery must not prompt Pi"); } } as unknown as EmbeddedPiRuntimeBoundary,
   });
 }
 
@@ -2702,7 +2548,7 @@ for (const changed of ["owner", "binding", "session", "target", "workspace"] as 
 test("the invoke command switches a channel to always-on and survives a rebind", async () => {
   const setup = fixture(["main", "other"]);
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => { throw new Error("should not create a session"); },
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -2743,7 +2589,7 @@ test("the invoke command switches a channel to always-on and survives a rebind",
 test("invoke reports the current mode and refuses an unknown one", async () => {
   const setup = fixture(["main"]);
   const piRuntime = {
-    kind: "embedded-pi-sdk" as const,
+    kind: "embedded-omp-sdk" as const,
     project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
     createSessionRuntime: async () => { throw new Error("should not create a session"); },
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -2787,13 +2633,13 @@ test("authorized bound watcher feeds durable snapshots to its frozen conversatio
     listChannel: async () => ({ runs: [] }), listDirect: async () => ({ runs: [] }),
   };
   const messages: unknown[] = [];
-  const runtime = { session: { sessionId: "session", sessionFile: "/tmp/fixture-session.jsonl", messages,
+  const runtime = { sessionId: "session", sessionFile: "/tmp/fixture-session.jsonl", messages,
     subscribe: () => () => undefined,
     prompt: async () => { messages.push({ role: "assistant", content: [{ type: "text", text: "normal reply" }], stopReason: "stop" }); },
-  }, dispose: async () => undefined };
+    dispose: async () => undefined };
   const application = createBridgeApplication(setup.config, {
     clickClack: setup.clickClack, logger: createLogger({ sink() {} }),
-    piRuntime: { kind: "embedded-pi-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
+    piRuntime: { kind: "embedded-omp-sdk", project: (alias: string) => setup.config.projects.get(toProjectAlias(alias))!,
       createSessionRuntime: async () => runtime } as unknown as EmbeddedPiRuntimeBoundary,
     workflowClientFactory: () => ({ ...host.client, hostIdentity: "fixture-host", close: async () => undefined,
       watchSession: async (sessionId, listener) => {

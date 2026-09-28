@@ -4,9 +4,9 @@ import { readFileSync } from "node:fs";
 import type { RealtimeEvent } from "@clickclack/sdk-ts";
 import {
   parseSessionEntries,
-  type AgentSessionRuntime,
+  type AgentSession,
   type FileEntry,
-} from "@earendil-works/pi-coding-agent";
+} from "@oh-my-pi/pi-coding-agent";
 
 import type { Logger } from "./logger.js";
 
@@ -127,9 +127,9 @@ export type TangentHostOptions = {
   selfId: () => string | undefined;
   /** The bound project and session for the tangent's source conversation. */
   resolveSource: (tangent: TangentRecord) => TangentForkSource | undefined;
-  createRuntime: (projectAlias: string, forkEntries: FileEntry[] | undefined) => Promise<AgentSessionRuntime>;
+  createRuntime: (projectAlias: string, forkEntries: FileEntry[] | undefined) => Promise<AgentSession>;
   /** Run one prompt to completion and return the reply text. */
-  runTurn: (runtime: AgentSessionRuntime, prompt: string) => Promise<string>;
+  runTurn: (runtime: AgentSession, prompt: string) => Promise<string>;
   logger: Logger;
   readSessionFile?: (path: string) => string;
   maxTangents?: number;
@@ -137,7 +137,7 @@ export type TangentHostOptions = {
 
 type Entry = {
   record: TangentRecord;
-  runtime: Promise<AgentSessionRuntime | undefined>;
+  runtime: Promise<AgentSession | undefined>;
   queue: Promise<void>;
   closed: boolean;
 };
@@ -213,7 +213,7 @@ export class TangentHost {
     return entry;
   }
 
-  private async fork(record: TangentRecord): Promise<AgentSessionRuntime | undefined> {
+  private async fork(record: TangentRecord): Promise<AgentSession | undefined> {
     const source = this.options.resolveSource(record);
     if (!source) return undefined;
     let entries: FileEntry[] | undefined;
@@ -249,7 +249,7 @@ export class TangentHost {
   private async answer(entry: Entry, prompt: string): Promise<void> {
     if (entry.closed) return;
     const id = entry.record.id;
-    let runtime: AgentSessionRuntime | undefined;
+    let runtime: AgentSession | undefined;
     try {
       runtime = await entry.runtime;
     } catch (error) {
@@ -286,7 +286,7 @@ export class TangentHost {
     if (!entry) return;
     entry.closed = true;
     this.tangents.delete(id);
-    let runtime: AgentSessionRuntime | undefined;
+    let runtime: AgentSession | undefined;
     try {
       runtime = await entry.runtime;
     } catch {
@@ -294,7 +294,7 @@ export class TangentHost {
     }
     if (!runtime) return;
     try {
-      await runtime.session.abort();
+      await runtime.abort();
     } catch (error) {
       this.options.logger.warn("tangent abort failed", { tangentId: id, error });
     }

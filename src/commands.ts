@@ -1,12 +1,7 @@
 import type { BotCommandInput } from "@clickclack/sdk-ts";
-import type { AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 
-export type SlashInvocation = {
-  raw: string;
-  name: string;
-  args: string;
-};
-
+export type SlashInvocation = { raw: string; name: string; args: string };
 export const botCommandMenu: readonly BotCommandInput[] = [
   { command: "project", description: "Bind this conversation to a configured project", args_hint: "<alias>" },
   { command: "invoke", description: "Show or set how this conversation invokes Pi", args_hint: "[mention|always]" },
@@ -26,51 +21,29 @@ export function parseSlashInvocation(body: string): SlashInvocation | undefined 
   const trimmed = body.trim();
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(trimmed);
   if (!match?.[1]) return undefined;
-  return {
-    raw: trimmed,
-    name: match[1],
-    args: match[2]?.trim() ?? "",
-  };
+  return { raw: trimmed, name: match[1], args: match[2]?.trim() ?? "" };
 }
 
-export function runtimeBotCommandMenu(runtime: AgentSessionRuntime): BotCommandInput[] {
+/** Omp exposes extension commands through ExtensionRunner and prompt templates on AgentSession. */
+export function runtimeBotCommandMenu(session: AgentSession): BotCommandInput[] {
   const commands: BotCommandInput[] = [];
-  for (const command of runtime.session.extensionRunner.getRegisteredCommands()) {
-    if (!isPublishableCommandName(command.invocationName)) continue;
-    commands.push({
-      command: command.invocationName,
-      description: boundedMetadata(command.description ?? "Run a Pi extension command"),
-    });
+  for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
+    if (!isPublishableCommandName(command.name)) continue;
+    commands.push({ command: command.name, description: boundedMetadata(command.description ?? "Run an omp extension command") });
   }
-  for (const template of runtime.session.promptTemplates) {
+  for (const template of session.promptTemplates ?? []) {
     if (!isPublishableCommandName(template.name)) continue;
-    commands.push({
-      command: template.name,
-      description: boundedMetadata(template.description || "Run a Pi prompt template"),
-      ...(template.argumentHint ? { args_hint: boundedMetadata(template.argumentHint) } : {}),
-    });
+    commands.push({ command: template.name, description: boundedMetadata(template.description || "Run an omp prompt template") });
   }
   return commands;
 }
 
-export function isPiResourceCommand(runtime: AgentSessionRuntime, invocation: SlashInvocation): boolean {
-  if (runtime.session.extensionRunner.getCommand(invocation.name)) return true;
-  if (runtime.session.promptTemplates.some((template) => template.name === invocation.name)) return true;
-  if (!invocation.name.startsWith("skill:")) return false;
-  const skillName = invocation.name.slice("skill:".length);
-  return runtime.session.resourceLoader.getSkills().skills.some((skill) => skill.name === skillName);
+export function isPiResourceCommand(session: AgentSession, invocation: SlashInvocation): boolean {
+  if (session.extensionRunner?.getCommand(invocation.name)) return true;
+  return (session.promptTemplates ?? []).some((template) => template.name === invocation.name);
 }
 
-/**
- * Matches ClickClack's bot command shape, including one optional namespace
- * segment, so a command family such as /kas:cook reaches the command menu.
- * A name outside this shape is dropped rather than rejected, because Pi
- * extensions may register names ClickClack cannot represent.
- */
 function isPublishableCommandName(name: string): boolean {
   return /^[a-z0-9_-]{1,32}(?::[a-z0-9_-]{1,32})?$/u.test(name);
 }
-
-function boundedMetadata(value: string): string {
-  return value.trim().slice(0, 100);
-}
+function boundedMetadata(value: string): string { return value.trim().slice(0, 100); }

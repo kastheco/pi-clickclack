@@ -48,8 +48,8 @@ function createDefaultWorkflowClient(): ManagedWorkflowClient {
     ensureAvailable: async () => await client.ensureAvailable(),
     hydrateContent: async (runId, value) =>
       await client.hydrateContent(runId, value as Parameters<WorkflowClient["hydrateContent"]>[1]),
-    watchSession: async (sessionId, listener, options) =>
-      await client.watchSession(sessionId, listener as Parameters<WorkflowClient["watchSession"]>[1], options),
+    watchSession: async (sessionId, listener) =>
+      await client.watchSession(sessionId, listener as Parameters<WorkflowClient["watchSession"]>[1]),
     request: async (options) =>
       await client.request(options as Parameters<WorkflowClient["request"]>[0]),
     requestDurable: async (options) =>

@@ -6,14 +6,14 @@ import { basename, extname, isAbsolute, join, relative, resolve } from "node:pat
 
 import type { AgentProgressPayload, BotCommandInput, Channel, Message, MessageInput, RealtimeEvent, User, Workspace } from "@clickclack/sdk-ts";
 import {
-  resolveCliModel,
   type AgentSessionEvent,
-  type AgentSessionRuntime,
+  type AgentSession,
   type ExtensionUIDialogOptions,
   type ExtensionUIContext,
   type PromptOptions,
-} from "@earendil-works/pi-coding-agent";
-
+} from "@oh-my-pi/pi-coding-agent";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { betterOpenAIStatusKey, fastModeFromBetterOpenAIStatus } from "./bot-runtime-status.js";
 import {
   TurnActivity,
   defaultReasoningVisibility,
@@ -29,7 +29,6 @@ import {
   type SlashInvocation,
 } from "./commands.js";
 import { createClickClackClient, type ClickClackBoundary } from "./clickclack.js";
-import { betterOpenAIStatusKey, fastModeFromBetterOpenAIStatus } from "./bot-runtime-status.js";
 import { errorReply } from "./error-reply.js";
 import type { BridgeConfig } from "./config.js";
 import {
@@ -49,7 +48,7 @@ import { DurableWorkflowPublisher } from "./workflow-durable-publisher.js";
 import { WorkflowRunReporter } from "./workflow-run-publisher.js";
 import { createLogger, environmentSecretValues, type Logger } from "./logger.js";
 import { latestTodoTasks, todoNotepadCard, todoTasksFromEvent, type TodoTask } from "./notepad.js";
-import { createEmbeddedPiRuntime, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
+import { createEmbeddedPiRuntime, setSessionToolUIContext, type EmbeddedPiRuntimeBoundary } from "./pi-runtime.js";
 import { steerWithReceipt } from "./pi-steering.js";
 import { TangentHost, createTangentTransport, type TangentTransport } from "./tangents.js";
 import {
@@ -117,7 +116,7 @@ type ActiveSessionTurn = {
   activity: TurnActivity;
   unconsumedSteering: Set<MessageId>;
   pendingSteering: Set<MessageId>;
-  session: AgentSessionRuntime["session"];
+  session: AgentSession;
   messagesBefore: readonly unknown[];
   latestAssistant: unknown;
   notifications: string[];
@@ -177,10 +176,10 @@ export class BridgeService {
   private readonly queuedConversationWork = new Map<number, number>();
   private readonly steeringMessages = new WeakMap<object, MessageId>();
   private steeringNotices: Promise<void> = Promise.resolve();
-  private readonly runtimes = new Map<number, AgentSessionRuntime>();
+  private readonly runtimes = new Map<number, AgentSession>();
   private readonly activeSessionTurns = new Map<number, ActiveSessionTurn>();
   private readonly sessionObservers = new Map<number, {
-    session: AgentSessionRuntime["session"];
+    session: AgentSession;
     unsubscribe: () => void;
   }>();
   private readonly decisionWatchers = new Map<number, WorkflowDecisionWatcher>();
@@ -237,7 +236,7 @@ export class BridgeService {
         if (!target) return undefined;
         const binding = this.state.getBinding(target.type, toConversationId(target.id));
         if (!binding) return undefined;
-        const sessionFile = this.runtimes.get(binding.id)?.session.sessionFile
+        const sessionFile = this.runtimes.get(binding.id)?.sessionFile
           ?? this.state.getActivePiSession(binding.id)?.sessionFile;
         return {
           projectAlias: binding.projectAlias,
@@ -250,8 +249,7 @@ export class BridgeService {
           ...(forkEntries ? { forkEntries } : {}),
         });
         try {
-          // No conversation UI: a tangent can't answer extension dialogs.
-          await runtime.session.bindExtensions({ mode: "rpc" });
+          await this.initializeRuntimeExtensions(runtime);
         } catch (error) {
           await runtime.dispose();
           throw error;
@@ -931,7 +929,7 @@ export class BridgeService {
       const runtime = await this.runtimeFor(binding);
       switch (command) {
         case "compact":
-          await runtime.session.compact(invocation.args || undefined);
+          await runtime.compact(invocation.args || undefined);
           await this.sendReply(source, "Pi session compacted.", `pi-command-${source.id}`);
           return;
         case "new": {
@@ -939,19 +937,19 @@ export class BridgeService {
             await this.sendReply(source, "usage: `/new`", `pi-command-${source.id}`);
             return;
           }
-          let result: { cancelled: boolean };
+          let replaced: boolean;
           try {
-            result = await runtime.newSession();
+            replaced = await runtime.newSession();
           } catch (error) {
             this.runtimes.delete(binding.id);
             throw error;
           }
-          if (result.cancelled) {
-            await this.sendReply(source, "Pi session replacement was cancelled.", `pi-command-${source.id}`);
+          if (!replaced) {
+            await this.sendReply(source, "Pi session replacement was cancelled.", "pi-command-" + source.id);
             return;
           }
           this.recordReplacementSession(binding, runtime);
-          await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
+          await this.watchWorkflowDecisions(binding, runtime.sessionId);
           await this.sendReply(source, "New Pi session started.", `pi-command-${source.id}`);
           return;
         }
@@ -959,13 +957,13 @@ export class BridgeService {
           if (!invocation.args) {
             await this.sendReply(
               source,
-              runtime.session.sessionName ? `Pi session name: ${runtime.session.sessionName}` : "usage: `/name <name>`",
+              runtime.sessionName ? `Pi session name: ${runtime.sessionName}` : "usage: `/name <name>`",
               `pi-command-${source.id}`,
             );
             return;
           }
-          runtime.session.setSessionName(invocation.args);
-          await this.sendReply(source, `Pi session name set: ${runtime.session.sessionName ?? invocation.args}`, `pi-command-${source.id}`);
+          runtime.setSessionName(invocation.args);
+          await this.sendReply(source, `Pi session name set: ${runtime.sessionName ?? invocation.args}`, `pi-command-${source.id}`);
           return;
         }
         case "session":
@@ -986,7 +984,7 @@ export class BridgeService {
             await this.sendReply(source, "usage: `/reload`", `pi-command-${source.id}`);
             return;
           }
-          await runtime.session.reload();
+          await runtime.reload();
           try {
             await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
           } catch (error) {
@@ -1002,7 +1000,7 @@ export class BridgeService {
             await this.sendReply(source, "usage: `/copy`", `pi-command-${source.id}`);
             return;
           }
-          const text = runtime.session.getLastAssistantText();
+          const text = runtime.getLastAssistantText();
           await this.sendReply(source, text ?? "This Pi session has no assistant answer to copy.", `pi-command-${source.id}`);
           return;
         }
@@ -1027,36 +1025,31 @@ export class BridgeService {
     }
   }
 
-  private async handleModelCommand(runtime: AgentSessionRuntime, source: Message, modelRef: string): Promise<void> {
+  private async handleModelCommand(runtime: AgentSession, source: Message, modelRef: string): Promise<void> {
     if (!modelRef) {
-      const current = runtime.session.model;
+      const current = runtime.model;
       const label = current ? `${current.provider}/${current.id}` : "none";
       await this.sendReply(source, `Pi model: ${label}`, `pi-command-${source.id}`);
       return;
     }
-    const resolved = resolveCliModel({
-      cliModel: modelRef,
-      modelRuntime: runtime.session.modelRuntime,
-    });
-    if (resolved.error || !resolved.model) {
-      await this.sendReply(source, `couldn't resolve Pi model \`${modelRef}\`: ${resolved.error ?? "model not found"}`, `pi-command-${source.id}`);
+    const slash = modelRef.indexOf("/");
+    const provider = slash > 0 ? modelRef.slice(0, slash) : "";
+    const modelId = slash > 0 ? modelRef.slice(slash + 1) : modelRef;
+    const model = provider ? runtime.modelRegistry.find(provider, modelId) : undefined;
+    if (!model) {
+      await this.sendReply(source, `couldn't resolve Pi model \`${modelRef}\`: model not found`, `pi-command-${source.id}`);
       return;
     }
-    await runtime.session.setModel(resolved.model);
-    if (resolved.thinkingLevel) runtime.session.setThinkingLevel(resolved.thinkingLevel);
-    await this.sendReply(
-      source,
-      `Pi model set: ${resolved.model.provider}/${resolved.model.id} (${runtime.session.thinkingLevel})`,
-      `pi-command-${source.id}`,
-    );
+    await runtime.setModel(model);
+    await this.sendReply(source, `Pi model set: ${model.provider}/${model.id} (${runtime.thinkingLevel})`, `pi-command-${source.id}`);
   }
 
-  private async handleThinkingCommand(runtime: AgentSessionRuntime, source: Message, level: string): Promise<void> {
-    const available = runtime.session.getAvailableThinkingLevels();
+  private async handleThinkingCommand(runtime: AgentSession, source: Message, level: string): Promise<void> {
+    const available = runtime.getAvailableThinkingLevels();
     if (!level) {
       await this.sendReply(
         source,
-        `Pi thinking: ${runtime.session.thinkingLevel}. available: ${available.join(", ") || "off"}`,
+        `Pi thinking: ${runtime.thinkingLevel}. available: ${available.join(", ") || "off"}`,
         `pi-command-${source.id}`,
       );
       return;
@@ -1065,16 +1058,16 @@ export class BridgeService {
       await this.sendReply(source, `invalid thinking level \`${level}\`. available: ${available.join(", ") || "off"}`, `pi-command-${source.id}`);
       return;
     }
-    runtime.session.setThinkingLevel(level as (typeof available)[number]);
-    await this.sendReply(source, `Pi thinking set: ${runtime.session.thinkingLevel}`, `pi-command-${source.id}`);
+    runtime.setThinkingLevel(level as (typeof available)[number]);
+    await this.sendReply(source, `Pi thinking set: ${runtime.thinkingLevel}`, `pi-command-${source.id}`);
   }
 
-  private recordReplacementSession(binding: ConversationBinding, runtime: AgentSessionRuntime): void {
-    const sessionFile = runtime.session.sessionFile;
+  private recordReplacementSession(binding: ConversationBinding, runtime: AgentSession): void {
+    const sessionFile = runtime.sessionFile;
     if (!sessionFile) throw new Error("Pi did not create a persistent replacement session file");
     this.state.setActivePiSession({
       bindingId: binding.id,
-      sessionId: runtime.session.sessionId,
+      sessionId: runtime.sessionId,
       sessionFile,
     });
   }
@@ -1189,13 +1182,13 @@ export class BridgeService {
       // idle barrier so autonomous extension work that starts meanwhile stays
       // outside this ClickClack turn's activity and error boundary.
       const prepared = await this.preparePromptInput(binding, source, prompt);
-      if (runtime.session.isIdle === false) {
+      if (runtime.isStreaming) {
         await this.sendReply(
           source,
           "pi resumed work after an external event and is still running. your message is queued and will start when it finishes.",
           `pi-queued-${source.id}`,
         );
-        await runtime.session.waitForIdle();
+        await runtime.waitForIdle();
       }
       this.state.startActiveTurn({
         turnId,
@@ -1207,7 +1200,7 @@ export class BridgeService {
         source,
         projectCwd: this.piRuntime.project(binding.projectAlias).cwd,
         projectAlias: binding.projectAlias,
-        sessionId: runtime.session.sessionId,
+        sessionId: runtime.sessionId,
         reasoning: this.reasoningVisibility.get(binding.id) ?? defaultReasoningVisibility,
         transport: this.activityTransport(source),
         onError: (error) => this.logger.warn("agent activity publish failed", { turnId, error }),
@@ -1218,24 +1211,29 @@ export class BridgeService {
         activity,
         unconsumedSteering: new Set(),
         pendingSteering: new Set(),
-        session: runtime.session,
-        messagesBefore: [...runtime.session.messages],
+        session: runtime,
+        messagesBefore: [...runtime.messages],
         latestAssistant: undefined,
         notifications: [],
         unsubscribe: undefined,
       };
       this.activeSessionTurns.set(binding.id, activeSessionTurn);
-      this.bindActiveTurnSession(binding, runtime.session);
+      this.bindActiveTurnSession(binding, runtime);
       this.state.transitionActiveTurn(turnId, "starting", "running");
       status = "running";
       const extensionErrors: Error[] = [];
+      const sessionIdBeforePrompt = runtime.sessionId;
       this.activeExtensionErrors.set(binding.id, extensionErrors);
       try {
         await this.promptAndWaitForNestedPrompts(
-          runtime.session,
+          runtime,
           prepared.prompt,
           prepared.images.length > 0 ? { images: prepared.images } : {},
         );
+        if (runtime.sessionId !== sessionIdBeforePrompt) {
+          this.recordReplacementSession(binding, runtime);
+          await this.watchWorkflowDecisions(binding, runtime.sessionId);
+        }
         if (extensionErrors[0]) throw extensionErrors[0];
       } finally {
         this.activeExtensionErrors.delete(binding.id);
@@ -1326,8 +1324,8 @@ export class BridgeService {
       if (session && activeSessionTurn
         && this.state.hasUnconsumedSteering(turnId, session.sessionId)
         && (activeSessionTurn.pendingSteering.size > 0
-          || (activeSessionTurn.unconsumedSteering.size > 0 && session.getSteeringMessages?.().length > 0))
-        && this.runtimes.get(binding.id)?.session === session) {
+          || activeSessionTurn.unconsumedSteering.size > 0)
+        && this.runtimes.get(binding.id) === session) {
         await this.quarantineUnresponsiveSession(binding);
         this.state.markSteeringRuntimeRetired(turnId);
       }
@@ -1370,10 +1368,10 @@ export class BridgeService {
     return false;
   }
 
-  private async runtimeFor(binding: ConversationBinding): Promise<AgentSessionRuntime> {
+  private async runtimeFor(binding: ConversationBinding): Promise<AgentSession> {
     const cached = this.runtimes.get(binding.id);
     if (cached) {
-      await this.watchWorkflowDecisions(binding, cached.session.sessionId);
+      await this.watchWorkflowDecisions(binding, cached.sessionId);
       return cached;
     }
     let reference = this.state.getActivePiSession(binding.id);
@@ -1391,11 +1389,11 @@ export class BridgeService {
       ...(reference ? { sessionFile: reference.sessionFile } : {}),
     });
     if (!reference) {
-      const sessionFile = runtime.session.sessionFile;
+      const sessionFile = runtime.sessionFile;
       if (!sessionFile) throw new Error("Pi did not create a persistent session file");
       this.state.setActivePiSession({
         bindingId: binding.id,
-        sessionId: runtime.session.sessionId,
+        sessionId: runtime.sessionId,
         sessionFile,
       });
     }
@@ -1416,7 +1414,7 @@ export class BridgeService {
         error,
       });
     }
-    await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
+    await this.watchWorkflowDecisions(binding, runtime.sessionId);
     return runtime;
   }
 
@@ -1765,7 +1763,7 @@ export class BridgeService {
 
   private startRuntimeStatusHeartbeat(
     binding: ConversationBinding,
-    session: AgentSessionRuntime["session"],
+    session: AgentSession,
   ): void {
     const previous = this.runtimeStatusHeartbeats.get(binding.id);
     if (previous) clearInterval(previous);
@@ -1779,14 +1777,14 @@ export class BridgeService {
 
   private queueRuntimeStatusPublication(
     binding: ConversationBinding,
-    session: AgentSessionRuntime["session"],
+    session: AgentSession,
   ): void {
     if (this.stopped || this.clickClack.botRuntimeStatus === undefined) return;
     const previous = this.runtimeStatusPublications.get(binding.id) ?? Promise.resolve();
     const publication = previous
       .catch(() => undefined)
       .then(async () => {
-        if (this.stopped || this.runtimes.get(binding.id)?.session !== session) return;
+        if (this.stopped || this.runtimes.get(binding.id) !== session) return;
         const model = session.model;
         if (!model) return;
         await this.clickClack.botRuntimeStatus!.publish(
@@ -1798,7 +1796,7 @@ export class BridgeService {
               runtime: "pi",
               model_provider: model.provider,
               model_id: model.id,
-              reasoning: session.thinkingLevel,
+              reasoning: session.thinkingLevel ?? "off",
               fast_mode: this.runtimeFastMode.get(binding.id) ?? null,
             },
           },
@@ -1819,100 +1817,54 @@ export class BridgeService {
     });
   }
 
-  private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSessionRuntime): Promise<void> {
-    const bindSession = async (session: AgentSessionRuntime["session"]): Promise<void> => {
-      this.runtimeFastMode.delete(binding.id);
-      this.queueNotepadPublication(binding, latestTodoTasks(session.messages));
-      this.bindSessionObserver(binding, session);
-      if (typeof session.bindExtensions !== "function") return;
-      const baseUI = session.extensionRunner.getUIContext?.() ?? ({} as ExtensionUIContext);
-      const uiContext: ExtensionUIContext = {
-        ...baseUI,
-        select: (title, options, dialogOptions) => this.presentInteraction(
-          binding,
-          { kind: "selection", title, options },
-          dialogOptions,
-        ) as Promise<string | undefined>,
-        confirm: (title, message, dialogOptions) => this.presentInteraction(
-          binding,
-          { kind: "confirmation", title, message },
-          dialogOptions,
-        ) as Promise<boolean>,
-        input: (title, placeholder, dialogOptions) => this.presentInteraction(
-          binding,
-          { kind: "input", title, ...(placeholder ? { placeholder } : {}) },
-          dialogOptions,
-        ) as Promise<string | undefined>,
-        editor: (title, prefill) => this.presentInteraction(
-          binding,
-          { kind: "editor", title, ...(prefill ? { prefill } : {}) },
-        ) as Promise<string | undefined>,
-        notify: (message) => {
-          const activeTurn = this.activeSessionTurns.get(binding.id);
-          if (activeTurn) activeTurn.notifications.push(message);
-        },
-        setStatus: (key, text) => {
-          baseUI.setStatus?.(key, text);
-          if (key !== betterOpenAIStatusKey) return;
-          this.runtimeFastMode.set(
-            binding.id,
-            fastModeFromBetterOpenAIStatus(text),
-          );
-          this.queueRuntimeStatusPublication(binding, session);
-        },
-      };
-      await session.bindExtensions({
-        uiContext,
-        mode: "rpc",
-        commandContextActions: {
-          waitForIdle: () => session.waitForIdle(),
-          newSession: (options) => this.replaceRuntimeSession(binding, runtime, () => runtime.newSession(options)),
-          fork: (entryId, options) => this.replaceRuntimeSession(binding, runtime, async () => {
-            const result = await runtime.fork(entryId, options);
-            return { cancelled: result.cancelled };
-          }),
-          navigateTree: async (targetId, options) => {
-            const result = await session.navigateTree(targetId, options);
-            return { cancelled: result.cancelled };
-          },
-          switchSession: (sessionPath, options) => this.replaceRuntimeSession(
-            binding,
-            runtime,
-            () => runtime.switchSession(sessionPath, options),
-          ),
-          reload: async () => {
-            await session.reload();
-            await this.refreshProjectCommandMenu(binding.projectAlias, runtime);
-          },
-        },
-        onError: (extensionError) => {
-          const error = new Error(
-            `Pi extension error (${extensionError.extensionPath}, ${extensionError.event}): ${extensionError.error}`,
-          );
-          this.logger.error("Pi extension failed", {
-            projectAlias: binding.projectAlias,
-            bindingId: binding.id,
-            extensionPath: extensionError.extensionPath,
-            event: extensionError.event,
-            error: extensionError.error,
-            stack: extensionError.stack,
-          });
-          this.activeExtensionErrors.get(binding.id)?.push(error);
-        },
-      });
-      this.bindActiveTurnSession(binding, session);
-      this.startRuntimeStatusHeartbeat(binding, session);
-      this.queueRuntimeStatusPublication(binding, session);
-      await this.watchWorkflowDecisions(binding, session.sessionId);
+  private async bindRuntimeExtensions(binding: ConversationBinding, runtime: AgentSession): Promise<void> {
+    const baseUI = runtime.extensionRunner?.getUIContext?.() ?? {} as ExtensionUIContext;
+    const uiContext: ExtensionUIContext = {
+      ...baseUI,
+      select: (title, options, dialogOptions) => this.presentInteraction(binding, { kind: "selection", title, options: options.map((option) => typeof option === "string" ? option : option.label) }, dialogOptions) as Promise<string | undefined>,
+      confirm: (title, message, dialogOptions) => this.presentInteraction(binding, { kind: "confirmation", title, message }, dialogOptions) as Promise<boolean>,
+      input: (title, placeholder, dialogOptions) => this.presentInteraction(binding, { kind: "input", title, ...(placeholder ? { placeholder } : {}) }, dialogOptions) as Promise<string | undefined>,
+      editor: (title, prefill) => this.presentInteraction(binding, { kind: "editor", title, ...(prefill ? { prefill } : {}) }) as Promise<string | undefined>,
+      notify: (message) => {
+        const activeTurn = this.activeSessionTurns.get(binding.id);
+        if (activeTurn) activeTurn.notifications.push(message);
+      },
+      setStatus: (key, text) => {
+        baseUI.setStatus?.(key, text);
+        if (key !== betterOpenAIStatusKey) return;
+        this.runtimeFastMode.set(binding.id, fastModeFromBetterOpenAIStatus(text));
+        this.queueRuntimeStatusPublication(binding, runtime);
+      },
     };
-
-    if (typeof runtime.setRebindSession === "function") {
-      runtime.setRebindSession(bindSession);
-    }
-    await bindSession(runtime.session);
+    setSessionToolUIContext(runtime, uiContext, true);
+    this.queueNotepadPublication(binding, latestTodoTasks(runtime.messages));
+    this.bindSessionObserver(binding, runtime);
+    await this.initializeRuntimeExtensions(runtime, uiContext, binding);
+    this.startRuntimeStatusHeartbeat(binding, runtime);
+    this.queueRuntimeStatusPublication(binding, runtime);
   }
 
-  private bindActiveTurnSession(binding: ConversationBinding, session: AgentSessionRuntime["session"]): void {
+  private async initializeRuntimeExtensions(runtime: AgentSession, uiContext?: ExtensionUIContext, binding?: ConversationBinding): Promise<void> {
+    await initializeExtensions(runtime, {
+      mode: "rpc",
+      ...(uiContext ? { uiContext } : {}),
+      reportSendError: (action, error) => this.logger.error("Pi extension send failed", {
+        sessionId: runtime.sessionId,
+        action,
+        error,
+      }),
+      reportRuntimeError: ({ extensionPath, event, error, stack }) => {
+        this.logger.error("Pi extension failed", {
+          sessionId: runtime.sessionId, extensionPath, event, error, stack,
+        });
+        if (binding) this.activeExtensionErrors.get(binding.id)?.push(
+          new Error(`Pi extension error (${extensionPath}, ${event}): ${error}`),
+        );
+      },
+    });
+  }
+
+  private bindActiveTurnSession(binding: ConversationBinding, session: AgentSession): void {
     const activeTurn = this.activeSessionTurns.get(binding.id);
     if (!activeTurn) return;
     activeTurn.unsubscribe?.();
@@ -1937,7 +1889,7 @@ export class BridgeService {
 
   private bindSessionObserver(
     binding: ConversationBinding,
-    session: AgentSessionRuntime["session"],
+    session: AgentSession,
   ): void {
     const previous = this.sessionObservers.get(binding.id);
     if (previous?.session === session) return;
@@ -1950,7 +1902,7 @@ export class BridgeService {
       }
       if (
         event.type === "thinking_level_changed"
-        || (event.type === "entry_appended" && event.entry.type === "model_change")
+        || (event.type === "model_changed")
       ) this.queueRuntimeStatusPublication(binding, session);
       if (event.type !== "agent_start") return;
       this.adoptAutonomousTurn(binding, session, event);
@@ -1981,7 +1933,7 @@ export class BridgeService {
 
   private adoptAutonomousTurn(
     binding: ConversationBinding,
-    session: AgentSessionRuntime["session"],
+    session: AgentSession,
     firstEvent: AgentSessionEvent,
   ): void {
     const source = this.conversationSources.get(binding.id);
@@ -2097,8 +2049,8 @@ export class BridgeService {
       this.state.markSteeringUncertain(turnId);
       if (this.state.hasUnconsumedSteering(turnId, session.sessionId)
         && (activeTurn.pendingSteering.size > 0
-          || (activeTurn.unconsumedSteering.size > 0 && session.getSteeringMessages?.().length > 0))
-        && this.runtimes.get(binding.id)?.session === session) {
+          || activeTurn.unconsumedSteering.size > 0)
+        && this.runtimes.get(binding.id) === session) {
         await this.quarantineUnresponsiveSession(binding);
         this.state.markSteeringRuntimeRetired(turnId);
       }
@@ -2137,31 +2089,14 @@ export class BridgeService {
     }
   }
 
-  private async replaceRuntimeSession(
-    binding: ConversationBinding,
-    runtime: AgentSessionRuntime,
-    replace: () => Promise<{ cancelled: boolean }>,
-  ): Promise<{ cancelled: boolean }> {
-    try {
-      const result = await replace();
-      if (!result.cancelled) {
-        this.recordReplacementSession(binding, runtime);
-        await this.watchWorkflowDecisions(binding, runtime.session.sessionId);
-      }
-      return result;
-    } catch (error) {
-      this.runtimes.delete(binding.id);
-      throw error;
-    }
-  }
 
   private async promptAndWaitForNestedPrompts(
-    session: AgentSessionRuntime["session"],
+    session: AgentSession,
     prompt: string,
     promptOptions: Pick<PromptOptions, "images"> = {},
   ): Promise<void> {
     const originalPrompt = session.prompt;
-    const pending = new Set<Promise<void>>();
+    const pending = new Set<Promise<unknown>>();
     let invocationCount = 0;
     let nestedFailure: unknown;
 
@@ -2177,7 +2112,7 @@ export class BridgeService {
     };
 
     try {
-      await session.prompt(prompt, { ...promptOptions, source: "interactive" });
+      await session.prompt(prompt, promptOptions);
       while (pending.size > 0) await Promise.allSettled([...pending]);
       if (nestedFailure !== undefined) throw nestedFailure;
       if (typeof session.waitForIdle === "function") await session.waitForIdle();
@@ -2187,8 +2122,8 @@ export class BridgeService {
   }
 
   /** Runs one tangent prompt to completion and returns its reply text. */
-  private async runTangentTurn(runtime: AgentSessionRuntime, prompt: string): Promise<string> {
-    const session = runtime.session;
+  private async runTangentTurn(runtime: AgentSession, prompt: string): Promise<string> {
+    const session = runtime;
     let latestAssistant: unknown;
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "message_end" && event.message.role === "assistant") latestAssistant = event.message;
@@ -2207,7 +2142,7 @@ export class BridgeService {
     await this.tangents.waitForIdle();
   }
 
-  private async refreshProjectCommandMenu(projectAlias: string, runtime: AgentSessionRuntime): Promise<void> {
+  private async refreshProjectCommandMenu(projectAlias: string, runtime: AgentSession): Promise<void> {
     this.projectCommandMenus.set(projectAlias, runtimeBotCommandMenu(runtime));
     await this.publishCommandMenu();
   }
@@ -2522,6 +2457,7 @@ export class BridgeService {
   }
 }
 
+
 function conversationTarget(message: Message): ConversationTarget | undefined {
   if (message.channel_id) return { type: "channel", id: message.channel_id };
   if (message.direct_conversation_id) return { type: "direct", id: message.direct_conversation_id };
@@ -2636,18 +2572,18 @@ function isRecoverableSessionFile(path: string): boolean {
   return pendingToolCalls.size === 0;
 }
 
-function formatSessionStats(runtime: AgentSessionRuntime): string {
-  const stats = runtime.session.getSessionStats();
+function formatSessionStats(runtime: AgentSession): string {
+  const stats = runtime.getSessionStats();
   const context = stats.contextUsage && stats.contextUsage.tokens !== null && stats.contextUsage.percent !== null
     ? `${stats.contextUsage.tokens.toLocaleString()} / ${stats.contextUsage.contextWindow.toLocaleString()} tokens (${stats.contextUsage.percent.toFixed(1)}%)`
     : "unavailable";
   return [
     "**Pi session**",
     "",
-    `- name: ${runtime.session.sessionName ?? "unnamed"}`,
+    `- name: ${runtime.sessionName ?? "unnamed"}`,
     `- id: \`${stats.sessionId}\``,
-    `- model: ${runtime.session.model ? `${runtime.session.model.provider}/${runtime.session.model.id}` : "none"}`,
-    `- thinking: ${runtime.session.thinkingLevel}`,
+    `- model: ${runtime.model ? `${runtime.model.provider}/${runtime.model.id}` : "none"}`,
+    `- thinking: ${runtime.thinkingLevel}`,
     `- messages: ${stats.totalMessages} (${stats.userMessages} user, ${stats.assistantMessages} assistant)`,
     `- tools: ${stats.toolCalls} calls, ${stats.toolResults} results`,
     `- tokens: ${stats.tokens.total.toLocaleString()}`,

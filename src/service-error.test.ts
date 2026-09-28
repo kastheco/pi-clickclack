@@ -53,23 +53,22 @@ test(`publishes the current Pi ${failure} error without reusing an earlier answe
   const messages: unknown[] = [{ role: "assistant", content: [{ type: "text", text: "stale response" }], stopReason: "stop" }];
   let listener: ((event: unknown) => void) | undefined;
   const runtime = {
-    session: {
-      sessionId: "session-failed",
-      sessionFile: "/tmp/session-failed.jsonl",
-      messages,
-      subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
-      async compact() { throw new Error("provider rejected the transcript ccb_secret"); },
-      async prompt() {
-        if (failure === "throw") throw new Error("provider rejected the transcript ccb_secret");
-        const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "provider rejected the transcript" };
-        listener?.({ type: "message_end", message: failed });
-        messages.push(failed);
-      },
+    sessionId: "session-failed",
+    sessionFile: "/tmp/session-failed.jsonl",
+    messages,
+    subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
+    async compact() { throw new Error("provider rejected the transcript ccb_secret"); },
+    async prompt() {
+      if (failure === "throw") throw new Error("provider rejected the transcript ccb_secret");
+      const failed = { role: "assistant", content: [], stopReason: "error", errorMessage: "provider rejected the transcript" };
+      listener?.({ type: "message_end", message: failed });
+      messages.push(failed);
+      return true;
     },
     async dispose() {},
   };
   const piRuntime = {
-    kind: "embedded-pi-sdk",
+    kind: "embedded-omp-sdk",
     project: () => ({ alias, cwd: "/tmp" }),
     createSessionRuntime: async () => runtime,
   } as unknown as EmbeddedPiRuntimeBoundary;
@@ -156,7 +155,7 @@ test(`turn recovery handles ${scenario} without losing current work`, async () =
   let created = 0;
   let disposed = 0;
   const piRuntime = {
-    kind: "embedded-pi-sdk",
+    kind: "embedded-omp-sdk",
     project: () => ({ alias, cwd: "/tmp" }),
     createSessionRuntime: async () => {
       created += 1;
@@ -167,36 +166,35 @@ test(`turn recovery handles ${scenario} without losing current work`, async () =
       let calls = 0;
       let listener: ((event: unknown) => void) | undefined;
       return {
-        session: {
-          sessionId: empty ? "session-empty" : "session-fresh",
-          sessionFile: empty ? "/tmp/session-empty.jsonl" : "/tmp/session-fresh.jsonl",
-          messages,
-          subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
-          async prompt() {
-            calls += 1;
-            if (scenario !== "empty" && empty && calls === 1) {
-              const compact = () => messages.splice(0, messages.length, {
-                role: "compactionSummary", summary: "current work, not stale work",
-              });
-              if (scenario !== "compact-after-answer") compact();
-              const answer = {
-                role: "assistant",
-                content: scenario === "compact-empty" || scenario === "compact-error"
-                  ? [] : [{ type: "text", text: "current answer" }],
-                stopReason: scenario === "compact-error" ? "error" : "stop",
-                ...(scenario === "compact-error" ? { errorMessage: "provider failed after compaction" } : {}),
-              };
-              messages.push(answer);
-              listener?.({ type: "message_end", message: answer });
-              if (scenario === "compact-after-answer") compact();
-              return;
-            }
-            const answer = empty && scenario === "empty"
-              ? { role: "assistant", content: [], stopReason: "stop", usage: { totalTokens: 0 } }
-              : { role: "assistant", content: [{ type: "text", text: "fresh answer" }], stopReason: "stop" };
+        sessionId: empty ? "session-empty" : "session-fresh",
+        sessionFile: empty ? "/tmp/session-empty.jsonl" : "/tmp/session-fresh.jsonl",
+        messages,
+        subscribe(next: (event: unknown) => void) { listener = next; return () => { listener = undefined; }; },
+        async prompt() {
+          calls += 1;
+          if (scenario !== "empty" && empty && calls === 1) {
+            const compact = () => messages.splice(0, messages.length, {
+              role: "compactionSummary", summary: "current work, not stale work",
+            });
+            if (scenario !== "compact-after-answer") compact();
+            const answer = {
+              role: "assistant",
+              content: scenario === "compact-empty" || scenario === "compact-error"
+                ? [] : [{ type: "text", text: "current answer" }],
+              stopReason: scenario === "compact-error" ? "error" : "stop",
+              ...(scenario === "compact-error" ? { errorMessage: "provider failed after compaction" } : {}),
+            };
             messages.push(answer);
             listener?.({ type: "message_end", message: answer });
-          },
+            if (scenario === "compact-after-answer") compact();
+            return true;
+          }
+          const answer = empty && scenario === "empty"
+            ? { role: "assistant", content: [], stopReason: "stop", usage: { totalTokens: 0 } }
+            : { role: "assistant", content: [{ type: "text", text: "fresh answer" }], stopReason: "stop" };
+          messages.push(answer);
+          listener?.({ type: "message_end", message: answer });
+          return true;
         },
         async dispose() { disposed += 1; },
       };

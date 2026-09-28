@@ -30,20 +30,22 @@ function safePath(value: unknown): value is string {
   return typeof value === "string" && [...value].length <= 1024 && value.length > 0
     && !/[\\:\p{C}]/u.test(value) && value.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
-function filesProjection(files: WorkflowRunView["operatorArtifacts"]): WorkflowFiles | null {
-  const value = files?.changedFiles;
+function filesProjection(files: unknown): WorkflowFiles | null {
+  if (!isRecord(files)) return null;
+  const value = files.changedFiles;
   if (value == null) return null;
+  check(isRecord(value));
   check(value.source === "host-git" && value.basis === "cumulative-since-base" && identifier(value.baseRevision));
-  check(["clean-baseline", "includes-preexisting-changes"].includes(value.attribution));
+  check(value.attribution === "clean-baseline" || value.attribution === "includes-preexisting-changes");
   check(typeof value.complete === "boolean" && typeof value.truncated === "boolean" && !(value.complete && value.truncated));
   check(Array.isArray(value.entries) && value.entries.length <= 500);
   return {
     source: value.source, basis: value.basis, baseRevision: value.baseRevision,
     attribution: value.attribution, complete: value.complete, truncated: value.truncated,
-    entries: value.entries.map(entry => {
-      check(safePath(entry.path) && changes.has(entry.change));
+    entries: value.entries.map((entry: unknown) => {
+      check(isRecord(entry) && safePath(entry.path) && typeof entry.change === "string" && changes.has(entry.change));
       check(entry.oldPath === undefined || safePath(entry.oldPath));
-      return { path: entry.path, change: entry.change, ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }) };
+      return { path: entry.path, change: entry.change as WorkflowFiles["entries"][number]["change"], ...(entry.oldPath === undefined ? {} : { oldPath: entry.oldPath }) };
     }),
   };
 }
@@ -56,7 +58,7 @@ export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, se
   check(response.outcome === "accepted" && isRecord(response.receipt));
   const raw = response.receipt;
   check(raw.schema === "pi-workflows.run-view.v1" && raw.runId === runId);
-  // The exported host type names the trusted field; all serialized values are checked below.
+  // The current host omits operatorArtifacts; if a host supplies it, validate every field before publication.
   const view = raw as unknown as WorkflowRunView;
   check(identifier(sessionId) && identifier(runId) && identifier(view.queue.workflowName));
   check(view.queue.runId === runId && (view.queue.originSessionId === sessionId || (view.queue.originSessionId === null && discoveredSession)));
@@ -73,7 +75,7 @@ export async function collectWorkflowSnapshot(client: WorkflowDecisionClient, se
     run: { workflowName: view.queue.workflowName, status: view.display.status, reason: view.display.reason !== null && safeReasons.has(view.display.reason) ? view.display.reason : null,
       possiblyInterrupted: view.possiblyInterrupted, startedAt: view.queue.startedAt, finishedAt: view.queue.finishedAt,
       stepTotal: view.stepTotal, stepsComplete: false },
-    steps: [], files: filesProjection(view.operatorArtifacts),
+    steps: [], files: filesProjection(raw.operatorArtifacts),
   };
   const ids = new Set<string>();
   const limit = Math.min(view.stepTotal, 1000);

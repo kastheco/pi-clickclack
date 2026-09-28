@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SessionManager, convertToLlm } from '@earendil-works/pi-coding-agent';
+import { SessionManager, convertToLlm } from '@oh-my-pi/pi-coding-agent';
 
 // Tests SDK persistence, not an AgentSession/model loop. The optional provider is
 // the caller's unchanged attribution module; transport is replaced by a sentinel.
@@ -54,19 +54,19 @@ export async function exerciseLineage(inject, provider) {
     toolTurn(); await transport();
     await prompt('second prompt'); await transport();
     const persisted = structuredClone(messages());
-    sm = SessionManager.open(sm.getSessionFile());
+    sm = await SessionManager.open(sm.getSessionFile());
     assert.deepEqual(messages(), persisted);
-    sm = SessionManager.open(sm.createBranchedSession(sm.getLeafId()));
+    sm = await SessionManager.open(sm.createBranchedSession(sm.getLeafId()));
     assert.deepEqual(messages(), persisted);
     assert.deepEqual(messages().slice(0, 3), prefix);
     await transport();
     for (const index of [1, 2]) await transport(messages().filter((_, i) => i !== index), true);
     const second = sm.getBranch().find(e => e.type === 'message' && e.message.role === 'user' && e.message.content?.[0]?.text === 'second prompt');
-    sm.appendCompaction('offline summary', second.id, 100);
+    sm.appendCompaction('offline summary', undefined, second.id, 100);
     const compacted = structuredClone(messages());
     assert.equal(compacted.some(m => m.role === 'assistant'), false);
     assert.equal(sm.buildSessionContext().messages.filter(m => m.role === 'custom').length, 2);
-    sm = SessionManager.open(sm.getSessionFile());
+    sm = await SessionManager.open(sm.getSessionFile());
     assert.deepEqual(messages(), compacted);
     toolTurn(); await transport();
     await prompt('post-compaction prompt'); await transport();

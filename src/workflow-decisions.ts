@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 
 /**
- * Host-side external decision watching for the latest Pi Workflows protocol.
- * The subscription advertises external presentation without taking agent
- * coordination. Message publication is nonce-deduplicated by ClickClack;
- * answers remain revision-fenced.
+ * Host-side external decision watching for the pinned Pi Workflows protocol.
+ * Decision ownership is registered process-locally with the extension, while
+ * this subscription observes pending decisions without taking agent coordination.
+ * Message publication is nonce-deduplicated by ClickClack; answers remain revision-fenced.
  */
 export type WorkflowInteractiveRequest = {
   requestId: string;
@@ -37,7 +37,6 @@ export type WorkflowDecisionClient = {
   watchSession(
     sessionId: string,
     listener: (event: unknown) => void,
-    options?: { externalPresenter?: boolean },
   ): Promise<() => Promise<void>>;
   request(options: {
     operation: string;
@@ -203,7 +202,7 @@ export class WorkflowDecisionWatcher {
       }
       const interactions = sessionInteractions(event);
       if (interactions !== undefined) this.queueInteractions(interactions, generation);
-    }, { externalPresenter: true });
+    });
     if (generation === this.generation) this.unwatch = unwatch;
     else await unwatch();
   }

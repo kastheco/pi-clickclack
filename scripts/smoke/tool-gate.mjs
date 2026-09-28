@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 
-// Pi 0.85.1's public Agent.beforeToolCall blocks before execute(), unlike
+// Omp 18.3.5's Agent.beforeToolCall blocks before execute(), unlike
 // tool_execution_start (an observational event). Preserve AgentSession's hook
 // so installed extension tool_call handlers still run for the permitted read.
 // Check again afterwards: those handlers may mutate the validated arguments.
@@ -14,13 +14,13 @@ export function installSmokeToolGate(agent, expectedPath) {
   const block = () => {
     const reason = 'smoke permits only one read of the exact repository package.json';
     violations.push(reason);
-    return { block: true, reason, terminate: true };
+    return { block: true, reason };
   };
   const gate = async (context, signal) => {
     if (reads !== 0 || !allowed(context)) return block();
     const result = await previous?.call(agent, context, signal);
     if (result?.block) return result;
-    if (reads !== 0 || !allowed(context)) return block();
+    if (reads !== 0 || !allowed(context) || !isDeepStrictEqual(result?.args ?? context.args, { path: expectedPath })) return block();
     reads++;
     return result;
   };

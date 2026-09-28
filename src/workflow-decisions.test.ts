@@ -89,11 +89,27 @@ async function settle(): Promise<void> {
   for (let tick = 0; tick < 10; tick += 1) await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
-test("external subscription advertises ownership without taking agent coordination", async () => {
-  let options: unknown;
-  const transport = client({ watchSession: async (_session,next,opts) => { options=opts; return async () => {}; } });
-  const watcher = new WorkflowDecisionWatcher({ client: transport, sessionId: "s", present: async () => undefined });
-  await watcher.start(); assert.deepEqual(options,{externalPresenter:true}); await watcher.stop();
+test("external decision subscription stops presenting after watcher shutdown", async () => {
+  let emit: ((event: unknown) => void) | undefined;
+  let watchedSession: string | undefined;
+  const transport = client({ watchSession: async (sessionId, next) => {
+    watchedSession = sessionId;
+    emit = next;
+    return async () => { emit = undefined; };
+  } });
+  const presented: string[] = [];
+  const watcher = new WorkflowDecisionWatcher({
+    client: transport, sessionId: "session-1",
+    present: async (decision) => { presented.push(decision.title); return undefined; },
+  });
+  await watcher.start();
+  assert.equal(watchedSession, "session-1");
+  emit?.(sessionEvent([decisionRequest()]));
+  await settle();
+  assert.deepEqual(presented, ["Approve the implementation plan"]);
+  await watcher.stop();
+  assert.equal(emit, undefined);
+  assert.deepEqual(transport.recorded, [], "an unanswered decision is not submitted");
 });
 
 test("the operator view carries the authored presentation and never the subject", () => {

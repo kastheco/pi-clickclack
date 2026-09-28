@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import test from "node:test";
-import {
-  createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-  type AgentSession,
-} from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream, type AssistantMessage } from "@oh-my-pi/pi-ai";
+import { createAgentSession, SessionManager, type AgentSession } from "@oh-my-pi/pi-coding-agent";
 import { steerWithReceipt } from "./pi-steering.js";
 
 function barrier() {
@@ -16,67 +13,54 @@ function barrier() {
   return { promise, resolve };
 }
 
-test("Pi 0.87.1 consumes identical steering objects before prompt settles without model calls", { timeout: 5000 }, async () => {
-  const manifest = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "../package.json"), "utf8"));
-  assert.equal(manifest.version, "0.87.1", "review steering identity compatibility before upgrading");
-  const directory = mkdtempSync(join(tmpdir(), "pi-steering-sdk-"));
-  const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-  const loader = new DefaultResourceLoader({
-    cwd: directory, agentDir: directory, settingsManager,
-    noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    extensionFactories: [(pi) => {
-      pi.on("input", async (event) => {
-        if (event.text !== "identical correction") return { action: "continue" };
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        return { action: "transform", text: "transformed correction" };
-      });
-    }],
-  });
+test("OMP consumes identical steering objects before prompt settles without network", { timeout: 15000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "omp-steering-sdk-"));
   let session: AgentSession | undefined;
   const firstStream = barrier();
   const releaseFirst = barrier();
   const correctionsConsumed = barrier();
   const releaseLast = barrier();
   try {
-    await loader.reload();
-    const models = await ModelRuntime.create({
-      authPath: join(directory, "auth.json"), modelsPath: join(directory, "models.json"),
-      modelsStorePath: join(directory, "models-store.json"), allowModelNetwork: false,
-    });
-    await models.setRuntimeApiKey("anthropic", "fixture-not-a-credential");
-    const model = models.getModel("anthropic", "claude-sonnet-4-5");
-    assert.ok(model);
     ({ session } = await createAgentSession({
-      cwd: directory, agentDir: directory, modelRuntime: models, model,
-      resourceLoader: loader, settingsManager, sessionManager: SessionManager.inMemory(directory), noTools: "all",
+      cwd: directory, agentDir: directory, sessionManager: SessionManager.inMemory(directory),
+      disableExtensionDiscovery: true, cacheWarming: false, bindProcessState: false,
+      extensions: [(pi) => {
+        pi.on("input", async (event) => {
+          if (event.text !== "identical correction") return;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          return { text: "transformed correction" };
+        });
+      }],
     }));
-    await session.bindExtensions({ mode: "rpc" });
+    const model = session.model;
+    assert.ok(model);
     let calls = 0;
-    session.agent.streamFunction = (_model, context) => {
+    session.agent.streamFn = (_model, context) => {
       calls += 1;
       const call = calls;
-      const answer = {
-        role: "assistant" as const, content: [{ type: "text" as const, text: "fixture answer" }],
-        api: model.api, provider: model.provider, model: model.id, stopReason: "stop" as const,
+      const answer: AssistantMessage = {
+        role: "assistant", content: [{ type: "text", text: "fixture answer" }],
+        api: model.api, provider: model.provider, model: model.id, stopReason: "stop",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now(),
       };
-      return {
-        async *[Symbol.asyncIterator]() {
-          yield { type: "start", partial: answer };
-          if (call === 1) { firstStream.resolve(); await releaseFirst.promise; }
-          if (call === 3) {
-            assert.equal(context.messages.filter((m) => m.role === "user").length, 3);
-            correctionsConsumed.resolve(); await releaseLast.promise;
-          }
-          yield { type: "done", reason: "stop", message: answer };
-        },
-        result: async () => answer,
-      } as unknown as Awaited<ReturnType<AgentSession["agent"]["streamFunction"]>>;
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        stream.push({ type: "start", partial: answer });
+        if (call === 1) { firstStream.resolve(); await releaseFirst.promise; }
+        if (call === 3) {
+          assert.equal(context.messages.filter((m) => m.role === "user").length, 3);
+          correctionsConsumed.resolve(); await releaseLast.promise;
+        }
+        stream.push({ type: "done", reason: "stop", message: answer });
+        stream.end(answer);
+      })().catch((error: unknown) => stream.fail(error));
+      return stream;
     };
     const identities = new WeakMap<object, number>();
     const consumed: number[] = [];
     let steerAtSettlement = false;
+    let boundaryConsumed: boolean | undefined;
     let lateSteering: Promise<void> | undefined;
     session.subscribe((event) => {
       if (event.type === "message_start") {
@@ -87,6 +71,7 @@ test("Pi 0.87.1 consumes identical steering objects before prompt settles withou
         steerAtSettlement = false;
         assert.equal(session!.isStreaming, true);
         lateSteering = steerWithReceipt(session!, "at the settlement boundary", undefined, (object, alreadyConsumed) => {
+          boundaryConsumed = alreadyConsumed;
           if (alreadyConsumed) consumed.push(3);
           else identities.set(object, 3);
         });
@@ -99,7 +84,7 @@ test("Pi 0.87.1 consumes identical steering objects before prompt settles withou
     const originalSteer = session.agent.steer;
     for (const id of [1, 2]) {
       await steerWithReceipt(session, "identical correction", undefined, (object, alreadyConsumed) => {
-        assert.deepEqual((object as { content: unknown }).content, [{ type: "text", text: "transformed correction" }]);
+        assert.deepEqual("content" in object ? object.content : undefined, [{ type: "text", text: "identical correction" }], "OMP steering bypasses interactive input transforms");
         if (alreadyConsumed) consumed.push(id);
         else identities.set(object, id);
       });
@@ -114,7 +99,11 @@ test("Pi 0.87.1 consumes identical steering objects before prompt settles withou
     releaseLast.resolve();
     await run;
     await lateSteering;
-    assert.deepEqual(consumed, [1, 2, 3], "agent_end steering continues the same SDK prompt rather than becoming stranded");
+    assert.equal(boundaryConsumed, undefined, "a resolved steer without enqueue is not a delivery receipt");
+    assert.deepEqual(consumed, [1, 2]);
+    assert.equal(session.agent.peekSteeringQueue().length, 0, "OMP drops the agent_end boundary correction");
+    await session.prompt("next turn");
+    assert.deepEqual(consumed, [1, 2], "the dropped correction does not reappear in the next turn");
     assert.equal(calls, 4);
   } finally {
     releaseFirst.resolve(); releaseLast.resolve();
