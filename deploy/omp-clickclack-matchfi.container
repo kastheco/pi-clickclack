@@ -1,0 +1,73 @@
+# the matchfi bot as a rootless container from the shared release image.
+# install to ~/.config/containers/systemd/ and set Image= to the release tag.
+#
+# the container sees the read-only release image, its private tree at /bot, the
+# approved workspaces, and read-only git, gh and ssh credentials. it never gets
+# the personal home, sibling bot state, or a container-management socket.
+
+[Unit]
+Description=omp ClickClack bot matchfi
+After=network-online.target clickclack.service omp-auth-broker.service
+Wants=network-online.target omp-auth-broker.service
+
+[Container]
+ContainerName=omp-clickclack-matchfi
+Image=localhost/omp-clickclack:3efe88e-omp18.3.5
+Pull=never
+UserNS=keep-id
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+# host loopback stays closed except hindsight (8888), the auth broker (8766),
+# browseros (9001), and kasmos (7434) for matchfi-replit's project .mcp.json.
+Network=pasta:-T,8888,-T,8766,-T,9001,-T,7434
+EnvironmentFile=%h/.config/omp-clickclack/matchfi.env
+Secret=omp-clickclack-gh-token,type=env,target=GH_TOKEN
+Environment=HOME=/bot/home
+Environment=XDG_CONFIG_HOME=/bot/home/.config
+Environment=XDG_DATA_HOME=/bot/home/.local/share
+Environment=XDG_STATE_HOME=/bot/home/.local/state
+Environment=XDG_CACHE_HOME=/bot/home/.cache
+Environment=TMPDIR=/bot/tmp
+Environment=PI_CODING_AGENT_DIR=/bot/agent
+Environment=CLICKCLACK_PI_AGENT_DIR=/bot/agent
+Environment=CLICKCLACK_PI_STATE_PATH=/bot/state/bridge.sqlite
+Environment=LCM_DB_DIR=/bot/agent/lcm
+Environment=OMP_AUTH_BROKER_URL=http://127.0.0.1:8766
+Volume=%h/.local/share/omp-clickclack/matchfi:/bot:rw
+Volume=%h/.omp/auth-broker.token:/bot/home/.omp/auth-broker.token:ro
+Volume=%h/.gitconfig:/bot/home/.gitconfig:ro
+Volume=%h/.ssh:/bot/home/.ssh:ro
+# ssh multiplexing sockets (ControlPath ~/.ssh/cm) need a writable directory.
+# notmpcopyup keeps the host's live sockets out of it.
+Tmpfs=/bot/home/.ssh/cm:rw,mode=0700,U,notmpcopyup
+# the bridge loads the standing voice profile from $HOME at startup. the global
+# AGENTS.md and a skill refer to it by its host path, so mount it there too.
+Volume=%h/.config/unslop/kas-voice-profile.md:/bot/home/.config/unslop/kas-voice-profile.md:ro
+Volume=%h/.config/unslop/kas-voice-profile.md:%h/.config/unslop/kas-voice-profile.md:ro
+# same global instructions and skills the pi bot loaded from ~/.pi/agent.
+# notion-svg-diagrams is a symlink into ~/.agents/skills, so its target is
+# mounted at the same path.
+Volume=%h/.pi/agent/AGENTS.md:/bot/agent/AGENTS.md:ro
+Volume=%h/.pi/agent/skills:/bot/agent/skills:ro
+Volume=%h/.agents/skills/notion-svg-diagrams:%h/.agents/skills/notion-svg-diagrams:ro
+Volume=%h/dev/matchfi-replit:%h/dev/matchfi-replit:rw
+# pi-hindsight keeps retain cursors and receipts under <cwd>/.pi/hindsight.
+# give the bot its own copy instead of sharing the workspace's.
+Volume=%h/.local/share/omp-clickclack/matchfi/workspace-hindsight:%h/dev/matchfi-replit/.pi/hindsight:rw
+WorkingDir=%h/dev/matchfi-replit
+Memory=4g
+PidsLimit=1024
+PodmanArgs=--memory-swap=4g --cpus=2 --device-write-bps=/dev/nvme0n1:60mb --device-read-bps=/dev/nvme0n1:200mb --device-write-iops=/dev/nvme0n1:2000
+StopTimeout=30
+
+[Service]
+Slice=omp-clickclack.slice
+ExecStartPre=%h/dev/omp-clickclack/deploy/preflight.sh
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

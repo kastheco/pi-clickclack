@@ -1,6 +1,6 @@
 # isolated scoped bots
 
-each ClickClack bot runs as its own rootless podman container from one shared release image. bots share code and the credential pool, never writable state. this is the KAS-946 layout, and `clickclack` is the canary.
+each ClickClack bot runs as its own rootless podman container from one shared release image. bots share code and the credential pool, never writable state. this is the KAS-946 layout. `clickclack` was the canary, and `kassette`, `matchfi`, `utmco`, and the multi-project `pi` bot run the same way.
 
 ## release image
 
@@ -38,7 +38,7 @@ build from a clean worktree so the tag names the exact source. the image contain
 
 the quadlet sets every storage variable (`HOME`, `XDG_*`, `TMPDIR`, `PI_CODING_AGENT_DIR`, `CLICKCLACK_PI_AGENT_DIR`, `CLICKCLACK_PI_STATE_PATH`, `LCM_DB_DIR`). the bot env file must not set any of them.
 
-pi-hindsight writes its retain cursors, receipts, and queue to `<cwd>/.pi/hindsight` with the path hardcoded. the quadlet mounts the bot's own `workspace-hindsight/` over that directory, so bots sharing a workspace don't share retain state.
+pi-hindsight writes its retain cursors, receipts, and queue to `<cwd>/.pi/hindsight` with the path hardcoded. the quadlet mounts the bot's own `workspace-hindsight/` over that directory, so bots sharing a workspace don't share retain state. the multi-project `pi` bot mounts `workspace-hindsight/<alias>/` over each project's directory.
 
 create a new bot tree:
 
@@ -60,7 +60,7 @@ the bots default to `gpt-6-astra` on the priority tier, with thinking from `CLIC
 
 - the release image, read-only.
 - `/bot`, the bot's private tree.
-- its workspaces at their host paths, read-write, so session `cwd` values stay valid across the migration. the canary gets `~/dev/clickclack`, `~/dev/omp-clickclack`, and `~/dev/pi-clickclack`.
+- its workspaces at their host paths, read-write, so session `cwd` values stay valid across the migration. `clickclack` gets `~/dev/clickclack`, `~/dev/omp-clickclack`, and `~/dev/pi-clickclack`. `kassette`, `matchfi`, and `utmco` get their one project directory. `pi` gets the directory of every project in its `CLICKCLACK_PI_PROJECTS`. the container's working directory is the bot's first project.
 - read-only: `~/.gitconfig`, `~/.ssh` (with a tmpfs over `~/.ssh/cm` for multiplexing sockets), the voice profile, and the global `AGENTS.md` and skills from `~/.pi/agent`.
 - `GH_TOKEN` from the podman secret `omp-clickclack-gh-token`, created with `gh auth token | tr -d '\n' | podman secret create omp-clickclack-gh-token -`. the gitconfig's credential helper is `gh auth git-credential`, so https pushes use the same token.
 - the auth broker token at `/bot/home/.omp/auth-broker.token`, read-only.
@@ -74,8 +74,9 @@ every bot shares one model credential pool through `omp-auth-broker.service`, wh
 ## isolation
 
 - `UserNS=keep-id` runs the bot as the invoking uid, so workspace files keep normal ownership. all capabilities are dropped, `no-new-privileges` is set, and the root filesystem is read-only.
-- networking is pasta. host loopback is closed except port 8888 (hindsight), 8766 (auth broker), and 9001 (browseros MCP). the tailnet ClickClack URL resolves and connects normally.
-- MCP servers come from `/bot/agent/mcp.json`. OAuth servers such as linear read their credential from the shared auth broker, so one login in the host omp (`/mcp reauth <server>` with the same server URL) covers every bot.
+- networking is pasta. host loopback is closed except port 8888 (hindsight), 8766 (auth broker), and 9001 (browseros MCP). `matchfi` and `pi` also get 7434 for kasmos, which `matchfi-replit/.mcp.json` declares. the tailnet ClickClack URL resolves and connects normally.
+- MCP servers come from `/bot/agent/mcp.json` plus the project's own `.mcp.json`. OAuth servers such as linear read their credential from the shared auth broker, so one login in the host omp (`/mcp reauth <server>` with the same server URL) covers every bot.
+- omp drops a project server whose URL, headers, and auth match a server already loaded, and omp keys OAuth credentials by server URL. `utmco/.mcp.json`'s `linear-utmco` has the same URL as `linear`, so utmco's bot gets only `linear`, with the main Linear login.
 - ClickClack permissions are enforced server-side by each bot's own token. the private `HOME` is a storage boundary, not the security boundary; the mount set is.
 
 ## limits
@@ -100,8 +101,8 @@ run these against the release image with the bot's real quadlet flags (`/usr/lib
 
 1. create the bot tree and env file (above), and install the quadlet with `Image=` set to the release tag.
 2. rehearse: `bun scripts/migrate-from-pi.ts ~/.local/state/pi-clickclack/<bot>.sqlite /tmp/<dir>/<bot> --rehearsal`. this reads the live database without writing it.
-3. `systemctl --user disable --now pi-clickclack-<bot>.service`, so the old bridge doesn't come back on reboot.
-4. `bun scripts/migrate-from-pi.ts ~/.local/state/pi-clickclack/<bot>.sqlite ~/.local/share/omp-clickclack/<bot>`. it refuses to run while either service is active or when bot state already exists. it snapshots the bridge database with `VACUUM INTO`, copies every referenced session file with a sha256 check, rewrites references to `/bot/agent/sessions/`, and runs integrity and foreign key checks. archived references whose session files were never written are reported, not copied.
+3. `systemctl --user disable --now pi-clickclack-<bot>.service`, so the old bridge doesn't come back on reboot. the multi-project `pi` bot ran as `pi-clickclack.service` from `~/.local/state/pi-clickclack/state.sqlite`.
+4. `bun scripts/migrate-from-pi.ts ~/.local/state/pi-clickclack/<bot>.sqlite ~/.local/share/omp-clickclack/<bot>`. it refuses to run while either service is active or when bot state already exists. it snapshots the bridge database with `VACUUM INTO`, copies every referenced session file with a sha256 check, rewrites references to `/bot/agent/sessions/`, and runs integrity and foreign key checks. pi writes a session file only once the session has content, so references without a file are reported, not copied. omp opens them as new sessions in the container's working directory, which must be the project's directory.
 5. `systemctl --user daemon-reload && systemctl --user start omp-clickclack-<bot>.service`.
 
 ## rollback
