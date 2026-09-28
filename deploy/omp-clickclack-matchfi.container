@@ -18,9 +18,9 @@ UserNS=keep-id
 ReadOnly=true
 NoNewPrivileges=true
 DropCapability=ALL
-# host loopback stays closed except hindsight (8888), the auth broker (8766),
-# browseros (9001), and kasmos (7434) for matchfi-replit's project .mcp.json.
-Network=pasta:-T,8888,-T,8766,-T,9001,-T,7434
+# host loopback stays closed except hindsight (8888), the auth broker (8766)
+# and browseros (9001).
+Network=pasta:-T,8888,-T,8766,-T,9001
 EnvironmentFile=%h/.config/omp-clickclack/matchfi.env
 Secret=omp-clickclack-gh-token,type=env,target=GH_TOKEN
 Environment=HOME=/bot/home
