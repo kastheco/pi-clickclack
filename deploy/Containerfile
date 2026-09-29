@@ -61,6 +61,6 @@ COPY src ./src
 
 # context-mode loads through its pi adapter, which carries the MCP bridge and
 # the resume/active-memory injection that its omp adapter lacks.
-ENV CLICKCLACK_OMP_EXTENSION_PATHS='["/opt/omp-clickclack/extensions/node_modules/context-mode/build/adapters/pi/extension.js","/opt/omp-clickclack/extensions/node_modules/pi-lcm","/opt/omp-clickclack/extensions/node_modules/@luxusai/pi-hindsight"]'
+ENV CLICKCLACK_OMP_EXTENSION_PATHS='["/opt/omp-clickclack/extensions/node_modules/context-mode/build/adapters/pi/extension.js","/opt/omp-clickclack/extensions/node_modules/pi-lcm","/opt/omp-clickclack/extensions/node_modules/@luxusai/pi-hindsight","/home/kas/.pi/agent/npm/node_modules/@monotykamary/pi-better-openai/index.ts"]'
 
 CMD ["bun", "/opt/omp-clickclack/src/index.ts"]
