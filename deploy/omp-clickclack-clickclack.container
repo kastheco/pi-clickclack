@@ -1,9 +1,5 @@
-# the clickclack bot as a rootless container from the shared release image.
-# install to ~/.config/containers/systemd/ and set Image= to the release tag.
-#
-# the container sees the read-only release image, its private tree at /bot, the
-# approved workspaces, and read-only git, gh and ssh credentials. it never gets
-# the personal home, sibling bot state, or a container-management socket.
+# the ClickClack bot runs with the same host-user filesystem, network, and
+# user-systemd access as an interactive omp session.
 
 [Unit]
 Description=omp ClickClack bot clickclack
@@ -15,12 +11,22 @@ ContainerName=omp-clickclack-clickclack
 Image=localhost/omp-clickclack:3efe88e-omp18.3.5
 Pull=never
 UserNS=keep-id
-ReadOnly=true
-NoNewPrivileges=true
-DropCapability=ALL
-# host loopback stays closed except hindsight (8888), the auth broker (8766)
-# and browseros (9001).
-Network=pasta:-T,8888,-T,8766,-T,9001
+Network=host
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+Environment=HOME=%h
+Environment=XDG_CONFIG_HOME=%h/.config
+Environment=XDG_DATA_HOME=%h/.local/share
+Environment=XDG_STATE_HOME=%h/.local/state
+Environment=XDG_CACHE_HOME=%h/.cache
+Environment=TMPDIR=/tmp
+Environment=PI_CODING_AGENT_DIR=/bot/agent
+Environment=CLICKCLACK_PI_AGENT_DIR=/bot/agent
+Environment=CLICKCLACK_PI_STATE_PATH=/bot/state/bridge.sqlite
+Environment=LCM_DB_DIR=/bot/agent/lcm
+Environment=OMP_AUTH_BROKER_URL=http://127.0.0.1:8766
+Volume=%h:%h:rw
+Volume=/run/user/%U:/run/user/%U:rw
 EnvironmentFile=%h/.config/omp-clickclack/clickclack.env
 Secret=omp-clickclack-gh-token,type=env,target=GH_TOKEN
 Environment=HOME=/bot/home

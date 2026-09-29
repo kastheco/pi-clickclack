@@ -1,4 +1,4 @@
-# one immutable release shared read-only by every omp ClickClack bot.
+# shared release image for private OMP ClickClack bots.
 # build from the repo root with the clickclack sdk as a named build context:
 #   podman build -f deploy/Containerfile --build-context clickclack-sdk=../clickclack/packages/sdk-ts -t localhost/omp-clickclack:<commit>-omp<version> .
 ARG NODE_VERSION=24.21.0
@@ -11,7 +11,7 @@ ARG GH_VERSION=2.101.0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl fd-find git jq openssh-client python3 ripgrep sqlite3 unzip \
+    build-essential ca-certificates curl fd-find git jq openssh-client python3 ripgrep sqlite3 systemd unzip \
   && ln -s /usr/bin/fdfind /usr/local/bin/fd \
   && rm -rf /var/lib/apt/lists/*
 
@@ -50,7 +50,6 @@ COPY --from=clickclack-sdk package.json /opt/clickclack/packages/sdk-ts/package.
 COPY --from=clickclack-sdk dist /opt/clickclack/packages/sdk-ts/dist
 
 COPY package.json bun.lock ./
-COPY vendor ./vendor
 RUN bun install --frozen-lockfile --production && rm -rf /tmp/* /tmp/.[!.]* /root/.bun/install/cache
 
 COPY deploy/extensions/package.json deploy/extensions/bun.lock deploy/extensions/bunfig.toml ./extensions/
