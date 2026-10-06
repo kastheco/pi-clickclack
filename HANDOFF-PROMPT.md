@@ -6,7 +6,7 @@ Linear issue: https://linear.app/kashub/issue/KAS-732/bootstrap-the-bridge-servi
 
 ## Start here
 
-1. Read `README.md`, `CONTEXT.md`, `docs/SCOPE.md`, and `docs/adr/0001-standalone-embedded-bridge.md` completely.
+1. Read `README.md`, `GLOSSARY.md`, `docs/SCOPE.md`, and `docs/adr/0001-standalone-embedded-bridge.md` completely.
 2. Inspect `git status`. The uncommitted planning baseline is intentional; preserve it.
 3. Read the current Pi SDK documentation at `/home/kas/.nvm/versions/node/v22.22.2/lib/node_modules/@earendil-works/pi-coding-agent/docs/sdk.md` and follow relevant cross-references before using the SDK.
 4. Read the relevant ClickClack contracts in `../clickclack/docs/features/bots.md`, `realtime.md`, and `messages.md`, plus the TypeScript SDK surface in `../clickclack/packages/sdk-ts`.
