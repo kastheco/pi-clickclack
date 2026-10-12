@@ -17,7 +17,7 @@ Don't run a blanket package update until the installed local patches below have 
 
 ## Current Omp checkout pins
 
-- `package.json` pins `@oh-my-pi/pi-coding-agent@18.3.5` and `bun@1.4.2`.
+- `package.json` pins `@oh-my-pi/pi-coding-agent@18.10.3` and `bun@1.4.2`.
 
 ## Historical Pi recovery ledger (2026-09-05; not current Omp install state)
 
@@ -78,7 +78,7 @@ Nvm default now points to Node `24.20.0`. Existing shells don't change automatic
 - Installed the LCM dependency fix from commit `90698eb`. Backed up live LCM databases with integrity checks, verified the installed native regression, passed the repo-owned live smoke with normal exit 0, then restarted `pi-clickclack.service` successfully. No OpenClaw restart.
 ### omp canary
 
-The canary runs under Bun 1.4.2 with `@oh-my-pi/pi-coding-agent` pinned to `18.3.5`. `CLICKCLACK_OMP_EXTENSION_PATHS` is a JSON array of absolute, read-only extension paths. The bridge passes these paths to omp as additional extension paths while disabling extension/plugin discovery from the writable agent directory. The canary extension set contains only `context-mode` and `pi-lcm`; `pi-kas` is intentionally excluded because its docs-reconciliation skill requires credentials unavailable to the scoped bot.
+The canary runs under Bun 1.4.2 with `@oh-my-pi/pi-coding-agent` pinned to `18.10.3`. `CLICKCLACK_OMP_EXTENSION_PATHS` is a JSON array of absolute, read-only extension paths. The bridge passes these paths to omp as additional extension paths while disabling extension/plugin discovery from the writable agent directory. The canary extension set contains only `context-mode` and `pi-lcm`; `pi-kas` is intentionally excluded because its docs-reconciliation skill requires credentials unavailable to the scoped bot.
 
 Omp path-related environment variables are `PI_CODING_AGENT_DIR` (agent/config directory), `PI_CONFIG_FILES` (optional settings-file overlays), and `PI_WORKSPACE_DIR` (workspace root). The bridge aligns `PI_CODING_AGENT_DIR` with `CLICKCLACK_PI_AGENT_DIR`; it does not allow omp to fall back to the real user's `~/.omp` or `~/.pi` directories.
 

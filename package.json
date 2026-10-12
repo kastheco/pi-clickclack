@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@clickclack/sdk-ts": "file:../clickclack/packages/sdk-ts",
-    "@oh-my-pi/pi-coding-agent": "18.3.5",
+    "@oh-my-pi/pi-coding-agent": "18.10.3",
     "valibot": "^1.4.2"
   },
   "devDependencies": {
