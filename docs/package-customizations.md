@@ -1,6 +1,6 @@
 # Package customizations and update checks
 
-Last updated: 2026-09-27.
+last updated: 2026-10-13.
 
 This is the running record of local package changes made during the bridge recovery. It isn't a complete inventory of every historical customization on this machine. Update this file whenever a package is patched, rebuilt, pinned, restored, or returned to upstream. Mirror it to the [Notion package-customization ledger](https://app.notion.com/p/Package-customizations-and-update-checks-3d2b3a0a9c1981398003f31d42068ecf) under the pi-clickclack project page.
 
@@ -18,6 +18,7 @@ Don't run a blanket package update until the installed local patches below have 
 ## Current Omp checkout pins
 
 - `package.json` pins `@oh-my-pi/pi-coding-agent@18.10.3` and `bun@1.4.2`.
+- `patches/@oh-my-pi%2Fpi-coding-agent@18.10.3.patch` preserves the five-minute `session_before_compact` handler budget. upstream 18.10.3 still uses the generic 30-second deadline. `patchedDependencies` in `package.json` and `bun.lock` applies the patch during installation.
 
 ## Historical Pi recovery ledger (2026-09-05; not current Omp install state)
 
@@ -78,8 +79,34 @@ Nvm default now points to Node `24.20.0`. Existing shells don't change automatic
 - Installed the LCM dependency fix from commit `90698eb`. Backed up live LCM databases with integrity checks, verified the installed native regression, passed the repo-owned live smoke with normal exit 0, then restarted `pi-clickclack.service` successfully. No OpenClaw restart.
 ### omp canary
 
-The canary runs under Bun 1.4.2 with `@oh-my-pi/pi-coding-agent` pinned to `18.10.3`. `CLICKCLACK_OMP_EXTENSION_PATHS` is a JSON array of absolute, read-only extension paths. The bridge passes these paths to omp as additional extension paths while disabling extension/plugin discovery from the writable agent directory. The canary extension set contains only `context-mode` and `pi-lcm`; `pi-kas` is intentionally excluded because its docs-reconciliation skill requires credentials unavailable to the scoped bot.
+the checkout pins Bun 1.4.2 and `@oh-my-pi/pi-coding-agent@18.10.3` for the candidate image. the deployed bots remain on 18.8.7 until the separately verified rollout. `CLICKCLACK_OMP_EXTENSION_PATHS` is a JSON array of absolute, read-only extension paths. the bridge passes these paths to OMP while disabling ambient extension discovery. the shared extension set contains `context-mode`, `pi-lcm`, and `@luxusai/pi-hindsight`.
 
 Omp path-related environment variables are `PI_CODING_AGENT_DIR` (agent/config directory), `PI_CONFIG_FILES` (optional settings-file overlays), and `PI_WORKSPACE_DIR` (workspace root). The bridge aligns `PI_CODING_AGENT_DIR` with `CLICKCLACK_PI_AGENT_DIR`; it does not allow omp to fall back to the real user's `~/.omp` or `~/.pi` directories.
 
 Hindsight is configured in `settings.json` under the agent directory. The exact keys are `memory.backend: "hindsight"`, `hindsight.apiUrl` (for example `http://127.0.0.1:8888`), `hindsight.bankId` (an isolated bot bank), `hindsight.autoRecall` (the boolean recall mode), and `hindsight.scoping` (`global`, `per-project`, or `per-project-tagged`). Keep canary banks separate from legacy `kas-engineering` and `pi-global` banks. The SDK session options that prevent writable discovery are `disableExtensionDiscovery: true` and `additionalExtensionPaths: [...]`; the latter contains `CLICKCLACK_OMP_EXTENSION_PATHS`.
+
+### 2026-09-29 OMP upgrade
+
+- upgraded all five bots from OMP 18.3.5 to 18.4.4 using `localhost/omp-clickclack:upgrade-20260929-omp18.4.4`. only installed Quadlet image lines changed. the previous image is `localhost/omp-clickclack:fast-toggle-20260929-omp18.3.5`.
+- carried the five-minute compaction-hook patch and verified its slow-hook regression in the image.
+- corrected the shared auth broker command to invoke the shell launcher directly.
+- updated the live smoke for resolved extension entrypoints and OMP's `i` tool-intent field, while retaining exact-path, single-read restrictions.
+- all 350 tests and typecheck passed. each live bot completed an authenticated model turn and read-tool continuation with the shared extensions loaded. the maintained live smoke also passed in the clickclack container. a real pi-lcm compaction wasn't forced.
+- the OMP upgrade initially preserved `openai-codex/gpt-6-astra`, `medium` thinking, the priority tier, and unset model roles. the model changes below were separately requested afterward.
+
+### 2026-09-29 bot model settings
+
+- changed all five bot defaults to `openai-codex/gpt-6.1-sol`, retaining `medium` reasoning and the OpenAI priority tier.
+- set architect (`plan`) to `openai-codex/gpt-6-astra:high`, advisor to `anthropic/claude-opus-5-5:medium`, fast (`smol`) to `openai-codex/gpt-6-luna:medium`, and thinking (`slow`) to `anthropic/claude-opus-5-5:high` in each bot's `modelRoles`. the default role is also explicitly `openai-codex/gpt-6.1-sol:medium`.
+- restarted all five bots. isolated live sessions verified the complete role map in each bot and authenticated default-model replies from each. all five model/reasoning combinations also completed authenticated replies in the clickclack container.
+
+### 2026-10-09 OMP candidate upgrade
+
+these checks are the historical candidate record carried from the host checkout. all five bots subsequently deployed this image, as confirmed by the host baseline on 2026-10-12. they aren't verification of the 18.10.3 candidate.
+
+- upgraded the checkout pin and lock from 18.4.4 to 18.8.7, preserving the existing dirty work without pulls or commits. upstream 18.8.7 still applies the generic 30-second compaction-hook deadline, so the five-minute patch remained under `patches/@oh-my-pi%2Fpi-coding-agent@18.8.7.patch`. rebased its hunk to line 158 of the published package. Bun accepts the old offset but produces invalid runtime source. no bridge compatibility changes were needed.
+- built the rootless candidate `localhost/omp-clickclack:upgrade-20261009-omp18.8.7` with the documented `clickclack-sdk=../clickclack/packages/sdk-ts` context, from the explicitly requested dirty checkout. image ID: `8554afadc1430c86e61cf021bbe51a3eb91c6adf7753203f97602e20e02075af`.
+- checkout typecheck and build passed. all 352 repository tests passed, including the slow compaction-hook regression. the separate offline smoke suite passed all 49 tests. the same regression passed inside the candidate (1 pass, exit 0). Bun also emitted `Cannot read file "/opt/omp-clickclack/": EACCES` during test discovery under keep-id, so that image test isn't claimed warning-free.
+- candidate smoke ran read-only, keep-id, capability-free, and network-disabled, with only disposable writable tmpfs and no live credentials. the actual entrypoint imported successfully and rejected missing configuration as expected. real SDK construction, extension initialization, disposal, and the bridge runtime boundary passed. all three configured extensions loaded with no load/runtime errors, alongside OMP's built-in inline extension. the SDK reported 18.8.7 and a 300,000 ms compaction-hook budget. no model turns, ClickClack messages, or live-session continuations ran.
+- installed injector integration was attempted against the host's installed policy sources but failed closed on an unsupported `node:crypto` import in the Hindsight recall module. the adapter and installed policies weren't changed. no installed-policy lineage pass is claimed. guard SHA-256: `18f216b1910823962a656f898fcc105d807e3864319d2dd3b05dadb62335edb0`.
+- no live service restart or installed Quadlet change was performed during those candidate checks. the live cutover was separate.
