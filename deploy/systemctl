@@ -1,0 +1,10 @@
+#!/bin/sh
+# the private systemd socket rejects keep-id container credentials. use the
+# session bus for user units while leaving system-unit calls unchanged.
+for arg do
+  if [ "$arg" = "--user" ]; then
+    unset XDG_RUNTIME_DIR
+    break
+  fi
+done
+exec /usr/bin/systemctl "$@"
