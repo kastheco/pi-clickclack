@@ -7,6 +7,7 @@ import { SessionManager } from '@oh-my-pi/pi-coding-agent';
 import { createEmbeddedPiRuntime } from '../../src/pi-runtime.ts';
 import { loadConfig } from '../../src/config.ts';
 import { installSmokeToolGate } from './tool-gate.mjs';
+import { discoverExtensionPaths } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { assertContinuation, assertLoadedExtensions, packagePath, pinnedSdkVersion, timeoutMs, withTimeout } from './assertions.mjs';
 
 const { values } = parseArgs({ options: {
@@ -41,7 +42,7 @@ try {
     assert.equal(session.sessionFile, sessionFile, 'probe session must remain isolated');
     const runner = session.extensionRunner;
     const loaded = runner?.getExtensionPaths() ?? [];
-    const expected = config.pi.extensionPaths ?? [];
+    const expected = await discoverExtensionPaths([...(config.pi.extensionPaths ?? [])], project.cwd, undefined, { ambient: false });
     console.error('BRIDGE_SMOKE_DIAGNOSTICS ' + JSON.stringify({ loaded, expected }));
     assertLoadedExtensions(loaded, expected);
     unsubscribe = runner?.onError(error => {

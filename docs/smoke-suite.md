@@ -1,6 +1,6 @@
 # Omp bridge smoke suite
 
-The checkout pins `@oh-my-pi/pi-coding-agent` **18.3.5** and Bun **1.4.2** in `package.json`; the smoke assertion also checks the installed SDK metadata against the exact dependency pin. Use this checkout's dependencies, not a global `pi`/`omp`. Installation still needs `file:../clickclack/packages/sdk-ts`. No command below installs packages or restarts a bridge.
+The checkout pins `@oh-my-pi/pi-coding-agent` **18.10.3** and Bun **1.4.2** in `package.json`; the smoke assertion also checks the installed SDK metadata against the exact dependency pin. Use this checkout's dependencies, not a global `pi`/`omp`. Installation still needs `file:../clickclack/packages/sdk-ts`. No command below installs packages or restarts a bridge.
 
 ## Offline CI
 
@@ -38,6 +38,6 @@ bun --env-file-if-exists=.env scripts/smoke/live.mjs \
   --allow-live --project YOUR_CONFIGURED_ALIAS --timeout-ms 120000
 ```
 
-The Omp 18.3.5 `Agent.beforeToolCall` hook blocks every call except a single exact-path `read` of this checkout's `package.json`; it preserves the installed extension hook and rejects both in-place and returned argument revisions. The transcript must contain one successful matching result and a later normal final answer containing only the exact pinned SDK version. The probe compares configured extension paths to loaded paths and records hook errors after session initialization. Omp's bridge boundary returns a session, not the SDK `LoadExtensionsResult`, so this probe cannot claim a full extension-load diagnostic audit or full extension health. `BRIDGE_SMOKE_PASS` means only this scoped continuation completed after disposal and cleanup.
+The Omp 18.10.3 `Agent.beforeToolCall` hook blocks every call except a single exact-path `read` of this checkout's `package.json`; it preserves the installed extension hook and rejects both in-place and returned argument revisions. The transcript must contain one successful matching result and a later normal final answer containing only the exact pinned SDK version. The probe compares configured extension paths to loaded paths and records hook errors after session initialization. Omp's bridge boundary returns a session, not the SDK `LoadExtensionsResult`, so this probe cannot claim a full extension-load diagnostic audit or full extension health. `BRIDGE_SMOKE_PASS` means only this scoped continuation completed after disposal and cleanup.
 
 Installed extension code, model/provider auth, provider requests, startup/shutdown hooks, and their side effects are **not sandboxed** by the read-tool gate. The command can expose project context to the provider. It has a bounded abort/dispose timeout and a hard nonzero exit deadline; a hard exit may leave extension-owned handles or probe data. Do not infer success from a model reply alone. This command is not part of CI and was not run as part of this offline port.

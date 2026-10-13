@@ -25,7 +25,9 @@ export function assertContinuation(messages, expectedVersion, expectedPath) {
   const calls = assistants.flatMap(m => m.content.filter(b => b.type === 'toolCall'));
   assert.equal(calls.length, 1, 'exactly one tool call required');
   assert.equal(calls[0].name, 'read', 'only read allowed');
-  assert.deepEqual(calls[0].arguments, { path: expectedPath }, 'must read exactly this repository package.json');
+  const { i, ...readArgs } = calls[0].arguments;
+  assert.ok(i === undefined || typeof i === "string", "read intent must be text");
+  assert.deepEqual(readArgs, { path: expectedPath }, "must read exactly this repository package.json");
   const results = messages.filter(m => m.role === 'toolResult');
   assert.equal(results.length, 1, 'exactly one tool result required');
   assert.equal(results[0].toolName, 'read');

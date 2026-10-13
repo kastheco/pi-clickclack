@@ -53,7 +53,7 @@ for (const [name, args] of [
   assert.equal(result.messages.find(m => m.role === 'toolResult').isError, true);
 });
 test('live tool gate permits exact real package read and preserves existing SDK hook', async () => {
-  const result = await exercise([call('read', { path: packagePath })]);
+  const result = await exercise([call("read", { i: "Reading smoke package", path: packagePath })]);
   assert.equal(result.sideEffects, 0);
   assert.equal(result.reads, 1);
   assert.equal(result.hookCalls, 1);

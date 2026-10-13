@@ -14,8 +14,9 @@ podman build -f deploy/Containerfile \
 
 build from a clean worktree so the tag names the exact source. the image contains:
 
-- bun, node, go, pnpm, gh, git, ripgrep, fd, and sqlite3 for the bot's coding work. the root filesystem is read-only at runtime, so pnpm is prepared at build time and `GOTOOLCHAIN=local` stops go from downloading toolchains.
-- the bridge under `/opt/omp-clickclack`, with `@oh-my-pi/pi-coding-agent` pinned by `bun.lock`.
+- bun, node, go, pnpm, gh, git, podman, systemctl, busctl, ripgrep, fd, and sqlite3 for the bot's coding work. the candidate Containerfile carries the host tooling from the deployed 18.8.7 image, including its `systemctl` wrapper. the root filesystem is read-only at runtime, so pnpm is prepared at build time and `GOTOOLCHAIN=local` stops go from downloading toolchains.
+- the deployed image prepends the mounted host user's executable directories to `PATH`, including `~/.local/bin` for `wt`. keep these paths on the host and in the image together. a host command is usable only if its executable and runtime dependencies work inside the container.
+- the bridge under `/opt/omp-clickclack`, with `@oh-my-pi/pi-coding-agent` pinned to `18.10.3` by `bun.lock`. `patches/@oh-my-pi%2Fpi-coding-agent@18.10.3.patch` gives `session_before_compact` a five-minute handler budget instead of the generic 30 seconds. upstream 18.10.3 still uses the generic deadline. large pi-lcm summaries must finish and return to OMP before its built-in compaction runs. other event deadlines stay unchanged.
 - the extension set under `/opt/omp-clickclack/extensions`, pinned by `deploy/extensions/bun.lock`: context-mode (loaded through its pi adapter, which carries the MCP bridge and resume injection that its omp adapter lacks), pi-lcm, and `@luxusai/pi-hindsight`. `deploy/extensions/bunfig.toml` disables peer installs, because the extensions declare upstream pi packages as peers and omp supplies those modules through its compatibility shim. the image must contain no `@earendil-works` or `@mariozechner` pi packages.
 - `deploy/extensions/patches/pi-lcm@0.1.3.patch`, which moves pi-lcm from better-sqlite3 to `bun:sqlite`. better-sqlite3 doesn't load under bun.
 - `CLICKCLACK_OMP_EXTENSION_PATHS`, which tells the bridge to load exactly those extensions. extension discovery stays off, so nothing is installed into a bot's writable tree.
@@ -50,11 +51,20 @@ jq '.banks.project.bankId="omp-clickclack-<bot>" | .banks.user={enabled: true, b
   ~/.pi/agent/hindsight.json > $b/home/.pi/agent/hindsight.json
 grep -vE '^(CLICKCLACK_PI_STATE_PATH|CLICKCLACK_PI_AGENT_DIR|CLICKCLACK_PI_MODEL)=' \
   ~/.config/pi-clickclack/personas/<bot>.env > ~/.config/omp-clickclack/<bot>.env
-echo 'CLICKCLACK_PI_MODEL=openai-codex/gpt-6-astra' >> ~/.config/omp-clickclack/<bot>.env
-printf 'tier:\n  openai: priority\n' > $b/agent/config.yml
+echo 'CLICKCLACK_PI_MODEL=openai-codex/gpt-6.1-sol' >> ~/.config/omp-clickclack/<bot>.env
+cat > "$b/agent/config.yml" <<'YAML'
+tier:
+  openai: priority
+modelRoles:
+  default: openai-codex/gpt-6.1-sol:medium
+  plan: openai-codex/gpt-6-astra:high
+  advisor: anthropic/claude-opus-5-5:medium
+  smol: openai-codex/gpt-6-luna:medium
+  slow: anthropic/claude-opus-5-5:high
+YAML
 ```
 
-the bots default to `gpt-6-astra` on the priority tier, with thinking from `CLICKCLACK_PI_THINKING_LEVEL`. the model comes from the env file and overrides the model saved in a resumed session. the tier comes from the bot's own omp `config.yml`.
+all five bots default to `openai-codex/gpt-6.1-sol` with `medium` thinking. their `modelRoles` map assigns architect (`plan`) to `openai-codex/gpt-6-astra:high`, advisor to `anthropic/claude-opus-5-5:medium`, fast (`smol`) to `openai-codex/gpt-6-luna:medium`, and thinking (`slow`) to `anthropic/claude-opus-5-5:high`. the bridge model and thinking level come from `CLICKCLACK_PI_MODEL` and `CLICKCLACK_PI_THINKING_LEVEL` in the bot env file, overriding resumed session settings. the role assignments and unchanged OpenAI priority tier come from the bot's own OMP `config.yml`.
 
 ## what the container sees
 
@@ -65,11 +75,13 @@ the bots default to `gpt-6-astra` on the priority tier, with thinking from `CLIC
 - `GH_TOKEN` from the podman secret `omp-clickclack-gh-token`, created with `gh auth token | tr -d '\n' | podman secret create omp-clickclack-gh-token -`. the gitconfig's credential helper is `gh auth git-credential`, so https pushes use the same token.
 - the auth broker token at `/bot/home/.omp/auth-broker.token`, read-only.
 
-it never gets the personal home, the personal omp or pi agent directories, sibling bot trees, or a container socket.
+the installed quadlets expose the host user's session bus and rootless podman socket through `/run/user/%U`. `systemctl --user` uses a wrapper that routes through the session bus because the private systemd socket rejects keep-id credentials. enable `podman.socket` with `systemctl --user enable --now podman.socket` before starting the bots. this gives each bot full control of the host user's rootless containers and their mounts, not just its own container. the repository socket lines will be carried with the image repin.
 
 ## credentials
 
 every bot shares one model credential pool through `omp-auth-broker.service`, which listens on `127.0.0.1:8766`. bots reach it with `OMP_AUTH_BROKER_URL` and the broker token, and never see the underlying credentials. adding an account to the host pool (`omp` on the host, then restart the broker) makes it available to every bot.
+
+the deployed auth broker service invokes the `%h/.bun/bin/omp` launcher directly, with `%h/.bun/bin` on `PATH`. don't pass the shell launcher to `bun` as a JavaScript file. the repository unit will be updated with the image repin.
 
 ## isolation
 
@@ -81,7 +93,7 @@ every bot shares one model credential pool through `omp-auth-broker.service`, wh
 - `mcp_oauth_linear-utmco` was imported from pi's keyring entry (`pi-mcp-adapter.oauth`, account `linear-utmco`). the import rotated the refresh token, so a pi rollback needs `/mcp reauth linear-utmco` in pi.
 - `mcp_oauth_linear-matchfi` came from a fresh OAuth login with its own client registration. a disabled row left under the same credential id (here, a dead import of codex's `linear_matchfi` login) made omp fall back to kasAI. removing the id and setting it again from the active row fixed it.
 - `matchfi-replit/.mcp.json` declares kasmos and playwright. the `matchfi` and `pi` bots list both in `disabledServers` in their `/bot/agent/mcp.json`. browseros covers browser work, and the image ships no browser. that hides them without changing the project's file.
-- ClickClack permissions are enforced server-side by each bot's own token. the private `HOME` is a storage boundary, not the security boundary; the mount set is.
+- ClickClack permissions are enforced server-side by each bot's own token. the private `HOME` separates default storage paths, but the shared host workspace mounts and rootless podman socket don't isolate bots from the host user's files or other containers.
 
 ## limits
 
