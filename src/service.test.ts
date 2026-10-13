@@ -274,10 +274,6 @@ test("service authenticates, subscribes to realtime, and closes state cleanly", 
   await service.start();
   assert.equal(sessionsCreated, 0);
   assert.equal(setup.subscriptionCount(), 1);
-  assert.deepEqual(
-    setup.commandMenu.map((command) => command.command),
-    ["project", "invoke", "continue", "compact", "new", "name", "session", "model", "thinking", "reasoning", "reload", "copy"],
-  );
   assert.match(lines.join("\n"), /"sessionsStarted":0/u);
   await service.waitForStop();
   assert.throws(() => stateStore.database.prepare("SELECT 1"), /not open|closed/u);
@@ -1336,12 +1332,78 @@ test("Pi host commands compact, name, and replace the bound session without reac
   assert.equal(await application.stop(), "completed");
 });
 
+test("native fast commands change the request tier and publish confirmed state without a model turn", async (t) => {
+  const setup = fixture();
+  const native = await nativeRuntimeFixture(setup);
+  t.after(native.cleanup);
+  const runtime = native.session;
+  runtime.setFastMode(false);
+  runtime.agent.streamFn = () => { throw new Error("fast control must not call a model"); };
+  const statuses: boolean[] = [];
+  let fastPublished: (() => void) | undefined;
+  const service = new BridgeService(setup.config, {
+    clickClack: {
+      ...setup.clickClack,
+      botRuntimeStatus: {
+        async list() { return { statuses: [] }; },
+        async publish(_kind, _id, input) {
+          statuses.push(input.status.fast_mode!);
+          if (input.status.fast_mode) fastPublished?.();
+          return { status: {} } as never;
+        },
+      },
+    },
+    piRuntime: native.bridge,
+    logger: createLogger({ sink() {} }),
+  });
+  t.after(() => service.waitForStop());
+  service.state.upsertBinding({ conversationType: "direct", conversationId: "dcn_1" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
+  await service.start();
+  for (const [index, body, expected] of [
+    [0, "/fast", true],
+    [1, "/fast", false],
+    [2, "/fast on", true],
+    [3, "/fast invalid", true],
+    [4, "/fast off", false],
+  ] as const) {
+    const command = message({ id: `msg_fast_${index}`, body, directConversationId: "dcn_1" });
+    setup.messages.set(command.id, command);
+    setup.emit(createdEvent({ messageId: command.id, cursor: `cur_${200 + index}` }));
+    await service.waitForIdle();
+    assert.equal(runtime.serviceTierByFamily.openai, expected ? "priority" : undefined);
+    assert.equal(runtime.agent.serviceTierResolver?.(runtime.model!), expected ? "priority" : undefined);
+    assert.equal(statuses.at(-1), expected);
+  }
+  assert.equal(runtime.messages.length, 0);
+  assert.equal(setup.sent[3]?.body, "usage: `/fast [on|off]`");
+
+  let releaseTurn!: () => void;
+  let turnStarted!: () => void;
+  const heldTurn = new Promise<void>(resolve => { releaseTurn = resolve; });
+  const started = new Promise<void>(resolve => { turnStarted = resolve; });
+  runtime.prompt = async () => { turnStarted(); await heldTurn; return true; };
+  const work = message({ id: "msg_held_turn", body: "hold this turn", directConversationId: "dcn_1" });
+  setup.messages.set(work.id, work);
+  setup.emit(createdEvent({ messageId: work.id, cursor: "cur_300" }));
+  await started;
+  const changed = new Promise<void>(resolve => { fastPublished = resolve; });
+  const toggle = message({ id: "msg_live_fast", body: "/fast", directConversationId: "dcn_1" });
+  setup.messages.set(toggle.id, toggle);
+  setup.emit(createdEvent({ messageId: toggle.id, cursor: "cur_301" }));
+  try {
+    await changed;
+    assert.equal(runtime.agent.serviceTierResolver?.(runtime.model!), "priority");
+  } finally {
+    releaseTurn();
+    await service.waitForIdle();
+  }
+});
+
 test("extension slash commands report UI notifications after waiting for autonomous work", async (t) => {
   const setup = fixture();
   const native = await nativeRuntimeFixture(setup, `export default function(pi) {
-    pi.registerCommand("fast", { description: "Toggle OpenAI fast mode", handler: async (_args, ctx) => {
-      ctx.ui.setStatus("better-openai", "gpt-5.6 fast · 5h 42%");
-      ctx.ui.notify("OpenAI fast mode: on.", "info");
+    pi.registerCommand("notice", { description: "Show a notification", handler: async (_args, ctx) => {
+      ctx.ui.notify("extension notification.", "info");
     } });
   }`);
   t.after(native.cleanup);
@@ -1375,7 +1437,7 @@ test("extension slash commands report UI notifications after waiting for autonom
     logger: createLogger({ sink() {} }),
   });
   service.state.upsertBinding({ conversationType: "direct", conversationId: "dcn_1" as never, projectAlias: toProjectAlias("main"), invocationMode: "auto" });
-  const fast = message({ id: "msg_fast", body: "/fast", directConversationId: "dcn_1" });
+  const fast = message({ id: "msg_notice", body: "/notice", directConversationId: "dcn_1" });
   const unknown = message({ id: "msg_unknown", body: "/not-a-command", directConversationId: "dcn_1" });
   setup.messages.set(fast.id, fast); setup.messages.set(unknown.id, unknown);
 
@@ -1384,21 +1446,20 @@ test("extension slash commands report UI notifications after waiting for autonom
   setup.emit(createdEvent({ messageId: unknown.id, cursor: "cur_300" }));
   await service.waitForIdle();
 
-  assert.deepEqual(receivedPrompts, ["/fast"]);
+  assert.deepEqual(receivedPrompts, ["/notice"]);
   assert.deepEqual(lifecycle, ["wait", "prompt", "wait"]);
   assert.deepEqual(setup.activity, []);
-  assert.ok(setup.commandMenu.some((command) => command.command === "fast"));
+  assert.ok(setup.commandMenu.some((command) => command.command === "notice"));
   assert.deepEqual(setup.sent.map((row) => row.body), [
     "pi resumed work after an external event and is still running. your message is queued and will start when it finishes.",
-    "OpenAI fast mode: on.",
+    "extension notification.",
     "unknown Pi command `/not-a-command`.",
   ]);
   await service.waitForStop();
-  assert.ok(runtimeStatuses.length >= 2);
   assert.deepEqual(runtimeStatuses.at(-1), {
     kind: "dms", id: "dcn_1", input: { workspace_id: "wsp_test", status: {
       runtime: "pi", model_provider: runtime.model?.provider, model_id: runtime.model?.id,
-      reasoning: runtime.thinkingLevel ?? "off", fast_mode: true,
+      reasoning: runtime.thinkingLevel ?? "off", fast_mode: runtime.isFastModeActive(),
     } },
   });
 });

@@ -12,7 +12,6 @@ import {
   type PromptOptions,
 } from "@oh-my-pi/pi-coding-agent";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
-import { betterOpenAIStatusKey, fastModeFromBetterOpenAIStatus } from "./bot-runtime-status.js";
 import {
   TurnActivity,
   defaultReasoningVisibility,
@@ -162,7 +161,6 @@ export class BridgeService {
   private readonly notepadRevisions = new Map<number, number>();
   private readonly notepadTasks = new Map<number, TodoTask[]>();
   private readonly notepadPublications = new Map<number, Promise<void>>();
-  private readonly runtimeFastMode = new Map<number, boolean | null>();
   private readonly runtimeStatusHeartbeats = new Map<number, NodeJS.Timeout>();
   private readonly runtimeStatusPublications = new Map<number, Promise<void>>();
   private stopTask: Promise<void> = Promise.resolve();
@@ -559,6 +557,17 @@ export class BridgeService {
       return;
     }
 
+    const liveControl = parseSlashInvocation(cleanBody);
+    if (liveControl?.name.toLowerCase() === "fast" && this.runtimes.has(binding.id)) {
+      const claim = this.state.claimSourceMessage({
+        messageId: toMessageId(message.id),
+        eventId: event.id,
+        eventCursor: event.cursor,
+      });
+      if (claim.claimed) await this.handleSlashCommand(binding, message, liveControl);
+      return;
+    }
+
     this.conversationSources.set(binding.id, message);
 
     const interaction = this.presentedInteractions.get(binding.id);
@@ -881,6 +890,21 @@ export class BridgeService {
         case "thinking":
           await this.handleThinkingCommand(runtime, source, invocation.args);
           return;
+        case "fast": {
+          const mode = invocation.args.toLowerCase();
+          if (mode && mode !== "on" && mode !== "off") {
+            await this.sendReply(source, "usage: `/fast [on|off]`", `pi-command-${source.id}`);
+            return;
+          }
+          const enabled = mode ? mode === "on" : !runtime.isFastModeEnabled();
+          if (!runtime.setFastMode(enabled)) {
+            await this.sendReply(source, "fast mode is unavailable for the current model.", `pi-command-${source.id}`);
+            return;
+          }
+          this.queueRuntimeStatusPublication(binding, runtime);
+          await this.sendReply(source, `fast mode: ${runtime.isFastModeActive() ? "on" : "off"}.`, `pi-command-${source.id}`);
+          return;
+        }
         case "reload":
           if (invocation.args) {
             await this.sendReply(source, "usage: `/reload`", `pi-command-${source.id}`);
@@ -1444,7 +1468,7 @@ export class BridgeService {
               model_provider: model.provider,
               model_id: model.id,
               reasoning: session.thinkingLevel ?? "off",
-              fast_mode: this.runtimeFastMode.get(binding.id) ?? null,
+              fast_mode: session.isFastModeActive(),
             },
           },
         );
@@ -1475,12 +1499,6 @@ export class BridgeService {
       notify: (message) => {
         const activeTurn = this.activeSessionTurns.get(binding.id);
         if (activeTurn) activeTurn.notifications.push(message);
-      },
-      setStatus: (key, text) => {
-        baseUI.setStatus?.(key, text);
-        if (key !== betterOpenAIStatusKey) return;
-        this.runtimeFastMode.set(binding.id, fastModeFromBetterOpenAIStatus(text));
-        this.queueRuntimeStatusPublication(binding, runtime);
       },
     };
     setSessionToolUIContext(runtime, uiContext, true);
@@ -1527,7 +1545,6 @@ export class BridgeService {
     const timer = this.runtimeStatusHeartbeats.get(bindingId);
     if (timer) clearInterval(timer);
     this.runtimeStatusHeartbeats.delete(bindingId);
-    this.runtimeFastMode.delete(bindingId);
     const observer = this.sessionObservers.get(bindingId);
     if (!observer) return;
     this.sessionObservers.delete(bindingId);

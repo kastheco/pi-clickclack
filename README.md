@@ -118,6 +118,7 @@ The bridge publishes its supported commands to ClickClack:
 - `/session` shows session and context statistics.
 - `/model [provider/model]` shows or changes the session model.
 - `/thinking [level]` shows or changes the thinking level.
+- `/fast [on|off]` toggles or sets native priority service for the current model family. the desktop fast toggle uses this command, and its status comes from omp's active request tier rather than extension status text.
 - `/reasoning [stream|off]` shows or changes whether Pi's intermediate working commentary streams before tool batches. Streaming is the default; `off` drops that commentary for this conversation until the bridge restarts. Provider reasoning summaries stay hidden.
 - `/reload` reloads Pi extensions, skills, prompts, and context files.
 - `/copy` posts the latest assistant answer as a new ClickClack message.
