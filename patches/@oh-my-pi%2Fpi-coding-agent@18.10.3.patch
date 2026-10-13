@@ -1,0 +1,22 @@
+diff --git a/src/extensibility/extensions/runner.ts b/src/extensibility/extensions/runner.ts
+index 7389084..2148e86 100644
+--- a/src/extensibility/extensions/runner.ts
++++ b/src/extensibility/extensions/runner.ts
+@@ -160,10 +160,14 @@ export function testSetSessionShutdownHandlerTimeoutMs(timeoutMs: number): void
+ 	sessionShutdownHandlerTimeoutMs = timeoutMs;
+ }
+ 
+-/** Per-event handler budget. Defaults to the generic cap; `session_shutdown`
+- *  uses its own short cap so teardown stays prompt. */
++/** Per-event handler budget. Compaction extensions may summarize many chunks and
++ * need to return their result before built-in compaction proceeds. */
++export const SESSION_BEFORE_COMPACT_HANDLER_TIMEOUT_MS = 300_000;
++
+ function handlerTimeoutForEvent(eventType: string): number {
+-	return eventType === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs;
++	if (eventType === "session_shutdown") return sessionShutdownHandlerTimeoutMs;
++	if (eventType === "session_before_compact") return SESSION_BEFORE_COMPACT_HANDLER_TIMEOUT_MS;
++	return extensionHandlerTimeoutMs;
+ }
+ 
+ const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");

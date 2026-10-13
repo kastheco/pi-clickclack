@@ -50,6 +50,7 @@ COPY --from=clickclack-sdk package.json /opt/clickclack/packages/sdk-ts/package.
 COPY --from=clickclack-sdk dist /opt/clickclack/packages/sdk-ts/dist
 
 COPY package.json bun.lock ./
+COPY patches ./patches
 RUN bun install --frozen-lockfile --production && rm -rf /tmp/* /tmp/.[!.]* /root/.bun/install/cache
 
 COPY deploy/extensions/package.json deploy/extensions/bun.lock deploy/extensions/bunfig.toml ./extensions/
