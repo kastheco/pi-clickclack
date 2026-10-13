@@ -9,7 +9,7 @@ const version = pinnedSdkVersion();
 function transcript() {
   return [
     { role: 'user', content: 'probe' },
-    { role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: { path: packagePath } }] },
+    { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { i: "Reading smoke package", path: packagePath } }] },
     { role: 'toolResult', toolCallId: 'call-1', toolName: 'read', isError: false, content: [{ type: 'text', text: '[package.json#offline]\n1:{"dependencies":{"@oh-my-pi/pi-coding-agent":"' + version + '"}}' }], details: { displayContent: { text: JSON.stringify({ dependencies: { '@oh-my-pi/pi-coding-agent': version } }) } } },
     { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: version }] },
   ];

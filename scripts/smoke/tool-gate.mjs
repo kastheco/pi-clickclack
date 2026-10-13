@@ -8,9 +8,10 @@ export function installSmokeToolGate(agent, expectedPath) {
   const previous = agent.beforeToolCall;
   let reads = 0;
   const violations = [];
-  const allowed = ({ toolCall, args }) => toolCall.name === 'read'
-    && isDeepStrictEqual(toolCall.arguments, { path: expectedPath })
+  const allowedArgs = ({ i, ...args }) => (i === undefined || typeof i === "string")
     && isDeepStrictEqual(args, { path: expectedPath });
+  const allowed = ({ toolCall, args }) => toolCall.name === "read"
+    && allowedArgs(toolCall.arguments) && allowedArgs(args);
   const block = () => {
     const reason = 'smoke permits only one read of the exact repository package.json';
     violations.push(reason);
@@ -20,7 +21,7 @@ export function installSmokeToolGate(agent, expectedPath) {
     if (reads !== 0 || !allowed(context)) return block();
     const result = await previous?.call(agent, context, signal);
     if (result?.block) return result;
-    if (reads !== 0 || !allowed(context) || !isDeepStrictEqual(result?.args ?? context.args, { path: expectedPath })) return block();
+    if (reads !== 0 || !allowed(context) || !allowedArgs(result?.args ?? context.args)) return block();
     reads++;
     return result;
   };
