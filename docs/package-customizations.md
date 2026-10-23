@@ -1,6 +1,6 @@
 # Package customizations and update checks
 
-last updated: 2026-10-13.
+last updated: 2026-10-23.
 
 This is the running record of local package changes made during the bridge recovery. It isn't a complete inventory of every historical customization on this machine. Update this file whenever a package is patched, rebuilt, pinned, restored, or returned to upstream. Mirror it to the [Notion package-customization ledger](https://app.notion.com/p/Package-customizations-and-update-checks-3d2b3a0a9c1981398003f31d42068ecf) under the pi-clickclack project page.
 
@@ -18,6 +18,7 @@ Don't run a blanket package update until the installed local patches below have 
 ## Current Omp checkout pins
 
 - `package.json` pins `@oh-my-pi/pi-coding-agent@18.10.3` and `bun@1.4.2`.
+- `deploy/Containerfile` targets Node `24.22.1` for both the base image and the mounted host nvm executable path. this is the desired release configuration, not a claim about the installed host default or running bots.
 - `patches/@oh-my-pi%2Fpi-coding-agent@18.10.3.patch` preserves the five-minute `session_before_compact` handler budget. upstream 18.10.3 still uses the generic 30-second deadline. `patchedDependencies` in `package.json` and `bun.lock` applies the patch during installation.
 
 ## Historical Pi recovery ledger (2026-09-05; not current Omp install state)
@@ -64,7 +65,7 @@ Restoring the Node 22 binary into Node 24 recreates the ABI failure. Restoring 1
 
 ## Runtime alignment
 
-Nvm default now points to Node `24.20.0`. Existing shells don't change automatically; run `nvm use 24.20.0` there before launching Pi or rebuilding these shared native dependencies. The global Pi under that Node installation reported `0.84.4`; the bridge independently resolves its pinned `0.85.1`. No global Pi upgrade is claimed.
+the September 5 recovery set the nvm default to Node `24.20.0`. existing shells needed `nvm use 24.20.0` before launching Pi or rebuilding the shared native dependencies. the global Pi under that installation reported `0.84.4`, while the bridge independently resolved its pinned `0.85.1`. this is historical evidence, not the current host state or desired release pin.
 
 ## Change log
 

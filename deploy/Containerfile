@@ -1,7 +1,7 @@
 # shared release image for private OMP ClickClack bots.
 # build from the repo root with the clickclack sdk as a named build context:
 #   podman build -f deploy/Containerfile --build-context clickclack-sdk=../clickclack/packages/sdk-ts -t localhost/omp-clickclack:<commit>-omp<version> .
-ARG NODE_VERSION=24.21.0
+ARG NODE_VERSION=24.22.1
 FROM docker.io/library/node:${NODE_VERSION}-bookworm-slim
 
 ARG BUN_VERSION=1.4.2
@@ -66,6 +66,6 @@ COPY --chmod=755 deploy/systemctl /usr/local/bin/systemctl
 # the resume/active-memory injection that its omp adapter lacks.
 ENV CLICKCLACK_OMP_EXTENSION_PATHS='["/opt/omp-clickclack/extensions/node_modules/context-mode/build/adapters/pi/extension.js","/opt/omp-clickclack/extensions/node_modules/pi-lcm","/opt/omp-clickclack/extensions/node_modules/@luxusai/pi-hindsight"]'
 # user tools live on the mounted host home; keep image toolchain paths as fallback.
-ENV PATH=/home/kas/.local/bin:/home/kas/.local/share/pnpm:/home/kas/go/bin:/home/kas/.opencode/bin:/home/kas/.bun/bin:/home/kas/.cargo/bin:/home/kas/.nvm/versions/node/v24.21.0/bin:/home/kas/.railway/bin:/home/kas/.local/share/bin:/home/kas/.acp/bin:${PATH}
+ENV PATH=/home/kas/.local/bin:/home/kas/.local/share/pnpm:/home/kas/go/bin:/home/kas/.opencode/bin:/home/kas/.bun/bin:/home/kas/.cargo/bin:/home/kas/.nvm/versions/node/v24.22.1/bin:/home/kas/.railway/bin:/home/kas/.local/share/bin:/home/kas/.acp/bin:${PATH}
 
 CMD ["bun", "/opt/omp-clickclack/src/index.ts"]
